@@ -1,0 +1,1423 @@
+import asyncio
+import logging
+import time
+from datetime import datetime
+from typing import Optional
+
+import aiohttp
+
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+
+import config
+from exchanges.nonkyc import NonKYCExchange
+from exchanges.kucoin import KucoinExchange
+from exchanges.spectrum import SpectrumDEX
+from exchanges.sigmausd import SigmaUSDBank
+from exchanges.ergo_node import ErgoNodeClient
+from arbitrage.calculator import ArbitrageCalculator, ArbitrageOpportunity, FeeBreakdown
+from tracker.profit_tracker import ProfitTracker
+from notifications.discord import DiscordNotifier
+from logging_config import console
+
+logger = logging.getLogger("ergo_arb.scanner")
+
+
+class ArbitrageScanner:
+    def __init__(self, mode: str = "monitor"):
+        """
+        mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
+        """
+        self.mode = mode
+        self.nonkyc = NonKYCExchange()
+        self.kucoin = KucoinExchange()
+        self.spectrum = SpectrumDEX()
+        self.sigmausd = SigmaUSDBank()
+        self.ergo_node = ErgoNodeClient()
+        self.calculator = ArbitrageCalculator()
+        self.tracker = ProfitTracker()
+        self.discord = DiscordNotifier()
+        self._crux_session: Optional[aiohttp.ClientSession] = None
+        self.scan_count = 0
+        self._last_snapshot_id = None
+        self._trade_sizes = [1, 5, 10, 25, 50, 100]
+
+        # Notification anti-spam state
+        self._opportunity_streak: dict[str, int] = {}
+        self._last_wallet_analysis_time: float = 0.0
+        self._last_summary_time: float = 0.0
+        self._price_timestamps: dict[str, float] = {}
+
+    @property
+    def discord_enabled(self) -> bool:
+        return self.mode in ("notify", "live") and config.DISCORD_ENABLED
+
+    @property
+    def trading_enabled(self) -> bool:
+        return self.mode == "live"
+
+    async def connect_all(self):
+        await asyncio.gather(
+            self.nonkyc.connect(),
+            self.kucoin.connect(),
+            self.spectrum.connect(),
+            self.sigmausd.connect(),
+            self.ergo_node.connect(),
+        )
+        self._crux_session = aiohttp.ClientSession()
+
+        node_ok = await self.ergo_node.check_connection()
+        if not node_ok:
+            logger.warning("Ergo node not reachable - continuing without node features")
+
+        nonkyc_fee, kucoin_fee, nonkyc_usdt_fee, kucoin_usdt_fee = await asyncio.gather(
+            self.nonkyc.get_withdraw_fee("ERG"),
+            self.kucoin.get_withdraw_fee("ERG"),
+            self.nonkyc.get_withdraw_fee("USDT"),
+            self.kucoin.get_withdraw_fee("USDT"),
+        )
+        self._nonkyc_usdt_fee = nonkyc_usdt_fee
+        self._kucoin_usdt_fee = kucoin_usdt_fee
+        logger.info(f"NonKYC ERG withdrawal fee: {nonkyc_fee} ERG")
+        logger.info(f"Kucoin ERG withdrawal fee: {kucoin_fee} ERG")
+        logger.info(f"NonKYC USDT withdrawal fee: {nonkyc_usdt_fee} USDT")
+        logger.info(f"Kucoin USDT withdrawal fee: {kucoin_usdt_fee} USDT")
+
+    async def disconnect_all(self):
+        if self._crux_session:
+            await self._crux_session.close()
+            self._crux_session = None
+        await asyncio.gather(
+            self.nonkyc.disconnect(),
+            self.kucoin.disconnect(),
+            self.spectrum.disconnect(),
+            self.sigmausd.disconnect(),
+            self.ergo_node.disconnect(),
+            self.discord.disconnect(),
+        )
+        self.tracker.close()
+
+    async def _fetch_use_price(self) -> Optional[dict]:
+        """Fetch USE (DexyUSD) price and status from Crux Finance API."""
+        if not self._crux_session:
+            return None
+        try:
+            async with self._crux_session.get(
+                f"{config.CRUX_API_URL}/dexy/analytics/use",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+            return None
+        except Exception as e:
+            logger.error(f"Crux USE price fetch error: {e}")
+            return None
+
+    async def _fetch_use_mint_status(self) -> Optional[dict]:
+        """Check if USE free_mint or arb_mint is available."""
+        if not self._crux_session:
+            return None
+        results = {}
+        for mint_type in ("free_mint", "arb_mint"):
+            try:
+                async with self._crux_session.get(
+                    f"{config.CRUX_API_URL}/dexy/mint_status/use?mint_type={mint_type}",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        results[mint_type] = data
+            except Exception as e:
+                logger.error(f"Crux {mint_type} status error: {e}")
+        return results if results else None
+
+    async def fetch_all_prices(self) -> dict:
+        """Fetch prices from all sources concurrently."""
+        results = {}
+
+        nonkyc_price, kucoin_price, spectrum_price, bank_state, use_data, use_mint = await asyncio.gather(
+            self.nonkyc.fetch_erg_usdt_price(),
+            self.kucoin.fetch_erg_usdt_price(),
+            self.spectrum.get_erg_sigusd_price(),
+            self.sigmausd.get_full_state(),
+            self._fetch_use_price(),
+            self._fetch_use_mint_status(),
+            return_exceptions=True,
+        )
+
+        if isinstance(nonkyc_price, Exception):
+            logger.error(f"NonKYC price fetch failed: {nonkyc_price}")
+            nonkyc_price = None
+        if isinstance(kucoin_price, Exception):
+            logger.error(f"Kucoin price fetch failed: {kucoin_price}")
+            kucoin_price = None
+        if isinstance(spectrum_price, Exception):
+            logger.error(f"Spectrum price fetch failed: {spectrum_price}")
+            spectrum_price = None
+        if isinstance(bank_state, Exception):
+            logger.error(f"SigmaUSD state fetch failed: {bank_state}")
+            bank_state = {}
+        if isinstance(use_data, Exception):
+            logger.error(f"Crux USE data fetch failed: {use_data}")
+            use_data = None
+        if isinstance(use_mint, Exception):
+            logger.error(f"Crux USE mint status fetch failed: {use_mint}")
+            use_mint = None
+
+        results["nonkyc_erg_usdt"] = nonkyc_price
+        results["kucoin_erg_usdt"] = kucoin_price
+        results["spectrum_erg_sigusd"] = spectrum_price
+        results["bank"] = bank_state
+        results["use_data"] = use_data
+        results["use_mint"] = use_mint
+
+        # Track price freshness for staleness guard
+        now = time.time()
+        if nonkyc_price is not None:
+            self._price_timestamps["nonkyc"] = now
+        if kucoin_price is not None:
+            self._price_timestamps["kucoin"] = now
+        if spectrum_price is not None:
+            self._price_timestamps["spectrum"] = now
+        if bank_state and bank_state.get("oracle_erg_usd"):
+            self._price_timestamps["bank"] = now
+        if use_data is not None:
+            self._price_timestamps["use"] = now
+
+        nonkyc_ob, kucoin_ob = await asyncio.gather(
+            self.nonkyc.get_orderbook("ERG/USDT", depth=20),
+            self.kucoin.get_orderbook("ERG/USDT", depth=20),
+        )
+        results["nonkyc_orderbook"] = nonkyc_ob
+        results["kucoin_orderbook"] = kucoin_ob
+
+        return results
+
+    def _display_prices(self, prices: dict):
+        """Display current prices in a rich table."""
+        table = Table(title="Current Prices", show_header=True, header_style="bold cyan")
+        table.add_column("Source", style="bold")
+        table.add_column("Pair")
+        table.add_column("Price", justify="right")
+        table.add_column("Details", style="dim")
+
+        nonkyc = prices.get("nonkyc_erg_usdt")
+        if nonkyc:
+            table.add_row("NonKYC", "ERG/USDT", f"${nonkyc:.4f}", "CEX mid price")
+
+        ob = prices.get("nonkyc_orderbook")
+        if ob and ob.best_bid and ob.best_ask:
+            table.add_row("", "", f"${ob.best_bid.price:.4f} / ${ob.best_ask.price:.4f}", "bid / ask")
+
+        kucoin = prices.get("kucoin_erg_usdt")
+        if kucoin:
+            table.add_row("Kucoin", "ERG/USDT", f"${kucoin:.4f}", "CEX mid price")
+
+        kob = prices.get("kucoin_orderbook")
+        if kob and kob.best_bid and kob.best_ask:
+            table.add_row("", "", f"${kob.best_bid.price:.4f} / ${kob.best_ask.price:.4f}", "bid / ask")
+
+        spectrum = prices.get("spectrum_erg_sigusd")
+        if spectrum:
+            table.add_row("Spectrum", "ERG/SigUSD", f"{spectrum:.4f} SigUSD", "DEX pool price")
+
+        bank = prices.get("bank", {})
+        oracle = bank.get("oracle_erg_usd")
+        if oracle:
+            table.add_row("SigmaUSD Bank", "ERG/USD", f"${oracle:.4f}", "Oracle price")
+            rr = bank.get("reserve_ratio")
+            mint_ok = bank.get("can_mint_sigusd", False)
+            redeem_ok = bank.get("can_redeem_sigusd", False)
+            status = f"RR: {rr:.0f}%" if rr else "RR: N/A"
+            status += f" | Mint: {'YES' if mint_ok else 'NO'} | Redeem: {'YES' if redeem_ok else 'NO'}"
+            table.add_row("", "", "", status)
+
+        # SigUSD peg check
+        if spectrum and oracle and spectrum > 0:
+            implied = oracle / spectrum
+            depeg = (implied - 1.0) * 100
+            peg_status = f"1 SigUSD = ${implied:.2f} ({depeg:+.1f}%)"
+            table.add_row("", "SigUSD Peg", "", peg_status)
+
+        # USE (DexyUSD)
+        use_data = prices.get("use_data")
+        if use_data:
+            use_price = use_data.get("erg_price") or use_data.get("price")
+            if use_price:
+                table.add_row("Crux/Dexy", "ERG/USE", f"{use_price:.4f} USE", "DexyUSD price")
+
+        use_mint = prices.get("use_mint")
+        if use_mint:
+            fm = use_mint.get("free_mint", {})
+            am = use_mint.get("arb_mint", {})
+            fm_ok = fm.get("available", fm.get("can_mint", False))
+            am_ok = am.get("available", am.get("can_mint", False))
+            table.add_row("", "USE Mint", "", f"FreeMint: {'YES' if fm_ok else 'NO'} | ArbMint: {'YES' if am_ok else 'NO'}")
+
+        console.print(table)
+
+    def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
+        """Analyze prices and find all arbitrage opportunities."""
+        opportunities = []
+
+        nonkyc_price = prices.get("nonkyc_erg_usdt")
+        kucoin_price = prices.get("kucoin_erg_usdt")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        bank = prices.get("bank", {})
+        oracle_price = bank.get("oracle_erg_usd")
+        can_mint = bank.get("can_mint_sigusd", False)
+        can_redeem = bank.get("can_redeem_sigusd", False)
+        reserve_ratio = bank.get("reserve_ratio")
+
+        # USE data
+        use_data = prices.get("use_data")
+        use_mint = prices.get("use_mint")
+        use_price = None
+        if use_data:
+            use_price = use_data.get("erg_price") or use_data.get("price")
+        use_free_mint_ok = False
+        use_arb_mint_ok = False
+        if use_mint:
+            fm = use_mint.get("free_mint", {})
+            am = use_mint.get("arb_mint", {})
+            use_free_mint_ok = fm.get("available", fm.get("can_mint", False))
+            use_arb_mint_ok = am.get("available", am.get("can_mint", False))
+
+        # Build blocked reason strings
+        rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
+        mint_blocked_reason = f"Bank mint blocked (RR={rr_str}, need >400%)" if not can_mint else ""
+        redeem_blocked_reason = f"Bank redeem blocked (RR={rr_str}, need <800%)" if not can_redeem else ""
+
+        for trade_size in self._trade_sizes:
+            slippage = config.get_recommended_slippage(trade_size)
+
+            # ---- SigUSD Paths ----
+
+            # Path 1: Bank mint -> Spectrum (always calculate, mark blocked)
+            if oracle_price and spectrum_price and spectrum_price > 0:
+                bank_rate_after_fees = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+                sigusd_from_bank = trade_size * bank_rate_after_fees
+                erg_from_dex = sigusd_from_bank / spectrum_price
+                erg_from_dex_after_fee = erg_from_dex * (1 - config.SPECTRUM_POOL_FEE)
+
+                opp = self.calculator.calc_bank_to_dex(
+                    input_erg=trade_size,
+                    bank_erg_to_sigusd_rate=bank_rate_after_fees,
+                    dex_sigusd_to_erg_output=erg_from_dex_after_fee,
+                    slippage=slippage,
+                )
+                opp.path = f"Bank mint->Spectrum sell [{trade_size} ERG]"
+                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+                opp.steps = [
+                    f"START: Have {trade_size} ERG in wallet",
+                    f"Send {trade_size} ERG to SigmaUSD Bank to mint SigUSD",
+                    f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+                    f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+                ]
+                if not can_mint:
+                    opp.blocked = True
+                    opp.blocked_reason = mint_blocked_reason
+                    opp.is_profitable = False
+                opportunities.append(opp)
+
+            # Path 2: Spectrum -> Bank redeem (always calculate, mark blocked)
+            if oracle_price and spectrum_price and spectrum_price > 0:
+                sigusd_from_dex = trade_size * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                bank_redeem_rate = (1.0 / oracle_price) * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+
+                opp = self.calculator.calc_dex_to_bank(
+                    input_erg=trade_size,
+                    dex_erg_to_sigusd_output=sigusd_from_dex,
+                    bank_sigusd_to_erg_rate=bank_redeem_rate,
+                    slippage=slippage,
+                )
+                opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
+                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+                erg_from_bank = sigusd_from_dex * bank_redeem_rate
+                opp.steps = [
+                    f"START: Have {trade_size} ERG in wallet",
+                    f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                    f"Receive ~{sigusd_from_dex:.2f} SigUSD",
+                    f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+                ]
+                if not can_redeem:
+                    opp.blocked = True
+                    opp.blocked_reason = redeem_blocked_reason
+                    opp.is_profitable = False
+                opportunities.append(opp)
+
+            # Path 3: NonKYC vs Spectrum (note SigUSD != USDT assumption)
+            if nonkyc_price and spectrum_price:
+                direction = "buy_dex_sell_cex" if nonkyc_price > spectrum_price else "buy_cex_sell_dex"
+                opp = self.calculator.calc_cex_vs_dex(
+                    input_erg=trade_size,
+                    cex_erg_usdt_price=nonkyc_price,
+                    dex_erg_sigusd_price=spectrum_price,
+                    direction=direction,
+                    cex_trading_fee=config.NONKYC_TRADING_FEE,
+                    erg_withdraw_fee=config.NONKYC_ERG_WITHDRAW_FEE,
+                    slippage=slippage,
+                )
+                opp.path = f"NonKYC<>Spectrum [{trade_size} ERG]"
+                opp.assumption = "SigUSD=USDT assumed (depegged!)"
+                nonkyc_usdt_fee = getattr(self, '_nonkyc_usdt_fee', 0)
+                if direction == "buy_dex_sell_cex":
+                    usdt_result = trade_size * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+                    opp.steps = [
+                        f"START: Have SigUSD in wallet",
+                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Deposit ERG to NonKYC (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
+                        f"Sell ERG on NonKYC for USDT at ${nonkyc_price:.4f}/ERG ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ~${usdt_result:.2f} USDT on NonKYC (USDT withdrawal fee: {nonkyc_usdt_fee} USDT)",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ]
+                else:
+                    opp.steps = [
+                        f"START: Have USDT on NonKYC",
+                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        f"Withdraw ERG to wallet (-{config.NONKYC_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
+                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"END RESULT: SigUSD tokens in Ergo wallet",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ]
+                opportunities.append(opp)
+
+            # Path 4: Kucoin vs Spectrum
+            if kucoin_price and spectrum_price:
+                direction = "buy_dex_sell_cex" if kucoin_price > spectrum_price else "buy_cex_sell_dex"
+                opp = self.calculator.calc_cex_vs_dex(
+                    input_erg=trade_size,
+                    cex_erg_usdt_price=kucoin_price,
+                    dex_erg_sigusd_price=spectrum_price,
+                    direction=direction,
+                    cex_trading_fee=config.KUCOIN_TRADING_FEE,
+                    erg_withdraw_fee=config.KUCOIN_ERG_WITHDRAW_FEE,
+                    slippage=slippage,
+                )
+                opp.path = f"Kucoin<>Spectrum [{trade_size} ERG]"
+                opp.assumption = "SigUSD=USDT assumed (depegged!)"
+                kucoin_usdt_fee = getattr(self, '_kucoin_usdt_fee', 1.0)
+                if direction == "buy_dex_sell_cex":
+                    usdt_result = trade_size * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
+                    opp.steps = [
+                        f"START: Have SigUSD in wallet",
+                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Deposit ERG to Kucoin (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
+                        f"Sell ERG on Kucoin for USDT at ${kucoin_price:.4f}/ERG ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ~${usdt_result:.2f} USDT on Kucoin (USDT withdrawal fee: {kucoin_usdt_fee} USDT)",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ]
+                else:
+                    opp.steps = [
+                        f"START: Have USDT on Kucoin",
+                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        f"Withdraw ERG to wallet (-{config.KUCOIN_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
+                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"END RESULT: SigUSD tokens in Ergo wallet",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ]
+                opportunities.append(opp)
+
+            # Path 5: NonKYC vs Kucoin (CEX to CEX)
+            if nonkyc_price and kucoin_price:
+                if nonkyc_price > kucoin_price:
+                    opp = self.calculator.calc_cex_to_cex(
+                        input_erg=trade_size,
+                        sell_price_usdt=nonkyc_price,
+                        buy_price_usdt=kucoin_price,
+                        sell_trading_fee=config.NONKYC_TRADING_FEE,
+                        buy_trading_fee=config.KUCOIN_TRADING_FEE,
+                        erg_withdraw_fee=config.KUCOIN_ERG_WITHDRAW_FEE,
+                    )
+                    opp.path = f"Kucoin->NonKYC [{trade_size} ERG]"
+                    usdt_result = opp.output_erg * nonkyc_price
+                    opp.steps = [
+                        f"START: Have USDT on Kucoin",
+                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        f"Withdraw ERG to NonKYC (-{config.KUCOIN_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
+                        f"Sell ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ~${usdt_result:.2f} USDT on NonKYC",
+                    ]
+                else:
+                    opp = self.calculator.calc_cex_to_cex(
+                        input_erg=trade_size,
+                        sell_price_usdt=kucoin_price,
+                        buy_price_usdt=nonkyc_price,
+                        sell_trading_fee=config.KUCOIN_TRADING_FEE,
+                        buy_trading_fee=config.NONKYC_TRADING_FEE,
+                        erg_withdraw_fee=config.NONKYC_ERG_WITHDRAW_FEE,
+                    )
+                    opp.path = f"NonKYC->Kucoin [{trade_size} ERG]"
+                    usdt_result = opp.output_erg * kucoin_price
+                    opp.steps = [
+                        f"START: Have USDT on NonKYC",
+                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        f"Withdraw ERG to Kucoin (-{config.NONKYC_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
+                        f"Sell ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ~${usdt_result:.2f} USDT on Kucoin",
+                    ]
+                opportunities.append(opp)
+
+            # Path 6: Kucoin vs SigmaUSD Bank (always calculate, mark blocked)
+            if kucoin_price and oracle_price:
+                bank_effective = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+                diff_pct = ((kucoin_price - bank_effective) / bank_effective) * 100
+                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+                sigusd_minted = trade_size * bank_effective
+                opp = ArbitrageOpportunity(
+                    path=f"Kucoin<>Bank [{trade_size} ERG]",
+                    input_erg=trade_size,
+                    output_erg=trade_size * (1 + diff_pct / 100),
+                    profit_erg=trade_size * diff_pct / 100,
+                    profit_percent=diff_pct,
+                    fees=FeeBreakdown(
+                        trading_fee=trade_size * kucoin_price * config.KUCOIN_TRADING_FEE,
+                        withdraw_fee_erg=config.KUCOIN_ERG_WITHDRAW_FEE,
+                        network_fee_erg=config.ERGO_TX_FEE,
+                        protocol_fee=trade_size * oracle_price * (1 - (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)),
+                    ),
+                    source_price=oracle_price,
+                    target_price=kucoin_price,
+                    source_exchange="SigmaUSD Bank",
+                    target_exchange="Kucoin",
+                    is_profitable=diff_pct > config.MIN_PROFIT_PERCENT and can_mint,
+                    blocked=not can_mint,
+                    blocked_reason=mint_blocked_reason if not can_mint else "",
+                    assumption="SigUSD=USDT assumed (depegged!)",
+                    requires_transfer=True,
+                    estimated_execution_minutes=60,
+                    price_risk_percent=60 * 0.02,
+                    steps=[
+                        f"START: Have {trade_size} ERG in wallet",
+                        f"Mint SigUSD at Bank: send {trade_size} ERG, receive ~{sigusd_minted:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% fees)",
+                        f"Sell SigUSD for USDT somewhere (assumes 1:1 peg)",
+                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ERG on Kucoin (withdraw to wallet: -{config.KUCOIN_ERG_WITHDRAW_FEE} ERG)",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ],
+                )
+                opportunities.append(opp)
+
+            # Path 7: NonKYC vs SigmaUSD Bank (always calculate, mark blocked)
+            if nonkyc_price and oracle_price:
+                bank_effective = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+                diff_pct = ((nonkyc_price - bank_effective) / bank_effective) * 100
+                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+                sigusd_minted = trade_size * bank_effective
+                opp = ArbitrageOpportunity(
+                    path=f"NonKYC<>Bank [{trade_size} ERG]",
+                    input_erg=trade_size,
+                    output_erg=trade_size * (1 + diff_pct / 100),
+                    profit_erg=trade_size * diff_pct / 100,
+                    profit_percent=diff_pct,
+                    fees=FeeBreakdown(
+                        trading_fee=trade_size * nonkyc_price * config.NONKYC_TRADING_FEE,
+                        withdraw_fee_erg=config.NONKYC_ERG_WITHDRAW_FEE,
+                        network_fee_erg=config.ERGO_TX_FEE,
+                        protocol_fee=trade_size * oracle_price * (1 - (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)),
+                    ),
+                    source_price=oracle_price,
+                    target_price=nonkyc_price,
+                    source_exchange="SigmaUSD Bank",
+                    target_exchange="NonKYC",
+                    is_profitable=diff_pct > config.MIN_PROFIT_PERCENT and can_mint,
+                    blocked=not can_mint,
+                    blocked_reason=mint_blocked_reason if not can_mint else "",
+                    assumption="SigUSD=USDT assumed (depegged!)",
+                    requires_transfer=True,
+                    estimated_execution_minutes=40,
+                    price_risk_percent=40 * 0.02,
+                    steps=[
+                        f"START: Have {trade_size} ERG in wallet",
+                        f"Mint SigUSD at Bank: send {trade_size} ERG, receive ~{sigusd_minted:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% fees)",
+                        f"Sell SigUSD for USDT somewhere (assumes 1:1 peg)",
+                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        f"END RESULT: ERG on NonKYC (withdraw to wallet: -{config.NONKYC_ERG_WITHDRAW_FEE} ERG)",
+                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                    ],
+                )
+                opportunities.append(opp)
+
+            # ---- USE (DexyUSD) Paths ----
+
+            # Path 8: ERG -> USE mint -> sell USE for ERG
+            # USE can be minted via Crux, price from oracle-based mechanism
+            if use_price and oracle_price and use_price > 0:
+                # Mint USE: spend ERG, get USE at Crux rate (~0.79 ERG flat fee)
+                crux_flat_fee = 0.79  # ERG
+                use_minted = (trade_size - crux_flat_fee) * use_price if trade_size > crux_flat_fee else 0
+                # To profit, we need to sell USE back for more ERG than we spent
+                # USE on Spectrum or elsewhere - for now just show the mint cost
+                use_mint_blocked = not (use_free_mint_ok or use_arb_mint_ok)
+                use_blocked_reason = "USE mint not available" if use_mint_blocked else ""
+
+                # USE value in ERG at oracle rate (USE is pegged to $1)
+                if oracle_price > 0:
+                    use_value_in_erg = use_minted / oracle_price  # if 1 USE = $1
+                    erg_out = use_value_in_erg - config.ERGO_TX_FEE
+                    profit = erg_out - trade_size
+                    pct = (profit / trade_size) * 100 if trade_size > 0 else 0
+
+                    opp = ArbitrageOpportunity(
+                        path=f"Crux mint+sell USE [{trade_size} ERG]",
+                        input_erg=trade_size,
+                        output_erg=erg_out,
+                        profit_erg=profit,
+                        profit_percent=pct,
+                        fees=FeeBreakdown(
+                            execution_fee_erg=crux_flat_fee,
+                            network_fee_erg=config.ERGO_TX_FEE,
+                        ),
+                        source_price=oracle_price,
+                        target_price=use_price,
+                        source_exchange="Crux Finance",
+                        target_exchange="USE holder",
+                        is_profitable=pct > config.MIN_PROFIT_PERCENT and not use_mint_blocked,
+                        blocked=use_mint_blocked,
+                        blocked_reason=use_blocked_reason,
+                        estimated_execution_minutes=5,
+                        price_risk_percent=5 * 0.02,
+                        assumption="USE sell path not yet built",
+                        steps=[
+                            f"START: Have {trade_size} ERG in wallet",
+                            f"Mint USE via Crux Finance (/dexy/build_mint_tx, {crux_flat_fee} ERG fee)",
+                            f"Receive ~{use_minted:.2f} USE at oracle rate (${oracle_price:.4f}/ERG)",
+                            f"Sell USE -> ERG via Crux LP (/dex/swap, ~0.785 ERG service fee)",
+                            f"END RESULT: ~{erg_out:.2f} ERG in wallet (net {profit:+.2f} ERG)",
+                        ],
+                    )
+                    opportunities.append(opp)
+
+        return opportunities
+
+    def _display_opportunities(self, opportunities: list[ArbitrageOpportunity]):
+        """Display opportunities as a full grid: paths x trade sizes."""
+        if not opportunities:
+            console.print("[dim]No opportunities to display[/dim]")
+            return
+
+        # Group by path type
+        path_groups: dict[str, list[ArbitrageOpportunity]] = {}
+        for opp in opportunities:
+            path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            path_groups.setdefault(path_name, []).append(opp)
+
+        # Collect all trade sizes used
+        all_sizes = sorted(set(o.input_erg for o in opportunities))
+
+        best_per_path: list[ArbitrageOpportunity] = []
+        for path_name, opps in path_groups.items():
+            best = max(opps, key=lambda x: x.profit_percent)
+            best_per_path.append(best)
+
+        profitable = [o for o in best_per_path if o.is_profitable and not o.blocked]
+        has_profitable = len(profitable) > 0
+
+        # --- Full Grid: paths x sizes ---
+        title = "Arbitrage Grid (profit %)"
+        if has_profitable:
+            title = f"Arbitrage Grid | {len(profitable)} profitable path(s)"
+        grid = Table(
+            title=title,
+            show_header=True,
+            header_style="bold cyan",
+            border_style="green" if has_profitable else "dim",
+            padding=(0, 1),
+        )
+        grid.add_column("Path", style="bold", no_wrap=True)
+        for size in all_sizes:
+            grid.add_column(f"{size:.0f}", justify="right", min_width=6)
+        grid.add_column("Status", justify="center")
+
+        # Sort paths: profitable first (by best %), then unprofitable, then blocked
+        def path_sort_key(name):
+            opps = path_groups[name]
+            best = max(opps, key=lambda x: x.profit_percent)
+            if best.blocked:
+                return (2, -best.profit_percent)
+            elif best.is_profitable:
+                return (0, -best.profit_percent)
+            else:
+                return (1, -best.profit_percent)
+
+        for path_name in sorted(path_groups.keys(), key=path_sort_key):
+            opps = path_groups[path_name]
+            best = max(opps, key=lambda x: x.profit_percent)
+
+            # Build size->opp lookup
+            size_map = {o.input_erg: o for o in opps}
+
+            display_path = path_name
+            if best.assumption:
+                display_path = f"{path_name} *"
+
+            # Status column
+            if best.blocked:
+                status = "[bold red]BLOCKED[/bold red]"
+            elif best.is_profitable:
+                risk_ok = best.risk_adjusted_profitable
+                status = "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]"
+            else:
+                status = "[dim]-[/dim]"
+
+            # Build cells for each size
+            cells = []
+            for size in all_sizes:
+                opp = size_map.get(size)
+                if opp is None:
+                    cells.append("[dim]-[/dim]")
+                elif opp.blocked:
+                    cells.append(f"[dim]{opp.profit_percent:+.1f}%[/dim]")
+                elif opp.is_profitable:
+                    cells.append(f"[bold green]{opp.profit_percent:+.1f}%[/bold green]")
+                elif opp.profit_percent > -0.5:
+                    cells.append(f"[yellow]{opp.profit_percent:+.1f}%[/yellow]")
+                else:
+                    cells.append(f"[dim]{opp.profit_percent:+.1f}%[/dim]")
+
+            if best.blocked:
+                grid.add_row(f"[dim]{display_path}[/dim]", *cells, status)
+            else:
+                grid.add_row(display_path, *cells, status)
+
+        # Footnotes
+        footnotes = set()
+        for opps in path_groups.values():
+            for o in opps:
+                if o.assumption:
+                    footnotes.add(o.assumption)
+        if footnotes:
+            grid.caption = " | ".join(f"* {a}" for a in footnotes)
+
+        console.print(grid)
+
+        # Show blocked reasons
+        blocked = [o for o in best_per_path if o.blocked]
+        if blocked:
+            reasons = set(o.blocked_reason for o in blocked if o.blocked_reason)
+            for reason in reasons:
+                console.print(f"  [bold red]BLOCKED:[/bold red] [dim]{reason}[/dim]")
+
+        # Show steps for GO/RISKY paths
+        actionable = [o for o in best_per_path if o.is_profitable and not o.blocked]
+        for opp in sorted(actionable, key=lambda x: x.profit_percent, reverse=True):
+            path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            risk_ok = opp.risk_adjusted_profitable
+            status_tag = "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]"
+            console.print(f"\n>> {path_name} [{opp.input_erg:.0f} ERG] {status_tag} [bold green]{opp.profit_percent:+.1f}% ({opp.profit_erg:+.2f} ERG)[/bold green]")
+            if opp.steps:
+                for i, step in enumerate(opp.steps, 1):
+                    if step.startswith("WARNING:"):
+                        console.print(f"   [bold yellow]!! {step}[/bold yellow]")
+                    else:
+                        console.print(f"   [dim]{i}. {step}[/dim]")
+
+        # --- Summary table for profitable paths only ---
+        if profitable:
+            summary = Table(
+                title="Profitable Paths - Best Size",
+                show_header=True,
+                header_style="bold green",
+                border_style="green",
+            )
+            summary.add_column("Path", style="bold", min_width=20)
+            summary.add_column("Size", justify="right")
+            summary.add_column("Profit", justify="right")
+            summary.add_column("ERG", justify="right")
+            summary.add_column("USD", justify="right")
+            summary.add_column("Time", justify="right")
+            summary.add_column("Status", justify="center")
+
+            for opp in sorted(profitable, key=lambda x: x.profit_percent, reverse=True):
+                path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+                risk_ok = opp.risk_adjusted_profitable
+                summary.add_row(
+                    path_name,
+                    f"{opp.input_erg:.0f} ERG",
+                    f"[bold green]{opp.profit_percent:+.2f}%[/bold green]",
+                    f"[bold green]{opp.profit_erg:+.4f}[/bold green]",
+                    f"[bold green]${opp.profit_usd:+.2f}[/bold green]",
+                    f"{opp.estimated_execution_minutes:.0f}m",
+                    "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]",
+                )
+            console.print(summary)
+
+            best = max(profitable, key=lambda x: x.profit_percent)
+            console.print(Panel(
+                f"[bold green]BEST: {best.path}\n"
+                f"Input: {best.input_erg:.2f} ERG -> Output: {best.output_erg:.4f} ERG\n"
+                f"Profit: {best.profit_erg:+.4f} ERG (${best.profit_usd:+.2f}) ({best.profit_percent:+.2f}%)\n"
+                f"Fees: {best.fees.total_fee_erg:.4f} ERG + ${best.fees.total_fee_usd:.4f}\n"
+                f"Time: ~{best.estimated_execution_minutes:.0f} min | Price risk: {best.price_risk_percent:.1f}% | "
+                f"Risk-adjusted: {'YES' if best.risk_adjusted_profitable else 'NO'}[/bold green]",
+                title="Best Opportunity",
+                border_style="green",
+            ))
+            for opp in profitable:
+                self.tracker.log_opportunity(opp, scan_number=self.scan_count,
+                                             snapshot_id=self._last_snapshot_id)
+
+    def _get_path_sources(self, path_key: str) -> list[str]:
+        """Return which price sources a path depends on."""
+        sources = []
+        pk = path_key.lower()
+        if "nonkyc" in pk:
+            sources.append("nonkyc")
+        if "kucoin" in pk:
+            sources.append("kucoin")
+        if "spectrum" in pk:
+            sources.append("spectrum")
+        if "bank" in pk:
+            sources.append("bank")
+        if "crux" in pk or "use" in pk:
+            sources.append("use")
+        return sources
+
+    def _is_price_stale(self, path_key: str) -> bool:
+        """Check if any price source used by this path is stale."""
+        now = time.time()
+        for source in self._get_path_sources(path_key):
+            last = self._price_timestamps.get(source, 0)
+            if (now - last) > config.PRICE_STALE_SECONDS:
+                return True
+        return False
+
+    def _update_streaks(self, opportunities: list[ArbitrageOpportunity]):
+        """Update consecutive scan streak counts for profitable paths."""
+        profitable_keys = set()
+        for opp in opportunities:
+            if opp.is_profitable and not opp.blocked:
+                path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+                profitable_keys.add(path_key)
+
+        # Increment streaks for paths that are profitable this scan
+        for key in profitable_keys:
+            self._opportunity_streak[key] = self._opportunity_streak.get(key, 0) + 1
+
+        # Reset streaks for paths that disappeared
+        for key in list(self._opportunity_streak.keys()):
+            if key not in profitable_keys:
+                self._opportunity_streak[key] = 0
+
+    async def _notify_discord(self, opportunities: list[ArbitrageOpportunity]):
+        """Send Discord notifications for confirmed, non-stale opportunities."""
+        if not self.discord_enabled:
+            return
+
+        self._update_streaks(opportunities)
+
+        # Filter to confirmed opportunities (streak >= CONFIRM_SCANS)
+        confirmed = []
+        for opp in opportunities:
+            if not opp.is_profitable or opp.blocked:
+                continue
+            path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            streak = self._opportunity_streak.get(path_key, 0)
+            if streak < config.DISCORD_CONFIRM_SCANS:
+                logger.debug(f"Streak {streak}/{config.DISCORD_CONFIRM_SCANS}: {path_key}")
+                continue
+            if self._is_price_stale(path_key):
+                logger.debug(f"Stale price, skipping notification: {path_key}")
+                continue
+            confirmed.append(opp)
+
+        if confirmed:
+            sent = await self.discord.notify_opportunities(
+                confirmed, scan_number=self.scan_count
+            )
+            if sent > 0:
+                logger.info(f"Sent {sent} Discord notification(s) (confirmed)")
+
+        # Log streak status for visibility
+        active_streaks = {k: v for k, v in self._opportunity_streak.items() if v > 0}
+        if active_streaks:
+            streak_info = ", ".join(f"{k}: {v}" for k, v in active_streaks.items())
+            logger.info(f"Streaks: {streak_info}")
+
+    async def _execute_trades(self, opportunities: list[ArbitrageOpportunity]):
+        """Execute trades for profitable opportunities (--live mode only)."""
+        if not self.trading_enabled:
+            return
+
+        profitable = [o for o in opportunities if o.is_profitable and not o.blocked and o.risk_adjusted_profitable]
+        if not profitable:
+            return
+
+        best = max(profitable, key=lambda x: x.profit_percent)
+        path_name = best.path.rsplit(" [", 1)[0] if " [" in best.path else best.path
+
+        # TODO: Wire up actual execution per path
+        logger.warning(
+            f"LIVE MODE: Would execute {path_name} with {best.input_erg:.0f} ERG "
+            f"(+{best.profit_percent:.2f}%) - NOT YET IMPLEMENTED"
+        )
+        console.print(Panel(
+            f"[bold yellow]LIVE MODE: Trade execution not yet implemented\n"
+            f"Path: {path_name}\n"
+            f"Size: {best.input_erg:.0f} ERG | Profit: +{best.profit_erg:.4f} ERG[/bold yellow]",
+            title="Trade Execution (pending implementation)",
+            border_style="yellow",
+        ))
+
+    async def _fetch_wallet_balances(self) -> dict:
+        """Fetch current wallet balances."""
+        balances = await self.ergo_node.get_wallet_balances()
+        if not balances:
+            return {"erg": 0, "sigusd": 0, "use": 0}
+        tokens = balances.get("tokens", {})
+        sigusd_raw = tokens.get(config.SIGUSD_TOKEN_ID, {}).get("amount", 0)
+        use_raw = tokens.get(config.USE_TOKEN_ID, {}).get("amount", 0)
+        return {
+            "erg": balances.get("erg", 0),
+            "sigusd": sigusd_raw / 100,  # 2 decimals
+            "use": use_raw / 1000,  # 3 decimals
+        }
+
+    def _build_wallet_analysis(self, wallet: dict, prices: dict):
+        """Analyze wallet by asset: what paths exist, profit for each.
+
+        Each option is a dict:
+            name: str - short path name
+            steps: list[str] - step-by-step flow with amounts
+            profit_pct: float - % profit vs baseline
+            profit_desc: str - human-readable profit summary
+            result: str - what you end up with
+            blocked: bool
+            blocked_reason: str
+        """
+        erg = wallet.get("erg", 0)
+        sigusd = wallet.get("sigusd", 0)
+        use = wallet.get("use", 0)
+
+        oracle_price = prices.get("bank", {}).get("oracle_erg_usd")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        can_redeem = prices.get("bank", {}).get("can_redeem_sigusd", False)
+        can_mint = prices.get("bank", {}).get("can_mint_sigusd", False)
+        nonkyc_price = prices.get("nonkyc_erg_usdt")
+        kucoin_price = prices.get("kucoin_erg_usdt")
+        fee_factor = (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+        bank_fee_pct = (1 - fee_factor) * 100  # ~2.225%
+
+        nonkyc_usdt_fee = getattr(self, '_nonkyc_usdt_fee', 0)
+        kucoin_usdt_fee = getattr(self, '_kucoin_usdt_fee', 1.0)
+
+        erg_options = []
+        sigusd_options = []
+        use_options = []
+
+        # ===================== ERG OPTIONS =====================
+        if erg > 2:
+            # 1. Bank mint -> Spectrum sell
+            if oracle_price and spectrum_price:
+                if can_mint:
+                    bank_rate = oracle_price * fee_factor
+                    sigusd_out = erg * bank_rate
+                    erg_before_fees = (sigusd_out / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                    total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
+                    erg_back = erg_before_fees - total_fees
+                    net = erg_back - erg
+                    pct = (net / erg) * 100
+                    erg_options.append({
+                        "name": "Bank mint -> Spectrum sell",
+                        "steps": [
+                            f"Mint SigUSD at Bank: {erg:.2f} ERG -> {sigusd_out:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                            f"Swap SigUSD -> ERG on Spectrum: {sigusd_out:.2f} SigUSD -> {erg_before_fees:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                            f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
+                        ],
+                        "profit_pct": pct,
+                        "profit_desc": f"{net:+.2f} ERG ({pct:+.1f}%)",
+                        "result": f"{erg_back:.2f} ERG in wallet",
+                        "blocked": False, "blocked_reason": "",
+                    })
+                else:
+                    rr = prices.get('bank', {}).get('reserve_ratio', 0)
+                    erg_options.append({"name": "Bank mint -> Spectrum sell", "steps": [], "profit_pct": 0,
+                        "profit_desc": "", "result": "", "blocked": True,
+                        "blocked_reason": f"Bank mint BLOCKED (RR={rr:.0f}%, need >400%)"})
+
+            # 2. Spectrum buy SigUSD -> Bank redeem
+            if oracle_price and spectrum_price:
+                if can_redeem:
+                    sigusd_out = erg * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                    erg_from_bank = (sigusd_out / oracle_price) * fee_factor
+                    total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE + config.SIGMAUSD_REDEEM_EXTRA_ERG
+                    erg_back = erg_from_bank - total_fees
+                    net = erg_back - erg
+                    pct = (net / erg) * 100
+                    erg_options.append({
+                        "name": "Spectrum buy -> Bank redeem",
+                        "steps": [
+                            f"Swap ERG -> SigUSD on Spectrum: {erg:.2f} ERG -> {sigusd_out:.2f} SigUSD (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                            f"Redeem SigUSD at Bank: {sigusd_out:.2f} SigUSD -> {erg_from_bank:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                            f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
+                        ],
+                        "profit_pct": pct,
+                        "profit_desc": f"{net:+.2f} ERG ({pct:+.1f}%)",
+                        "result": f"{erg_back:.2f} ERG in wallet",
+                        "blocked": False, "blocked_reason": "",
+                    })
+                else:
+                    erg_options.append({"name": "Spectrum buy -> Bank redeem", "steps": [], "profit_pct": 0,
+                        "profit_desc": "", "result": "", "blocked": True, "blocked_reason": "Bank redeem BLOCKED"})
+
+            # 3. Sell ERG on NonKYC
+            if nonkyc_price:
+                usdt_out = erg * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+                erg_options.append({
+                    "name": "Sell on NonKYC",
+                    "steps": [
+                        f"Deposit {erg:.2f} ERG to NonKYC (free)",
+                        f"Sell on NonKYC: {erg:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                    ],
+                    "profit_pct": 0,
+                    "profit_desc": f"${usdt_out:.2f} USDT (withdraw fee: {nonkyc_usdt_fee} USDT)",
+                    "result": f"${usdt_out:.2f} USDT on NonKYC",
+                    "blocked": False, "blocked_reason": "exit to USDT",
+                })
+
+            # 4. Sell ERG on Kucoin
+            if kucoin_price:
+                usdt_out = erg * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
+                erg_options.append({
+                    "name": "Sell on Kucoin",
+                    "steps": [
+                        f"Deposit {erg:.2f} ERG to Kucoin (free)",
+                        f"Sell on Kucoin: {erg:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                    ],
+                    "profit_pct": 0,
+                    "profit_desc": f"${usdt_out:.2f} USDT (withdraw fee: {kucoin_usdt_fee} USDT)",
+                    "result": f"${usdt_out:.2f} USDT on Kucoin",
+                    "blocked": False, "blocked_reason": "exit to USDT",
+                })
+
+        # ===================== SIGUSD OPTIONS =====================
+        # Baseline: SigUSD at oracle rate (no fees) = sigusd / oracle_price ERG
+        if sigusd > 0.5 and oracle_price and oracle_price > 0:
+            baseline_erg = sigusd / oracle_price
+
+            # 1. Bank redeem (SigUSD -> ERG)
+            if can_redeem:
+                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                pct = ((erg_out - baseline_erg) / baseline_erg) * 100
+                sigusd_options.append({
+                    "name": "Bank redeem",
+                    "steps": [
+                        f"Redeem at Bank: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee, -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG extra)",
+                    ],
+                    "profit_pct": pct,
+                    "profit_desc": f"{erg_out:.2f} ERG ({pct:+.1f}% vs oracle baseline {baseline_erg:.2f} ERG)",
+                    "result": f"{erg_out:.2f} ERG in wallet",
+                    "blocked": False, "blocked_reason": "",
+                })
+            else:
+                sigusd_options.append({"name": "Bank redeem", "steps": [], "profit_pct": 0,
+                    "profit_desc": "", "result": "", "blocked": True, "blocked_reason": "Bank redeem BLOCKED"})
+
+            # 2. Spectrum swap (SigUSD -> ERG)
+            if spectrum_price:
+                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_out = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                pct = ((erg_out - baseline_erg) / baseline_erg) * 100
+                sigusd_options.append({
+                    "name": "Spectrum swap",
+                    "steps": [
+                        f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                    ],
+                    "profit_pct": pct,
+                    "profit_desc": f"{erg_out:.2f} ERG ({pct:+.1f}% vs oracle baseline {baseline_erg:.2f} ERG)",
+                    "result": f"{erg_out:.2f} ERG in wallet",
+                    "blocked": False, "blocked_reason": "",
+                })
+
+            # 3. Spectrum -> Kucoin (SigUSD -> ERG -> USDT)
+            if spectrum_price and kucoin_price:
+                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                if erg_from_dex > 0:
+                    usdt_out = erg_from_dex * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
+                    # Profit: compare USDT out to what SigUSD "should be worth" ($1 per SigUSD if pegged)
+                    baseline_usdt = sigusd  # 1 SigUSD should = $1
+                    pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                    sigusd_options.append({
+                        "name": "Spectrum -> Kucoin",
+                        "steps": [
+                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                            f"Deposit {erg_from_dex:.2f} ERG to Kucoin (free)",
+                            f"Sell on Kucoin: {erg_from_dex:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        ],
+                        "profit_pct": pct_usdt,
+                        "profit_desc": f"${usdt_out:.2f} USDT from {sigusd:.2f} SigUSD ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {kucoin_usdt_fee} USDT)",
+                        "result": f"${usdt_out:.2f} USDT on Kucoin",
+                        "blocked": False, "blocked_reason": "",
+                    })
+
+            # 4. Spectrum -> NonKYC (SigUSD -> ERG -> USDT)
+            if spectrum_price and nonkyc_price:
+                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                if erg_from_dex > 0:
+                    usdt_out = erg_from_dex * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+                    baseline_usdt = sigusd
+                    pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                    sigusd_options.append({
+                        "name": "Spectrum -> NonKYC",
+                        "steps": [
+                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                            f"Deposit {erg_from_dex:.2f} ERG to NonKYC (free)",
+                            f"Sell on NonKYC: {erg_from_dex:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        ],
+                        "profit_pct": pct_usdt,
+                        "profit_desc": f"${usdt_out:.2f} USDT from {sigusd:.2f} SigUSD ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {nonkyc_usdt_fee} USDT)",
+                        "result": f"${usdt_out:.2f} USDT on NonKYC",
+                        "blocked": False, "blocked_reason": "",
+                    })
+
+            # 5. Bank redeem -> Kucoin (SigUSD -> ERG via bank -> USDT)
+            if can_redeem and kucoin_price:
+                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                if erg_out > 0:
+                    usdt_out = erg_out * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
+                    baseline_usdt = sigusd
+                    pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                    sigusd_options.append({
+                        "name": "Bank redeem -> Kucoin",
+                        "steps": [
+                            f"Redeem at Bank: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                            f"Deposit {erg_out:.2f} ERG to Kucoin (free)",
+                            f"Sell on Kucoin: {erg_out:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                        ],
+                        "profit_pct": pct_usdt,
+                        "profit_desc": f"${usdt_out:.2f} USDT from {sigusd:.2f} SigUSD ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {kucoin_usdt_fee} USDT)",
+                        "result": f"${usdt_out:.2f} USDT on Kucoin",
+                        "blocked": False, "blocked_reason": "",
+                    })
+
+            # 6. Bank redeem -> NonKYC (SigUSD -> ERG via bank -> USDT)
+            if can_redeem and nonkyc_price:
+                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                if erg_out > 0:
+                    usdt_out = erg_out * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+                    baseline_usdt = sigusd
+                    pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                    sigusd_options.append({
+                        "name": "Bank redeem -> NonKYC",
+                        "steps": [
+                            f"Redeem at Bank: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                            f"Deposit {erg_out:.2f} ERG to NonKYC (free)",
+                            f"Sell on NonKYC: {erg_out:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                        ],
+                        "profit_pct": pct_usdt,
+                        "profit_desc": f"${usdt_out:.2f} USDT from {sigusd:.2f} SigUSD ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {nonkyc_usdt_fee} USDT)",
+                        "result": f"${usdt_out:.2f} USDT on NonKYC",
+                        "blocked": False, "blocked_reason": "",
+                    })
+
+        # ===================== USE OPTIONS =====================
+        # USE -> ERG is the first hop, then ERG unlocks more paths
+        if use > 0.01:
+            if oracle_price and oracle_price > 0:
+                baseline_usdt = use  # 1 USE ~= $1
+                erg_before_fees = use / oracle_price
+                erg_from_crux = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                crux_step = f"Swap via Crux: {use:.3f} USE -> {erg_from_crux:.2f} ERG (-{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)"
+
+                if erg_from_crux > 0:
+                    # 1. USE -> ERG (keep)
+                    pct = ((erg_from_crux - erg_before_fees) / erg_before_fees) * 100
+                    use_options.append({
+                        "name": "Crux -> keep ERG",
+                        "steps": [crux_step],
+                        "profit_pct": pct,
+                        "profit_desc": f"{erg_from_crux:.2f} ERG ({pct:+.1f}% after fees, baseline {erg_before_fees:.2f} ERG)",
+                        "result": f"{erg_from_crux:.2f} ERG in wallet",
+                        "blocked": False, "blocked_reason": "",
+                    })
+
+                    # 2. USE -> ERG -> sell on Kucoin -> USDT
+                    if kucoin_price:
+                        usdt_out = erg_from_crux * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
+                        pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                        use_options.append({
+                            "name": "Crux -> Kucoin",
+                            "steps": [
+                                crux_step,
+                                f"Deposit {erg_from_crux:.2f} ERG to Kucoin (free)",
+                                f"Sell on Kucoin: {erg_from_crux:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
+                            ],
+                            "profit_pct": pct_usdt,
+                            "profit_desc": f"${usdt_out:.2f} USDT from {use:.3f} USE ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {kucoin_usdt_fee} USDT)",
+                            "result": f"${usdt_out:.2f} USDT on Kucoin",
+                            "blocked": False, "blocked_reason": "",
+                        })
+
+                    # 3. USE -> ERG -> sell on NonKYC -> USDT
+                    if nonkyc_price:
+                        usdt_out = erg_from_crux * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+                        pct_usdt = ((usdt_out - baseline_usdt) / baseline_usdt) * 100
+                        use_options.append({
+                            "name": "Crux -> NonKYC",
+                            "steps": [
+                                crux_step,
+                                f"Deposit {erg_from_crux:.2f} ERG to NonKYC (free)",
+                                f"Sell on NonKYC: {erg_from_crux:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
+                            ],
+                            "profit_pct": pct_usdt,
+                            "profit_desc": f"${usdt_out:.2f} USDT from {use:.3f} USE ({pct_usdt:+.1f}% vs $1 peg, withdraw fee: {nonkyc_usdt_fee} USDT)",
+                            "result": f"${usdt_out:.2f} USDT on NonKYC",
+                            "blocked": False, "blocked_reason": "",
+                        })
+
+                    # 4. USE -> ERG -> Spectrum buy SigUSD -> Bank redeem -> ERG (arb loop)
+                    if spectrum_price and can_redeem:
+                        sigusd_from_spectrum = erg_from_crux * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                        erg_hop2 = (sigusd_from_spectrum / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                        total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE
+                        erg_final = erg_hop2 - total_fees_hop2
+                        net = erg_final - erg_from_crux
+                        pct_arb = (net / erg_from_crux) * 100
+                        use_options.append({
+                            "name": "Crux -> Spectrum -> Bank redeem",
+                            "steps": [
+                                crux_step,
+                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service)",
+                                f"Redeem at Bank: {sigusd_from_spectrum:.2f} SigUSD -> {erg_hop2:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                                f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
+                            ],
+                            "profit_pct": pct_arb,
+                            "profit_desc": f"{erg_final:.2f} ERG from {erg_from_crux:.2f} ERG ({pct_arb:+.1f}%)",
+                            "result": f"{erg_final:.2f} ERG in wallet",
+                            "blocked": False, "blocked_reason": "",
+                        })
+
+                    # 5. USE -> ERG -> Bank mint SigUSD -> Spectrum sell -> ERG (if mint available)
+                    if spectrum_price and can_mint:
+                        bank_rate = oracle_price * fee_factor
+                        sigusd_from_bank = erg_from_crux * bank_rate
+                        erg_from_spectrum = (sigusd_from_bank / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                        total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
+                        erg_final = erg_from_spectrum - total_fees_hop2
+                        net = erg_final - erg_from_crux
+                        pct_arb = (net / erg_from_crux) * 100
+                        use_options.append({
+                            "name": "Crux -> Bank mint -> Spectrum sell",
+                            "steps": [
+                                crux_step,
+                                f"Mint SigUSD at Bank: {erg_from_crux:.2f} ERG -> {sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
+                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service)",
+                                f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
+                            ],
+                            "profit_pct": pct_arb,
+                            "profit_desc": f"{erg_final:.2f} ERG from {erg_from_crux:.2f} ERG ({pct_arb:+.1f}%)",
+                            "result": f"{erg_final:.2f} ERG in wallet",
+                            "blocked": False, "blocked_reason": "",
+                        })
+                    elif spectrum_price and not can_mint:
+                        rr = prices.get('bank', {}).get('reserve_ratio', 0)
+                        use_options.append({"name": "Crux -> Bank mint -> Spectrum sell", "steps": [], "profit_pct": 0,
+                            "profit_desc": "", "result": "", "blocked": True,
+                            "blocked_reason": f"Bank mint BLOCKED (RR={rr:.0f}%)"})
+                else:
+                    use_options.append({
+                        "name": "Crux LP swap",
+                        "steps": [f"Not worth it: {config.SPECTRUM_EXECUTION_FEE} ERG service fee > {erg_before_fees:.2f} ERG value"],
+                        "profit_pct": -100,
+                        "profit_desc": f"Balance too small (0.785 ERG fee > {erg_before_fees:.2f} ERG value)",
+                        "result": "",
+                        "blocked": False, "blocked_reason": "too small",
+                    })
+
+        return {
+            "erg": {"balance": erg, "options": erg_options},
+            "sigusd": {"balance": sigusd, "options": sigusd_options},
+            "use": {"balance": use, "options": use_options},
+        }
+
+    def _display_wallet_opportunities(self, wallet: dict, opportunities: list, prices: dict):
+        """Show what's possible with current wallet holdings."""
+        erg = wallet.get("erg", 0)
+        sigusd = wallet.get("sigusd", 0)
+        use = wallet.get("use", 0)
+
+        console.print()
+        console.print(Panel(
+            f"[bold]ERG:[/bold] {erg:.4f}  |  [bold]SigUSD:[/bold] {sigusd:.2f}  |  [bold]USE:[/bold] {use:.3f}",
+            title="Wallet Balances",
+            border_style="cyan",
+        ))
+
+        analysis = self._build_wallet_analysis(wallet, prices)
+
+        for asset_key, label in [("erg", "ERG"), ("sigusd", "SigUSD"), ("use", "USE")]:
+            info = analysis[asset_key]
+            balance = info["balance"]
+            options = info["options"]
+
+            if (asset_key == "erg" and balance < 2) or (asset_key == "sigusd" and balance < 0.5) or (asset_key == "use" and balance < 0.01):
+                console.print(f"  [dim]{label}: No balance[/dim]")
+                continue
+
+            if not options:
+                console.print(f"  [dim]{label}: No paths available[/dim]")
+                continue
+
+            available = [o for o in options if not o["blocked"] and o.get("blocked_reason") != "exit to USDT"]
+            usdt_exits = [o for o in options if not o["blocked"] and o.get("blocked_reason") == "exit to USDT"]
+            blocked = [o for o in options if o["blocked"]]
+
+            profitable = [o for o in available if o["profit_pct"] > 0.5]
+
+            # Header line
+            if profitable:
+                best = max(profitable, key=lambda x: x["profit_pct"])
+                console.print(f"\n  [bold green]{label}: {len(profitable)} profitable option(s). Best: {best['name']} ({best['profit_pct']:+.1f}%)[/bold green]")
+            elif available:
+                best = max(available, key=lambda x: x["profit_pct"])
+                if best.get("blocked_reason") == "too small":
+                    console.print(f"\n  [yellow]{label}: {best['profit_desc']}[/yellow]")
+                else:
+                    console.print(f"\n  [yellow]{label}: No profitable options. Best: {best['name']} ({best['profit_pct']:+.1f}%)[/yellow]")
+            else:
+                reasons = ", ".join(o["blocked_reason"] for o in blocked if o["blocked_reason"])
+                console.print(f"\n  [dim]{label}: All paths blocked ({reasons})[/dim]")
+
+            # Show each option with steps
+            all_available = sorted(available, key=lambda x: x["profit_pct"], reverse=True)
+            for o in all_available:
+                is_best = profitable and o["name"] == max(profitable, key=lambda x: x["profit_pct"])["name"]
+                pct = o["profit_pct"]
+                tag = "[bold green]" if pct > 0.5 else "[yellow]" if pct > -1 else "[dim]"
+                end_tag = "[/bold green]" if pct > 0.5 else "[/yellow]" if pct > -1 else "[/dim]"
+
+                console.print(f"    {tag}{o['name']} ({pct:+.1f}%):{end_tag}")
+                for step in o["steps"]:
+                    console.print(f"      {tag}{step}{end_tag}")
+                console.print(f"      {tag}-> {o['profit_desc']}{end_tag}")
+
+            # Show USDT exit options (ERG only)
+            for o in usdt_exits:
+                console.print(f"    [dim]{o['name']}: {o['profit_desc']}[/dim]")
+
+            # Show blocked
+            for o in blocked:
+                console.print(f"    [dim]-- {o['name']}: {o['blocked_reason']}[/dim]")
+
+    def _should_send_wallet_analysis(self, opportunities: list[ArbitrageOpportunity]) -> bool:
+        """Check if wallet analysis should be sent to Discord."""
+        now = time.time()
+        elapsed = now - self._last_wallet_analysis_time
+
+        # Periodic: every WALLET_COOLDOWN_SECONDS
+        if elapsed >= config.DISCORD_WALLET_COOLDOWN_SECONDS:
+            return True
+
+        # Triggered: when a NEW opportunity just hit confirmation threshold
+        for opp in opportunities:
+            if not opp.is_profitable or opp.blocked:
+                continue
+            path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            streak = self._opportunity_streak.get(path_key, 0)
+            if streak == config.DISCORD_CONFIRM_SCANS:
+                return True
+
+        return False
+
+    async def scan_once(self):
+        """Run a single scan cycle."""
+        self.scan_count += 1
+        console.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
+
+        prices = await self.fetch_all_prices()
+        self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
+        self._display_prices(prices)
+
+        opportunities = self._find_opportunities(prices)
+        self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
+        self._display_opportunities(opportunities)
+
+        # Wallet-based analysis
+        wallet = await self._fetch_wallet_balances()
+        self._display_wallet_opportunities(wallet, opportunities, prices)
+
+        await self._notify_discord(opportunities)
+
+        # Send wallet analysis to Discord (rate limited)
+        if self.discord_enabled and self._should_send_wallet_analysis(opportunities):
+            analysis = self._build_wallet_analysis(wallet, prices)
+            await self.discord.send_wallet_analysis(wallet, analysis)
+            self._last_wallet_analysis_time = time.time()
+            logger.info("Wallet analysis sent to Discord")
+
+        # Periodic summary heartbeat
+        if self.discord_enabled:
+            now = time.time()
+            if (now - self._last_summary_time) >= config.DISCORD_SUMMARY_INTERVAL_SECONDS:
+                await self.discord.send_scan_summary(opportunities, scan_number=self.scan_count)
+                self._last_summary_time = now
+                logger.info("Periodic summary sent to Discord")
+
+        await self._execute_trades(opportunities)
+
+        profitable_count = sum(1 for o in opportunities if o.is_profitable and not o.blocked)
+        self.tracker.update_daily_summary(self.scan_count, profitable_count)
+        logger.info(
+            f"Scan #{self.scan_count}: {len(opportunities)} paths analyzed, "
+            f"{profitable_count} profitable"
+        )
+
+    async def run(self):
+        """Main scan loop."""
+        mode_display = {
+            "monitor": "MONITOR ONLY (console output)",
+            "notify": "NOTIFICATION (console + Discord alerts)",
+            "live": "LIVE TRADING (console + Discord + auto-execute)",
+        }.get(self.mode, self.mode.upper())
+
+        discord_line = ""
+        if self.discord_enabled:
+            discord_line = (
+                f"Discord: ENABLED (min {config.DISCORD_MIN_PROFIT_PERCENT}%/{config.DISCORD_MIN_PROFIT_ERG} ERG, "
+                f"cooldown {config.DISCORD_COOLDOWN_SECONDS}s, confirm {config.DISCORD_CONFIRM_SCANS} scans)\n"
+                f"Tier 1 ping: >={config.DISCORD_TIER1_PROFIT_PERCENT}% + no SigUSD=USDT assumption\n"
+                f"Wallet analysis: every {config.DISCORD_WALLET_COOLDOWN_SECONDS}s | Summary: every {config.DISCORD_SUMMARY_INTERVAL_SECONDS}s"
+            )
+            if config.DISCORD_USER_ID:
+                discord_line += f"\nPinging user: <@{config.DISCORD_USER_ID}>"
+        elif self.mode in ("notify", "live"):
+            discord_line = "Discord: NOT CONFIGURED (set DISCORD_WEBHOOK_URL in .env)"
+        else:
+            discord_line = "Discord: DISABLED (use --notify or --live to enable)"
+
+        console.print(Panel(
+            "[bold]Ergo Arbitrage Scanner[/bold]\n"
+            f"Mode: {mode_display}\n"
+            f"Min profit: {config.MIN_PROFIT_PERCENT}%\n"
+            f"Max trade size: {config.MAX_TRADE_SIZE_ERG} ERG\n"
+            f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s\n"
+            f"Trade sizes monitored: {self._trade_sizes}\n"
+            f"{discord_line}",
+            title="Starting Up",
+            border_style="red" if self.mode == "live" else "magenta",
+        ))
+
+        await self.connect_all()
+
+        if self.discord_enabled:
+            await self.discord.send_startup_message(mode=self.mode)
+
+        try:
+            while True:
+                try:
+                    await self.scan_once()
+                except Exception as e:
+                    logger.error(f"Scan error: {e}", exc_info=True)
+                await asyncio.sleep(config.SCAN_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Shutting down...[/bold yellow]")
+        finally:
+            self.tracker.print_summary()
+            if self.discord_enabled:
+                await self.discord.send_summary_message(self.tracker.get_session_stats())
+            await self.disconnect_all()
