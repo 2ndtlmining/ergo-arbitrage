@@ -1,7 +1,7 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from rich.table import Table
@@ -11,16 +11,23 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.tracker")
 
+SCHEMA_VERSION = 1
+
 
 class ProfitTracker:
     def __init__(self, db_path: str = "arbitrage_tracker.db"):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
+        # WAL lets a dashboard read while the scanner writes
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
-        self._opportunities_seen = 0
-        self._total_potential_profit = 0.0
+        self._migrate()
         self._session_start = datetime.now()
+        # Episodes: one row per continuous run of a profitable path
+        self._open_episodes: dict[str, int] = {}  # path_key -> episode id
+        self._session_episode_best: dict[int, float] = {}  # episode id -> best profit
+        self._close_stale_episodes()
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -117,8 +124,103 @@ class ProfitTracker:
                 worst_loss_erg REAL DEFAULT 0,
                 avg_spread_percent REAL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS opportunity_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                closed_at TEXT,
+                scans INTEGER NOT NULL DEFAULT 1,
+                first_scan_number INTEGER,
+                best_profit_erg REAL NOT NULL,
+                best_profit_percent REAL NOT NULL,
+                best_size_erg REAL NOT NULL,
+                opportunity_id INTEGER,
+                FOREIGN KEY (opportunity_id) REFERENCES opportunities(id)
+            );
         """)
         self.conn.commit()
+
+    def _migrate(self):
+        """Schema versioning via PRAGMA user_version; each step is idempotent."""
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            self.conn.executescript("""
+                CREATE INDEX IF NOT EXISTS ix_scan_results_ts ON scan_results(timestamp);
+                CREATE INDEX IF NOT EXISTS ix_scan_results_path ON scan_results(path);
+                CREATE INDEX IF NOT EXISTS ix_opportunities_ts ON opportunities(timestamp);
+                CREATE INDEX IF NOT EXISTS ix_episodes_path ON opportunity_episodes(path, first_seen);
+            """)
+        if version < SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.conn.commit()
+
+    def _close_stale_episodes(self):
+        """Close episodes left open by a previous process (crash or kill)."""
+        self.conn.execute(
+            "UPDATE opportunity_episodes SET closed_at = last_seen WHERE closed_at IS NULL"
+        )
+        self.conn.commit()
+
+    def record_scan(self, opportunities: list, scan_number: int, snapshot_id: int = None):
+        """Open, extend or close opportunity episodes for this scan.
+
+        A path that stays profitable for many scans is one episode; its potential
+        profit is counted once, at the best size seen during the episode.
+        """
+        now = datetime.now().isoformat()
+        best: dict = {}
+        for opp in opportunities:
+            if not opp.is_profitable or opp.blocked:
+                continue
+            key = opp.path_key
+            if key not in best or opp.profit_erg > best[key].profit_erg:
+                best[key] = opp
+
+        for key, opp in best.items():
+            episode_id = self._open_episodes.get(key)
+            if episode_id is None:
+                opp_id = self.log_opportunity(opp, scan_number=scan_number, snapshot_id=snapshot_id)
+                cursor = self.conn.execute(
+                    """INSERT INTO opportunity_episodes
+                       (path, first_seen, last_seen, scans, first_scan_number,
+                        best_profit_erg, best_profit_percent, best_size_erg, opportunity_id)
+                       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)""",
+                    (key, now, now, scan_number, opp.profit_erg, opp.profit_percent, opp.input_erg, opp_id),
+                )
+                self._open_episodes[key] = cursor.lastrowid
+                self._session_episode_best[cursor.lastrowid] = opp.profit_erg
+                continue
+            self.conn.execute(
+                "UPDATE opportunity_episodes SET last_seen = ?, scans = scans + 1 WHERE id = ?",
+                (now, episode_id),
+            )
+            if opp.profit_erg > self._session_episode_best[episode_id]:
+                self.conn.execute(
+                    """UPDATE opportunity_episodes
+                       SET best_profit_erg = ?, best_profit_percent = ?, best_size_erg = ?
+                       WHERE id = ?""",
+                    (opp.profit_erg, opp.profit_percent, opp.input_erg, episode_id),
+                )
+                self._session_episode_best[episode_id] = opp.profit_erg
+
+        for key in [k for k in self._open_episodes if k not in best]:
+            episode_id = self._open_episodes.pop(key)
+            self.conn.execute(
+                "UPDATE opportunity_episodes SET closed_at = ? WHERE id = ?", (now, episode_id)
+            )
+            logger.info(f"Episode #{episode_id} closed: {key}")
+        self.conn.commit()
+
+    def prune_scan_results(self, days: int) -> int:
+        """Delete non-profitable scan_results older than `days`. Returns rows deleted."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cursor = self.conn.execute(
+            "DELETE FROM scan_results WHERE is_profitable = 0 AND timestamp < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def log_price_snapshot(self, prices: dict) -> int:
         """Log a price snapshot from all sources."""
@@ -175,10 +277,7 @@ class ProfitTracker:
         logger.debug(f"Logged {len(opportunities)} scan results for scan #{scan_number}")
 
     def log_opportunity(self, opp, scan_number: int = 0, snapshot_id: int = None) -> int:
-        """Log a profitable opportunity with full fee breakdown."""
-        self._opportunities_seen += 1
-        self._total_potential_profit += opp.profit_erg
-
+        """Log a profitable opportunity with full fee breakdown (once per episode)."""
         cursor = self.conn.execute(
             """INSERT INTO opportunities
                (timestamp, scan_number, path, input_erg, output_erg, profit_erg, profit_percent,
@@ -296,8 +395,8 @@ class ProfitTracker:
         self.conn.commit()
         logger.error(f"Trade #{trade_id} failed after {duration:.1f}s: {error}")
 
-    def update_daily_summary(self, scan_count: int, opportunities: int):
-        """Update today's daily summary."""
+    def update_daily_summary(self, opportunities: int):
+        """Count one scan in today's summary (accumulates across restarts)."""
         today = datetime.now().strftime("%Y-%m-%d")
 
         # Get today's trade stats
@@ -318,9 +417,9 @@ class ProfitTracker:
             INSERT INTO daily_summary (date, total_scans, opportunities_found,
                 trades_attempted, trades_completed, trades_failed,
                 total_profit_erg, total_fees_erg, best_profit_erg, worst_loss_erg)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
-                total_scans = ?,
+                total_scans = total_scans + 1,
                 opportunities_found = opportunities_found + ?,
                 trades_attempted = ?,
                 trades_completed = ?,
@@ -330,12 +429,12 @@ class ProfitTracker:
                 best_profit_erg = ?,
                 worst_loss_erg = ?
         """, (
-            today, scan_count, opportunities,
+            today, opportunities,
             trade_stats["attempted"], trade_stats["completed"], trade_stats["failed"],
             trade_stats["profit"], trade_stats["fees"],
             trade_stats["best"], trade_stats["worst"],
             # ON CONFLICT values
-            scan_count, opportunities,
+            opportunities,
             trade_stats["attempted"], trade_stats["completed"], trade_stats["failed"],
             trade_stats["profit"], trade_stats["fees"],
             trade_stats["best"], trade_stats["worst"],
@@ -344,8 +443,8 @@ class ProfitTracker:
 
     def get_session_stats(self) -> dict:
         return {
-            "opportunities_seen": self._opportunities_seen,
-            "total_potential_profit_erg": self._total_potential_profit,
+            "opportunities_seen": len(self._session_episode_best),
+            "total_potential_profit_erg": sum(self._session_episode_best.values()),
             "session_duration": str(datetime.now() - self._session_start).split(".")[0],
         }
 

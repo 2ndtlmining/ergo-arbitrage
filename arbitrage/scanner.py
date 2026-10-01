@@ -661,7 +661,7 @@ class ArbitrageScanner:
         # Group by path type
         path_groups: dict[str, list[ArbitrageOpportunity]] = {}
         for opp in opportunities:
-            path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            path_name = opp.path_key
             path_groups.setdefault(path_name, []).append(opp)
 
         # Collect all trade sizes used
@@ -763,7 +763,7 @@ class ArbitrageScanner:
         # Show steps for GO/RISKY paths
         actionable = [o for o in best_per_path if o.is_profitable and not o.blocked]
         for opp in sorted(actionable, key=lambda x: x.profit_percent, reverse=True):
-            path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            path_name = opp.path_key
             risk_ok = opp.risk_adjusted_profitable
             status_tag = "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]"
             console.print(f"\n>> {path_name} [{opp.input_erg:.0f} ERG] {status_tag} [bold green]{opp.profit_percent:+.1f}% ({opp.profit_erg:+.2f} ERG)[/bold green]")
@@ -791,7 +791,7 @@ class ArbitrageScanner:
             summary.add_column("Status", justify="center")
 
             for opp in sorted(profitable, key=lambda x: x.profit_percent, reverse=True):
-                path_name = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+                path_name = opp.path_key
                 risk_ok = opp.risk_adjusted_profitable
                 summary.add_row(
                     path_name,
@@ -815,9 +815,6 @@ class ArbitrageScanner:
                 title="Best Opportunity",
                 border_style="green",
             ))
-            for opp in profitable:
-                self.tracker.log_opportunity(opp, scan_number=self.scan_count,
-                                             snapshot_id=self._last_snapshot_id)
 
     def _get_path_sources(self, path_key: str) -> list[str]:
         """Return which price sources a path depends on."""
@@ -849,7 +846,7 @@ class ArbitrageScanner:
         profitable_keys = set()
         for opp in opportunities:
             if opp.is_profitable and not opp.blocked:
-                path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+                path_key = opp.path_key
                 profitable_keys.add(path_key)
 
         # Increment streaks for paths that are profitable this scan
@@ -873,7 +870,7 @@ class ArbitrageScanner:
         for opp in opportunities:
             if not opp.is_profitable or opp.blocked:
                 continue
-            path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            path_key = opp.path_key
             streak = self._opportunity_streak.get(path_key, 0)
             if streak < config.DISCORD_CONFIRM_SCANS:
                 logger.debug(f"Streak {streak}/{config.DISCORD_CONFIRM_SCANS}: {path_key}")
@@ -906,7 +903,7 @@ class ArbitrageScanner:
             return
 
         best = max(profitable, key=lambda x: x.profit_percent)
-        path_name = best.path.rsplit(" [", 1)[0] if " [" in best.path else best.path
+        path_name = best.path_key
 
         # TODO: Wire up actual execution per path
         logger.warning(
@@ -1376,7 +1373,7 @@ class ArbitrageScanner:
         for opp in opportunities:
             if not opp.is_profitable or opp.blocked:
                 continue
-            path_key = opp.path.rsplit(" [", 1)[0] if " [" in opp.path else opp.path
+            path_key = opp.path_key
             streak = self._opportunity_streak.get(path_key, 0)
             if streak == config.DISCORD_CONFIRM_SCANS:
                 return True
@@ -1394,6 +1391,7 @@ class ArbitrageScanner:
 
         opportunities = self._find_opportunities(prices)
         self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
+        self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities)
 
         # Wallet-based analysis
@@ -1420,7 +1418,7 @@ class ArbitrageScanner:
         await self._execute_trades(opportunities)
 
         profitable_count = sum(1 for o in opportunities if o.is_profitable and not o.blocked)
-        self.tracker.update_daily_summary(self.scan_count, profitable_count)
+        self.tracker.update_daily_summary(profitable_count)
         logger.info(
             f"Scan #{self.scan_count}: {len(opportunities)} paths analyzed, "
             f"{profitable_count} profitable"
@@ -1463,6 +1461,10 @@ class ArbitrageScanner:
         ))
 
         await self.connect_all()
+
+        pruned = self.tracker.prune_scan_results(config.SCAN_RESULTS_RETENTION_DAYS)
+        if pruned:
+            logger.info(f"Pruned {pruned} non-profitable scan rows older than {config.SCAN_RESULTS_RETENTION_DAYS} days")
 
         if self.discord_enabled:
             await self.discord.send_startup_message(mode=self.mode)

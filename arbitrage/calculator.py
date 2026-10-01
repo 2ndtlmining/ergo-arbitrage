@@ -51,6 +51,11 @@ class ArbitrageOpportunity:
     timestamp: datetime = field(default_factory=datetime.now)
 
     @property
+    def path_key(self) -> str:
+        """Path name without the trade size suffix, e.g. "Bank mint->Spectrum sell"."""
+        return self.path.rsplit(" [", 1)[0] if " [" in self.path else self.path
+
+    @property
     def net_profit_erg(self) -> float:
         return self.output_erg - self.input_erg
 

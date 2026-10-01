@@ -99,6 +99,9 @@ DISCORD_WALLET_COOLDOWN_SECONDS = int(os.getenv("DISCORD_WALLET_COOLDOWN_SECONDS
 DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
+# Tracker: non-profitable scan rows older than this are deleted at startup
+SCAN_RESULTS_RETENTION_DAYS = int(os.getenv("SCAN_RESULTS_RETENTION_DAYS", "14"))
+
 
 def get_recommended_slippage(trade_size_erg: float) -> float:
     for max_size, slippage in sorted(SLIPPAGE_TIERS.items()):
