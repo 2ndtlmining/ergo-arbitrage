@@ -8,6 +8,7 @@ import pytest
 import config
 
 pytestmark = [
+    pytest.mark.live,
     pytest.mark.skipif(not config.NONKYC_API_KEY, reason="NONKYC_API_KEY not set"),
     pytest.mark.asyncio,
 ]
@@ -193,16 +194,14 @@ class TestSpectrumDEX:
         finally:
             await dex.disconnect()
 
-    async def test_get_all_pools(self):
+    async def test_pool_box(self):
         dex = await self._make_dex()
         try:
-            pools = await dex.get_all_erg_sigusd_pools()
-            assert len(pools) > 0
-            print(f"  Found {len(pools)} ERG/SigUSD pools:")
-            for p in pools:
-                lp = getattr(p, '_last_price', 0)
-                vol = getattr(p, '_base_volume', 0)
-                print(f"    {p.pool_id[:20]}... price=${lp:.4f} vol={vol:.2f}")
+            pool = await dex.get_pool_state()
+            assert pool is not None, "ERG/SigUSD pool box not found"
+            assert pool.reserve_x > 0 and pool.reserve_y > 0
+            assert pool.fee_num == 995
+            print(f"  Pool {pool.pool_id[:16]}... {pool.reserve_x:,.0f} ERG / {pool.reserve_y:,.2f} SigUSD")
         finally:
             await dex.disconnect()
 
@@ -252,17 +251,18 @@ class TestSigmaUSDBank:
         finally:
             await bank.disconnect()
 
-    async def test_erg_to_sigusd_conversion(self):
+    async def test_sigusd_to_erg_conversion(self):
+        """Redeem is never RR-restricted; fees are 2% protocol + 0.229% UI."""
         bank = await self._make_bank()
         try:
-            await bank.fetch_oracle_price()
-            sigusd = bank.erg_to_sigusd(10)
-            assert sigusd > 0
-            raw = 10 * bank._oracle_price
-            assert sigusd < raw
-            fee_pct = (1 - sigusd / raw) * 100
-            assert abs(fee_pct - 2.1) < 0.1
-            print(f"  10 ERG -> {sigusd:.2f} SigUSD (fee: {fee_pct:.1f}%)")
+            await bank.get_full_state()
+            erg = bank.sigusd_to_erg(10)
+            raw = 10 / bank._oracle_price
+            fee_pct = (1 - (erg + 0.0021) / raw) * 100
+            assert abs(fee_pct - 2.22) < 0.05
+            print(f"  10 SigUSD -> {erg:.4f} ERG (fee: {fee_pct:.2f}%)")
+            if not bank.can_mint_sigusd():
+                assert bank.erg_to_sigusd(10) == 0
         finally:
             await bank.disconnect()
 

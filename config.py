@@ -18,14 +18,18 @@ KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY", "")
 KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET", "")
 KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE", "")
 
-# Spectrum Finance (ErgoDEX)
-SPECTRUM_API_URL = "https://api.spectrum.fi/v1"
+# Ergo explorer (public API)
+ERGO_EXPLORER_API_URL = os.getenv("ERGO_EXPLORER_API_URL", "https://api.ergoplatform.com/api/v1")
+
+# ErgoDEX/Spectrum ERG/SigUSD N2T pool (read on-chain; Spectrum's API is sunset)
+SPECTRUM_SIGUSD_POOL_NFT = "9916d75132593c8b07fe18bd8d583bda1652eed7565cf41a4738ddd90fc992ec"
 
 # Token IDs (Ergo mainnet)
 ERG_TOKEN_ID = "0000000000000000000000000000000000000000000000000000000000000000"
 SIGUSD_TOKEN_ID = "03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04"
 SIGRSV_TOKEN_ID = "003bd19d0187117f130b62e1bcab0939929ff5c7709f843c5c4dd158949285d0"
 SIGMAUSD_BANK_NFT = "7d672d1def471720ca5782fd6473e47e796d9ac0c138d9911346f118b2f6d9d9"
+SIGMAUSD_ORACLE_NFT = "011d3364de07e5a26f0c4eef0852cddb387039a921b7154ef3cab22c6eda887f"
 USE_TOKEN_ID = "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669"
 
 # Decimals
@@ -36,6 +40,15 @@ USE_DECIMALS = 3
 
 # Crux Finance (USE / DexyUSD)
 CRUX_API_URL = "https://api.cruxfinance.io"
+DEXY_USE_LP_NFT = "4ecaa1aac9846b1454563ae51746db95a3a40ee9f8c5f5301afbe348ae803d41"
+CRUX_MINT_SERVICE_FEE = 0.79  # ERG, Crux /dexy/build_mint_tx service fee
+
+# Service-fee addresses the TX guard lets a third-party-built TX pay (ErgoTrees).
+# Crux Finance swap/mint fee, SigmaUSD UI fee. Extend via env (comma separated).
+SERVICE_FEE_ERGO_TREES = {
+    "0008cd03c50363c9ed382bce675ef307b387410511d1d06dfa64dfd6f2f1de95e5020b61",  # Crux Finance
+    "0008cd02c5f61c83056a746a19a9e449e3c9596314cc417a2ef496b7567af558518f2bc7",  # SigmaUSD UI fee
+} | {t.strip() for t in os.getenv("EXTRA_SERVICE_FEE_ERGO_TREES", "").split(",") if t.strip()}
 
 # Ergo network fees
 ERGO_TX_FEE = 0.0011  # ERG
@@ -47,7 +60,8 @@ SIGMAUSD_FRONTEND_FEE = 0.00229  # 0.229% UI fee on bc_delta (after protocol fee
 SIGMAUSD_TOTAL_FEE = SIGMAUSD_PROTOCOL_FEE + SIGMAUSD_FRONTEND_FEE
 SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 
-# Spectrum DEX fees (SigUSD/ERG pool is 0.5%, confirmed via Crux API)
+# Spectrum DEX fees. The real fee is read from the pool box (R4 = 995 -> 0.5%);
+# this constant is only a display/fallback value.
 SPECTRUM_POOL_FEE = 0.005  # 0.5% (995/1000) for SigUSD/ERG pool
 SPECTRUM_EXECUTION_FEE = 0.785  # ERG service fee (via Crux Finance routing)
 
@@ -59,13 +73,21 @@ NONKYC_ERG_WITHDRAW_FEE = 3.3  # ERG (confirmed via /asset/info)
 KUCOIN_TRADING_FEE = 0.001  # 0.1% maker/taker
 KUCOIN_ERG_WITHDRAW_FEE = 0.73  # ERG (confirmed via /api/v1/currencies/ERG)
 
+# Venues. CEX paths (Kucoin/NonKYC) are off by default: on-chain only.
+ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "yes")
+
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
 MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
+MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
 
-# Slippage recommendations based on trade size
+# Buffer for state changing between quote and inclusion, applied to legs whose
+# price impact is computed from real reserves (AMM pool).
+EXECUTION_BUFFER = float(os.getenv("EXECUTION_BUFFER", "0.003"))  # 0.3%
+
+# Slippage recommendations based on trade size (legacy, legs without known depth)
 SLIPPAGE_TIERS = {
     10: 0.005,    # 0.5% for up to 10 ERG
     50: 0.01,     # 1% for up to 50 ERG
@@ -86,6 +108,9 @@ DISCORD_TIER1_PROFIT_PERCENT = float(os.getenv("DISCORD_TIER1_PROFIT_PERCENT", "
 DISCORD_WALLET_COOLDOWN_SECONDS = int(os.getenv("DISCORD_WALLET_COOLDOWN_SECONDS", "600"))
 DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
+
+# Tracker: non-profitable scan rows older than this are deleted at startup
+SCAN_RESULTS_RETENTION_DAYS = int(os.getenv("SCAN_RESULTS_RETENTION_DAYS", "14"))
 
 
 def get_recommended_slippage(trade_size_erg: float) -> float:

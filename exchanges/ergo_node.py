@@ -7,6 +7,8 @@ import config
 
 logger = logging.getLogger("ergo_arb.ergo_node")
 
+MAX_HEADER_LAG = 3  # blocks between headersHeight and fullHeight to count as synced
+
 
 class ErgoNodeClient:
     def __init__(self):
@@ -90,16 +92,23 @@ class ErgoNodeClient:
     async def get_node_info(self) -> Optional[dict]:
         return await self._get("/info")
 
-    async def check_connection(self) -> bool:
-        """Verify node is reachable and synced."""
+    async def get_health(self) -> dict:
+        """Reachability, sync and wallet-lock state. `ok_to_trade` requires all three."""
         info = await self.get_node_info()
-        if info:
-            height = info.get("fullHeight", 0)
-            best_header = info.get("headersHeight", 0)
-            is_synced = height > 0 and abs(best_header - height) < 5
-            if not is_synced:
-                logger.warning(
-                    f"Node not fully synced: height={height}, headers={best_header}"
-                )
-            return True
-        return False
+        if not info:
+            return {"reachable": False, "synced": False, "unlocked": False,
+                    "height": 0, "headers": 0, "ok_to_trade": False}
+        height = info.get("fullHeight") or 0
+        headers = info.get("headersHeight") or 0
+        synced = height > 0 and abs(headers - height) < MAX_HEADER_LAG
+        status = await self.get_wallet_status()
+        unlocked = bool(status and status.get("isUnlocked"))
+        return {"reachable": True, "synced": synced, "unlocked": unlocked,
+                "height": height, "headers": headers, "ok_to_trade": synced and unlocked}
+
+    async def check_connection(self) -> bool:
+        """True if the node is reachable and synced (logs a warning otherwise)."""
+        health = await self.get_health()
+        if health["reachable"] and not health["synced"]:
+            logger.warning(f"Node not fully synced: height={health['height']}, headers={health['headers']}")
+        return health["reachable"] and health["synced"]

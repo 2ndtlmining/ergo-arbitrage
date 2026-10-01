@@ -7,7 +7,7 @@ All available swap flows, their status, and test results.
 | Venue | Type | Stablecoin | API |
 |-------|------|-----------|-----|
 | SigmaUSD Bank | Protocol | SigUSD | Explorer + Oracle |
-| Spectrum DEX | AMM Pool | SigUSD | api.spectrum.fi |
+| ErgoDEX/Spectrum pool | AMM Pool | SigUSD | on-chain pool box `9916d751...` (Spectrum API sunset; swaps routed via Crux) |
 | Mew Finance | Batcher | SigUSD | Node TX (template) |
 | Crux Finance | Dexy LP | USE | api.cruxfinance.io |
 | NonKYC | CEX | USDT | api.nonkyc.io |
@@ -19,7 +19,7 @@ All available swap flows, their status, and test results.
 
 | # | Method | Route | Code | Tested Live | Notes |
 |---|--------|-------|------|-------------|-------|
-| 1 | Mew Finance batcher | ERG -> SigUSD | `execute_swap_sigusd.py` | YES (1 ERG) | Template-based, replaces pubkey in ErgoTree |
+| 1 | Mew Finance batcher | ERG -> SigUSD | `archive/execute_swap_sigusd.py` (archived) | YES (1 ERG) | One-off; replaced pubkey in ErgoTree, not guarded |
 | 2 | SigmaUSD Bank mint | ERG -> SigUSD | Not yet | BLOCKED | Same issue as #5 - needs bank contract TX builder. Currently RR=262% so also blocked by reserve ratio. |
 | 3 | Spectrum DEX swap | ERG -> SigUSD | `execute_swap_erg_to_sigusd_spectrum.py` | QUOTE ONLY | Via Crux /dex/swap routing to Spectrum pool, 0.5% LP fee, ~0.785 ERG service fee |
 
@@ -59,7 +59,7 @@ ERG ->(Bank mint #2)-> SigUSD ->(Spectrum #6)-> ERG
 ```
 - **When profitable**: Bank oracle rate > Spectrum pool rate (SigUSD overpriced on DEX)
 - **Blocked when**: RR < 400% (can't mint)
-- **Fees**: 2.1% bank fee + 0.3% DEX fee + ~0.005 ERG tx fees
+- **Fees**: ~2.22% bank fee (2% protocol + 0.229% UI) + 0.5% DEX fee + ~0.785 ERG Crux service + tx fees
 - **Time**: ~15 min
 - **Code status**: Neither leg built yet
 - **Current status**: BLOCKED (RR=262%)
@@ -69,8 +69,8 @@ ERG ->(Bank mint #2)-> SigUSD ->(Spectrum #6)-> ERG
 ERG ->(Spectrum #3)-> SigUSD ->(Bank redeem #5)-> ERG
 ```
 - **When profitable**: Spectrum pool rate > Bank oracle rate (SigUSD cheap on DEX)
-- **Blocked when**: RR > 800% (can't redeem) -- currently RR=262% so redeem IS available
-- **Fees**: 0.3% DEX fee + 2.1% bank fee + ~0.005 ERG tx fees
+- **Blocked when**: never (SigUSD redeem has no RR restriction; payout is pro-rata if RR < 100%)
+- **Fees**: 0.5% DEX fee + ~0.785 ERG Crux service + ~2.22% bank fee + tx fees
 - **Time**: ~15 min
 - **Code status**: Bank redeem (#5) WORKING. Spectrum buy (#3) not yet built.
 - **Current status**: Math shows -20.7% loss (SigUSD overpriced, not cheap)
@@ -131,7 +131,7 @@ Sell ERG (Exchange A) -> USDT transfer -> Buy ERG (Exchange B)
 
 | Venue | Trading Fee | Withdrawal | Other |
 |-------|-----------|-----------|-------|
-| SigmaUSD Bank | 2.0% protocol + 0.1% frontend | N/A | 0.0011 ERG tx |
+| SigmaUSD Bank | 2.0% protocol + 0.229% UI fee (min 0.001 ERG) | N/A | 0.0011 ERG tx + 0.001 ERG receipt box |
 | Spectrum DEX (SigUSD) | 0.5% pool fee | N/A | ~0.785 ERG service (via Crux) + 0.002 ERG miner |
 | Mew Finance | ~0.94 ERG batcher | N/A | 0.002 ERG protocol + 0.0011 ERG miner |
 | Crux Finance (mint) | 0.3%+0.2% bank fees | N/A | ~0.786 ERG service + 0.002 ERG miner |

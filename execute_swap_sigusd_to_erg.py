@@ -10,6 +10,12 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 
+import config
+from ergo.signing import DryRun, execute_requested, guarded_sign
+from ergo.tx_guard import SignPolicy
+
+FEE_BUDGET = int(config.MAX_FEE_BUDGET_ERG * 1e9)  # service + miner fees allowed per TX
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 # Configuration
@@ -76,55 +82,9 @@ async def build_swap_tx(s, address, sigusd_raw):
         return json.loads(body)
 
 
-async def sign_transaction(ns, unsigned_tx):
-    """Sign using Ergo node wallet. Uses withPool endpoint to find all boxes."""
-    inputs = unsigned_tx.get("inputs", [])
-    data_inputs = unsigned_tx.get("dataInputs", [])
-
-    stripped_tx = {
-        "inputs": [
-            {"boxId": inp["boxId"], "extension": inp.get("extension", {})}
-            for inp in inputs
-        ],
-        "dataInputs": [
-            {"boxId": di["boxId"]}
-            for di in data_inputs
-        ],
-        "outputs": unsigned_tx["outputs"],
-    }
-
-    all_input_raw = []
-    for inp in inputs:
-        bid = inp["boxId"]
-        async with ns.get(f"{NODE}/utxo/withPool/byIdBinary/{bid}", timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                data = await r.json()
-                all_input_raw.append(data.get("bytes", ""))
-            else:
-                raise Exception(f"Cannot get raw bytes for input {bid}: HTTP {r.status}")
-
-    all_data_raw = []
-    for di in data_inputs:
-        bid = di["boxId"]
-        async with ns.get(f"{NODE}/utxo/withPool/byIdBinary/{bid}", timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                data = await r.json()
-                all_data_raw.append(data.get("bytes", ""))
-            else:
-                raise Exception(f"Cannot get raw bytes for data input {bid}: HTTP {r.status}")
-
-    sign_request = {
-        "tx": stripped_tx,
-        "inputsRaw": all_input_raw,
-        "dataInputsRaw": all_data_raw,
-        "secrets": {},
-    }
-
-    async with ns.post(f"{NODE}/wallet/transaction/sign", json=sign_request, timeout=aiohttp.ClientTimeout(total=30)) as r:
-        body = await r.text()
-        if r.status != 200:
-            raise Exception(f"Sign failed: HTTP {r.status} - {body[:500]}")
-        return json.loads(body)
+async def sign_transaction(ns, unsigned_tx, policy):
+    """Verify the Crux-built TX with tx_guard, then sign it (only with --execute)."""
+    return await guarded_sign(ns, NODE, unsigned_tx, policy, execute=execute_requested())
 
 
 async def submit_transaction(ns, signed_tx):
@@ -202,7 +162,11 @@ async def main():
     print("--- Step 4: Signing Transaction ---")
     async with aiohttp.ClientSession(headers=node_headers) as ns:
         try:
-            signed_tx = await sign_transaction(ns, unsigned_tx)
+            policy = SignPolicy(max_erg_spent=FEE_BUDGET, max_token_spent={SIGUSD_TOKEN: SWAP_RAW}, min_erg_received=max(int(erg_output_nano * (1 - config.SLIPPAGE_TOLERANCE)) - FEE_BUDGET, 1))
+            signed_tx = await sign_transaction(ns, unsigned_tx, policy)
+        except DryRun as e:
+            print(f"  {e}")
+            return
         except Exception as e:
             print(f"  ERROR signing: {e}")
             return
