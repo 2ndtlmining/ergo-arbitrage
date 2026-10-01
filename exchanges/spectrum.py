@@ -1,3 +1,9 @@
+"""ERG/SigUSD AMM pool (ErgoDEX/Spectrum N2T contract), read directly from chain.
+
+Spectrum's off-chain API has been sunset, but the pool contracts are still live
+and are what Crux routes swaps through. Reserves and the fee come from the pool
+box itself, so quotes match what the contract will accept.
+"""
 import logging
 from typing import Optional
 
@@ -8,54 +14,72 @@ from exchanges.base import DEXBase, PriceQuote, PoolState
 
 logger = logging.getLogger("ergo_arb.spectrum")
 
+FEE_DENOM = 1000
+
+
+def amm_output_raw(reserve_in: int, reserve_out: int, amount_in: int, fee_num: int, fee_denom: int = FEE_DENOM) -> int:
+    """Constant-product swap output in raw units, floored like the contract."""
+    if amount_in <= 0 or reserve_in <= 0 or reserve_out <= 0:
+        return 0
+    return reserve_out * amount_in * fee_num // (reserve_in * fee_denom + amount_in * fee_num)
+
+
+def parse_n2t_pool_box(box: dict, token_id: str, decimals_y: int) -> PoolState:
+    """PoolState from an N2T pool box: value = ERG reserve, token Y reserve, R4 = feeNum."""
+    assets = box.get("assets", [])
+    pool_nft = assets[0]["tokenId"] if assets else ""
+    reserve_y_raw = next((a["amount"] for a in assets if a["tokenId"] == token_id), None)
+    if reserve_y_raw is None:
+        raise ValueError(f"Pool box does not hold token {token_id[:8]}")
+    r4 = box.get("additionalRegisters", {}).get("R4", {})
+    fee_num = int(r4.get("renderedValue") if isinstance(r4, dict) else r4)
+    return PoolState(
+        exchange="ErgoDEX pool (via Crux)",
+        pool_id=pool_nft,
+        token_x="ERG",
+        token_y="SigUSD",
+        reserve_x=box["value"] / 10**config.ERG_DECIMALS,
+        reserve_y=reserve_y_raw / 10**decimals_y,
+        fee_num=fee_num,
+        fee_denom=FEE_DENOM,
+    )
+
 
 class SpectrumDEX(DEXBase):
     def __init__(self):
-        self.api_url = config.SPECTRUM_API_URL
         self.session: Optional[aiohttp.ClientSession] = None
-        self._pools: dict[str, PoolState] = {}
+        self.pool: Optional[PoolState] = None
 
     async def connect(self):
         self.session = aiohttp.ClientSession()
-        logger.info("[exchange]Spectrum DEX[/exchange] connected")
+        logger.info("[exchange]ErgoDEX pool[/exchange] connected")
 
     async def disconnect(self):
         if self.session:
             await self.session.close()
             self.session = None
-        logger.info("Spectrum DEX disconnected")
+        logger.info("ErgoDEX pool disconnected")
 
-    async def _fetch_markets(self) -> Optional[list]:
+    async def get_pool_state(self, pair: str = "ERG/SigUSD") -> Optional[PoolState]:
+        """Read the ERG/SigUSD pool box from the explorer."""
         if not self.session:
             return None
-        url = f"{self.api_url}/price-tracking/markets"
+        url = f"{config.ERGO_EXPLORER_API_URL}/boxes/unspent/byTokenId/{config.SPECTRUM_SIGUSD_POOL_NFT}?limit=1"
         try:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.warning(f"Spectrum markets API returned {resp.status}")
+                if resp.status != 200:
+                    logger.warning(f"Pool box query returned {resp.status}")
+                    return None
+                data = await resp.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            if not items:
+                logger.warning("ERG/SigUSD pool box not found")
                 return None
+            self.pool = parse_n2t_pool_box(items[0], config.SIGUSD_TOKEN_ID, config.SIGUSD_DECIMALS)
+            return self.pool
         except Exception as e:
-            logger.error(f"Spectrum markets fetch error: {e}")
+            logger.error(f"Pool box fetch error: {e}")
             return None
-
-    def _find_erg_sigusd_pools(self, markets: list) -> list[dict]:
-        """Find all ERG/SigUSD pools from market data."""
-        pools = []
-        for m in markets:
-            base = m.get("baseSymbol", "")
-            quote = m.get("quoteSymbol", "")
-            base_id = m.get("baseId", "")
-            quote_id = m.get("quoteId", "")
-            # Match ERG/SigUSD pools (not test tokens like tERG/tSigUSD)
-            if (
-                base == "ERG"
-                and quote == "SigUSD"
-                and base_id == config.ERG_TOKEN_ID
-                and quote_id == config.SIGUSD_TOKEN_ID
-            ):
-                pools.append(m)
-        return pools
 
     async def get_price(self, pair: str = "ERG/SigUSD") -> Optional[PriceQuote]:
         pool = await self.get_pool_state(pair)
@@ -63,7 +87,7 @@ class SpectrumDEX(DEXBase):
             return None
         price = pool.price_x_in_y
         return PriceQuote(
-            exchange=f"Spectrum ({pool.pool_id[:8]}...)",
+            exchange=f"ErgoDEX ({pool.pool_id[:8]}...)",
             pair=pair,
             bid=price,
             ask=price,
@@ -71,111 +95,7 @@ class SpectrumDEX(DEXBase):
             ask_volume=pool.reserve_y,
         )
 
-    async def get_all_erg_sigusd_pools(self) -> list[PoolState]:
-        """Get all ERG/SigUSD pools with their states."""
-        markets = await self._fetch_markets()
-        if not markets:
-            return []
-
-        erg_sigusd = self._find_erg_sigusd_pools(markets)
-        pools = []
-
-        for m in erg_sigusd:
-            pool_id = m.get("id", "")
-            base_vol = m.get("baseVolume", {})
-            quote_vol = m.get("quoteVolume", {})
-
-            base_decimals = base_vol.get("units", {}).get("asset", {}).get("decimals", 9)
-            quote_decimals = quote_vol.get("units", {}).get("asset", {}).get("decimals", 2)
-
-            base_raw = base_vol.get("value", 0)
-            quote_raw = quote_vol.get("value", 0)
-
-            # The market data gives volume, not reserves
-            # We use lastPrice for price info
-            last_price = m.get("lastPrice", 0)
-
-            if last_price > 0:
-                pool = PoolState(
-                    exchange="Spectrum",
-                    pool_id=pool_id,
-                    token_x="ERG",
-                    token_y="SigUSD",
-                    # We don't have exact reserves from market endpoint,
-                    # but we can infer pricing. For accurate reserves,
-                    # we'd need to query the pool boxes directly.
-                    reserve_x=0,  # Will be populated from pool box query
-                    reserve_y=0,
-                    fee_num=997,
-                    fee_denom=1000,
-                )
-                # Store the last price for now
-                pool._last_price = last_price
-                pool._base_volume = base_raw / (10 ** base_decimals)
-                pool._quote_volume = quote_raw / (10 ** quote_decimals)
-                pools.append(pool)
-
-        return pools
-
-    async def get_pool_state(self, pair: str = "ERG/SigUSD") -> Optional[PoolState]:
-        """Get the best (most liquid) ERG/SigUSD pool."""
-        pools = await self.get_all_erg_sigusd_pools()
-        if not pools:
-            return None
-
-        # Return the pool with the highest volume
-        best = max(pools, key=lambda p: getattr(p, '_base_volume', 0))
-        return best
-
     async def get_erg_sigusd_price(self) -> Optional[float]:
-        """Get ERG price in SigUSD from the best pool."""
-        pools = await self.get_all_erg_sigusd_pools()
-        if not pools:
-            return None
-
-        # Use the most liquid pool's price
-        best = max(pools, key=lambda p: getattr(p, '_base_volume', 0))
-        return getattr(best, '_last_price', None)
-
-    def calculate_swap_output(
-        self,
-        input_amount: float,
-        input_is_erg: bool,
-        reserve_erg: float,
-        reserve_sigusd: float,
-    ) -> float:
-        """Calculate swap output using constant product formula with 0.3% fee."""
-        if input_is_erg:
-            reserve_in = reserve_erg
-            reserve_out = reserve_sigusd
-        else:
-            reserve_in = reserve_sigusd
-            reserve_out = reserve_erg
-
-        input_with_fee = input_amount * 997
-        numerator = input_with_fee * reserve_out
-        denominator = (reserve_in * 1000) + input_with_fee
-
-        if denominator == 0:
-            return 0
-        return numerator / denominator
-
-    def calculate_price_impact(
-        self,
-        input_amount: float,
-        input_is_erg: bool,
-        reserve_erg: float,
-        reserve_sigusd: float,
-    ) -> float:
-        """Calculate price impact as percentage."""
-        if input_is_erg:
-            spot_price = reserve_sigusd / reserve_erg if reserve_erg > 0 else 0
-        else:
-            spot_price = reserve_erg / reserve_sigusd if reserve_sigusd > 0 else 0
-
-        if spot_price == 0 or input_amount == 0:
-            return 0
-
-        output = self.calculate_swap_output(input_amount, input_is_erg, reserve_erg, reserve_sigusd)
-        effective_price = output / input_amount
-        return abs(1 - (effective_price / spot_price)) * 100
+        """Spot SigUSD per ERG from the pool reserves."""
+        pool = await self.get_pool_state()
+        return pool.price_x_in_y if pool else None

@@ -110,16 +110,14 @@ class TestSpectrumPrices:
         finally:
             await dex.disconnect()
 
-    async def test_all_pools(self):
+    async def test_pool_box(self):
         dex = await self._make_dex()
         try:
-            pools = await dex.get_all_erg_sigusd_pools()
-            assert len(pools) > 0, "No ERG/SigUSD pools found"
-            print(f"  Found {len(pools)} ERG/SigUSD pools:")
-            for p in pools:
-                lp = getattr(p, '_last_price', 0)
-                vol = getattr(p, '_base_volume', 0)
-                print(f"    Pool {p.pool_id[:16]}... price=${lp:.4f} vol={vol:.2f}")
+            pool = await dex.get_pool_state()
+            assert pool is not None, "ERG/SigUSD pool box not found"
+            assert pool.reserve_x > 0 and pool.reserve_y > 0
+            assert pool.fee_num == 995
+            print(f"  Pool {pool.pool_id[:16]}... {pool.reserve_x:,.0f} ERG / {pool.reserve_y:,.2f} SigUSD")
         finally:
             await dex.disconnect()
 

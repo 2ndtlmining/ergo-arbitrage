@@ -68,7 +68,7 @@ When the DEX pool prices ERG higher than the bank's oracle rate:
   Step 2: Redeem SigUSD at Bank (-2.2% bank fee, -0.002 ERG receipt)
   Result:  Depends on spread vs fees
 
-  RESTRICTION: Bank redeeming requires reserve ratio < 800%
+  NOTE: SigUSD redeem has no reserve-ratio restriction (pro-rata payout if RR < 100%)
 ```
 
 ### Strategy 3: CEX <> DEX (Cross-Venue)
@@ -289,7 +289,7 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 
 - **Never commit `.env`** - it contains your API keys and is gitignored
 - **NonKYC ERG withdrawal fee is 3.3 ERG** - makes small CEX trades unprofitable
-- **SigmaUSD Bank has restrictions** - minting blocked when RR < 400%, redeeming blocked when RR > 800%
+- **SigmaUSD Bank has restrictions** - SigUSD minting is blocked if the post-mint RR would fall below 400%; SigUSD redeem is always allowed (the 800% cap only applies to SigRSV minting)
 - **SigUSD is currently depegged** - trading at ~$1.23 instead of $1.00 (makes CEX<>DEX paths unreliable)
 - **USE (DexyUSD) is well-pegged** - trading at ~$0.99, more predictable for arb paths
 - **Crux service fee is ~0.785 ERG flat** - brutal for small swaps, negligible for large ones

@@ -142,10 +142,10 @@ class ArbitrageScanner:
         """Fetch prices from all sources concurrently."""
         results = {}
 
-        nonkyc_price, kucoin_price, spectrum_price, bank_state, use_data, use_mint = await asyncio.gather(
+        nonkyc_price, kucoin_price, spectrum_pool, bank_state, use_data, use_mint = await asyncio.gather(
             self.nonkyc.fetch_erg_usdt_price(),
             self.kucoin.fetch_erg_usdt_price(),
-            self.spectrum.get_erg_sigusd_price(),
+            self.spectrum.get_pool_state(),
             self.sigmausd.get_full_state(),
             self._fetch_use_price(),
             self._fetch_use_mint_status(),
@@ -158,9 +158,10 @@ class ArbitrageScanner:
         if isinstance(kucoin_price, Exception):
             logger.error(f"Kucoin price fetch failed: {kucoin_price}")
             kucoin_price = None
-        if isinstance(spectrum_price, Exception):
-            logger.error(f"Spectrum price fetch failed: {spectrum_price}")
-            spectrum_price = None
+        if isinstance(spectrum_pool, Exception):
+            logger.error(f"ERG/SigUSD pool fetch failed: {spectrum_pool}")
+            spectrum_pool = None
+        spectrum_price = spectrum_pool.price_x_in_y if spectrum_pool else None
         if isinstance(bank_state, Exception):
             logger.error(f"SigmaUSD state fetch failed: {bank_state}")
             bank_state = {}
@@ -174,6 +175,7 @@ class ArbitrageScanner:
         results["nonkyc_erg_usdt"] = nonkyc_price
         results["kucoin_erg_usdt"] = kucoin_price
         results["spectrum_erg_sigusd"] = spectrum_price
+        results["spectrum_pool"] = spectrum_pool
         results["bank"] = bank_state
         results["use_data"] = use_data
         results["use_mint"] = use_mint
@@ -226,7 +228,9 @@ class ArbitrageScanner:
 
         spectrum = prices.get("spectrum_erg_sigusd")
         if spectrum:
-            table.add_row("Spectrum", "ERG/SigUSD", f"{spectrum:.4f} SigUSD", "DEX pool price")
+            pool = prices.get("spectrum_pool")
+            depth = f"pool spot, {pool.reserve_x:,.0f} ERG / {pool.reserve_y:,.0f} SigUSD" if pool else "pool spot"
+            table.add_row("ErgoDEX pool", "ERG/SigUSD", f"{spectrum:.4f} SigUSD", depth)
 
         bank = prices.get("bank", {})
         oracle = bank.get("oracle_erg_usd")
@@ -262,6 +266,24 @@ class ArbitrageScanner:
             table.add_row("", "USE Mint", "", f"FreeMint: {'YES' if fm_ok else 'NO'} | ArbMint: {'YES' if am_ok else 'NO'}")
 
         console.print(table)
+
+    @staticmethod
+    def _dex_erg_to_sigusd(prices: dict, erg: float) -> float:
+        """SigUSD out of the AMM pool for `erg` ERG (real reserves, price impact included)."""
+        pool = prices.get("spectrum_pool")
+        if pool is not None:
+            return pool.swap_output(erg, input_is_x=True)
+        spot = prices.get("spectrum_erg_sigusd") or 0
+        return erg * spot * (1 - config.SPECTRUM_POOL_FEE)
+
+    @staticmethod
+    def _dex_sigusd_to_erg(prices: dict, sigusd: float) -> float:
+        """ERG out of the AMM pool for `sigusd` SigUSD (real reserves, price impact included)."""
+        pool = prices.get("spectrum_pool")
+        if pool is not None:
+            return pool.swap_output(sigusd, input_is_x=False)
+        spot = prices.get("spectrum_erg_sigusd") or 0
+        return sigusd / spot * (1 - config.SPECTRUM_POOL_FEE) if spot > 0 else 0
 
     @staticmethod
     def _bank_mint(state: Optional[BankState], erg: float) -> tuple[int, bool]:
@@ -315,7 +337,8 @@ class ArbitrageScanner:
         mint_blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR must stay >=400%)" if not can_mint else ""
 
         for trade_size in self._trade_sizes:
-            slippage = config.get_recommended_slippage(trade_size)
+            slippage = config.get_recommended_slippage(trade_size)  # legs without known depth (CEX)
+            amm_buffer = config.EXECUTION_BUFFER if prices.get("spectrum_pool") else slippage
 
             # ---- SigUSD Paths ----
 
@@ -324,14 +347,13 @@ class ArbitrageScanner:
                 mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
                 sigusd_from_bank = mint_cents / 100
                 bank_rate_after_fees = sigusd_from_bank / trade_size
-                erg_from_dex = sigusd_from_bank / spectrum_price
-                erg_from_dex_after_fee = erg_from_dex * (1 - config.SPECTRUM_POOL_FEE)
+                erg_from_dex_after_fee = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
 
                 opp = self.calculator.calc_bank_to_dex(
                     input_erg=trade_size,
                     bank_erg_to_sigusd_rate=bank_rate_after_fees,
                     dex_sigusd_to_erg_output=erg_from_dex_after_fee,
-                    slippage=slippage,
+                    slippage=amm_buffer,
                 )
                 opp.path = f"Bank mint->Spectrum sell [{trade_size} ERG]"
                 fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
@@ -353,7 +375,7 @@ class ArbitrageScanner:
 
             # Path 2: Spectrum -> Bank redeem (always calculate, mark blocked)
             if bank_state and spectrum_price and spectrum_price > 0:
-                sigusd_from_dex = trade_size * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                sigusd_from_dex = self._dex_erg_to_sigusd(prices, trade_size)
                 redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
                 bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
 
@@ -361,7 +383,7 @@ class ArbitrageScanner:
                     input_erg=trade_size,
                     dex_erg_to_sigusd_output=sigusd_from_dex,
                     bank_sigusd_to_erg_rate=bank_redeem_rate,
-                    slippage=slippage,
+                    slippage=amm_buffer,
                 )
                 opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
                 fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
@@ -941,7 +963,7 @@ class ArbitrageScanner:
                 mint_cents, mint_ok = self._bank_mint(bank_state, erg)
                 if mint_ok:
                     sigusd_out = mint_cents / 100
-                    erg_before_fees = (sigusd_out / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                    erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd_out)
                     total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
                     erg_back = erg_before_fees - total_fees
                     net = erg_back - erg
@@ -967,7 +989,7 @@ class ArbitrageScanner:
             # 2. Spectrum buy SigUSD -> Bank redeem
             if bank_state and spectrum_price:
                 if can_redeem:
-                    sigusd_out = erg * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                    sigusd_out = self._dex_erg_to_sigusd(prices, erg)
                     _, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_out)
                     total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE + config.SIGMAUSD_REDEEM_EXTRA_ERG
                     erg_back = erg_from_bank - total_fees
@@ -1044,7 +1066,7 @@ class ArbitrageScanner:
 
             # 2. Spectrum swap (SigUSD -> ERG)
             if spectrum_price:
-                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
                 erg_out = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
                 pct = ((erg_out - baseline_erg) / baseline_erg) * 100
                 sigusd_options.append({
@@ -1060,7 +1082,7 @@ class ArbitrageScanner:
 
             # 3. Spectrum -> Kucoin (SigUSD -> ERG -> USDT)
             if spectrum_price and kucoin_price:
-                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
                 erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
                 if erg_from_dex > 0:
                     usdt_out = erg_from_dex * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
@@ -1082,7 +1104,7 @@ class ArbitrageScanner:
 
             # 4. Spectrum -> NonKYC (SigUSD -> ERG -> USDT)
             if spectrum_price and nonkyc_price:
-                erg_before_fees = (sigusd / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
                 erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
                 if erg_from_dex > 0:
                     usdt_out = erg_from_dex * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
@@ -1198,7 +1220,7 @@ class ArbitrageScanner:
 
                     # 4. USE -> ERG -> Spectrum buy SigUSD -> Bank redeem -> ERG (arb loop)
                     if spectrum_price and can_redeem:
-                        sigusd_from_spectrum = erg_from_crux * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
+                        sigusd_from_spectrum = self._dex_erg_to_sigusd(prices, erg_from_crux)
                         erg_hop2 = self._bank_redeem_erg(bank_state, sigusd_from_spectrum)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
                         total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE
                         erg_final = erg_hop2 - total_fees_hop2
@@ -1222,7 +1244,7 @@ class ArbitrageScanner:
                     use_mint_cents, use_mint_ok = self._bank_mint(bank_state, erg_from_crux)
                     if spectrum_price and use_mint_ok:
                         sigusd_from_bank = use_mint_cents / 100
-                        erg_from_spectrum = (sigusd_from_bank / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
+                        erg_from_spectrum = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
                         total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
                         erg_final = erg_from_spectrum - total_fees_hop2
                         net = erg_final - erg_from_crux

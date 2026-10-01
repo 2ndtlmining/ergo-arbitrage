@@ -156,9 +156,10 @@ class ArbitrageCalculator:
         erg_from_bank = sigusd_received * bank_sigusd_to_erg_rate
         fees.protocol_fee = sigusd_received * (1 - (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE))
         fees.network_fee_erg += config.SIGMAUSD_REDEEM_EXTRA_ERG  # receipt box + miner fee
-        fees.slippage_cost = 0  # Bank has no slippage (oracle price)
+        # Bank leg is oracle-priced; the buffer covers the DEX leg moving before inclusion
+        fees.slippage_cost = erg_from_bank * slippage
 
-        output_erg = erg_from_bank - fees.execution_fee_erg - fees.network_fee_erg
+        output_erg = erg_from_bank - fees.execution_fee_erg - fees.network_fee_erg - fees.slippage_cost
         profit_erg = output_erg - input_erg
         profit_percent = (profit_erg / input_erg) * 100 if input_erg > 0 else 0
 

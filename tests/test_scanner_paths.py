@@ -83,3 +83,27 @@ class TestWalletAnalysis:
         names = {o["name"]: o for o in analysis["erg"]["options"]}
         assert not names["Bank mint -> Spectrum sell"]["blocked"]
         assert not names["Spectrum buy -> Bank redeem"]["blocked"]
+
+
+class TestPoolLegs:
+    def _pool(self, erg, sigusd):
+        from exchanges.base import PoolState
+        return PoolState(exchange="t", pool_id="p", token_x="ERG", token_y="SigUSD",
+                         reserve_x=erg, reserve_y=sigusd, fee_num=995, fee_denom=1000)
+
+    def test_dex_buy_leg_uses_pool_reserves(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        pool = self._pool(1_000, 310)  # thin pool: 100 ERG moves the price ~10%
+        prices = make_prices(state, pool.price_x_in_y)
+        prices["spectrum_pool"] = pool
+        opps = scanner._find_opportunities(prices)
+        opp = next(o for o in by_path(opps, "Spectrum buy->Bank redeem") if o.input_erg == 100)
+        assert opp.details["sigusd_cents"] == int(pool.swap_output(100, input_is_x=True) * 100)
+
+    def test_thin_pool_makes_large_size_worse(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        pool = self._pool(1_000, 330)
+        prices = make_prices(state, pool.price_x_in_y)
+        prices["spectrum_pool"] = pool
+        opps = {o.input_erg: o for o in by_path(scanner._find_opportunities(prices), "Spectrum buy->Bank redeem")}
+        assert opps[100].profit_percent < opps[25].profit_percent

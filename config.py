@@ -21,8 +21,8 @@ KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE", "")
 # Ergo explorer (public API)
 ERGO_EXPLORER_API_URL = os.getenv("ERGO_EXPLORER_API_URL", "https://api.ergoplatform.com/api/v1")
 
-# Spectrum Finance (ErgoDEX)
-SPECTRUM_API_URL = "https://api.spectrum.fi/v1"
+# ErgoDEX/Spectrum ERG/SigUSD N2T pool (read on-chain; Spectrum's API is sunset)
+SPECTRUM_SIGUSD_POOL_NFT = "9916d75132593c8b07fe18bd8d583bda1652eed7565cf41a4738ddd90fc992ec"
 
 # Token IDs (Ergo mainnet)
 ERG_TOKEN_ID = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -51,7 +51,8 @@ SIGMAUSD_FRONTEND_FEE = 0.00229  # 0.229% UI fee on bc_delta (after protocol fee
 SIGMAUSD_TOTAL_FEE = SIGMAUSD_PROTOCOL_FEE + SIGMAUSD_FRONTEND_FEE
 SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 
-# Spectrum DEX fees (SigUSD/ERG pool is 0.5%, confirmed via Crux API)
+# Spectrum DEX fees. The real fee is read from the pool box (R4 = 995 -> 0.5%);
+# this constant is only a display/fallback value.
 SPECTRUM_POOL_FEE = 0.005  # 0.5% (995/1000) for SigUSD/ERG pool
 SPECTRUM_EXECUTION_FEE = 0.785  # ERG service fee (via Crux Finance routing)
 
@@ -69,7 +70,11 @@ MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
 
-# Slippage recommendations based on trade size
+# Buffer for state changing between quote and inclusion, applied to legs whose
+# price impact is computed from real reserves (AMM pool).
+EXECUTION_BUFFER = float(os.getenv("EXECUTION_BUFFER", "0.003"))  # 0.3%
+
+# Slippage recommendations based on trade size (legacy, legs without known depth)
 SLIPPAGE_TIERS = {
     10: 0.005,    # 0.5% for up to 10 ERG
     50: 0.01,     # 1% for up to 50 ERG
