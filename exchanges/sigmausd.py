@@ -1,4 +1,6 @@
+import json
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
@@ -8,18 +10,153 @@ from exchanges.base import DEXBase, PriceQuote, PoolState
 
 logger = logging.getLogger("ergo_arb.sigmausd")
 
-# SigmaUSD Bank contract details
+# Off-chain oracle frontend, used only as a fallback for the on-chain oracle box
 ORACLE_POOL_API = "https://erg-oracle-ergusd.spirepools.com/frontendData"
-EXPLORER_API = "https://api.ergoplatform.com/api/v1"
+ORACLE_DIVERGENCE_WARN = 0.005  # warn when on-chain and frontend oracle differ by >0.5%
+
+# AgeUSD contract constants
+MIN_RESERVE_RATIO = 400  # percent, checked after a SigUSD mint
+PROTOCOL_FEE_PERCENT = 2  # integer percent, truncated toward zero
+UI_FEE_NUM = 229  # 0.229% of bc_delta
+UI_FEE_DENOM = 100_000
+UI_FEE_MIN_NANOERG = 1_000_000  # 0.001 ERG
+
+
+def _trunc_div(a: int, b: int) -> int:
+    """Integer division truncating toward zero (JVM/Scala semantics)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b >= 0) else -q
+
+
+def ui_fee_nanoerg(bc_delta: int) -> int:
+    return max(bc_delta * UI_FEE_NUM // UI_FEE_DENOM, UI_FEE_MIN_NANOERG)
+
+
+@dataclass(frozen=True)
+class BankState:
+    """Raw on-chain SigmaUSD bank state, in contract units."""
+    bank_erg_nano: int       # bank box value
+    sigusd_circ_cents: int   # bank R4
+    oracle_r4: int           # oracle pool box R4: nanoERG per USD
+
+    @property
+    def rate(self) -> int:
+        """nanoERG per SigUSD cent, as the contract computes it."""
+        return self.oracle_r4 // 100
+
+    @property
+    def oracle_usd_per_erg(self) -> float:
+        return 1e9 / self.oracle_r4 if self.oracle_r4 else 0.0
+
+    @property
+    def reserve_ratio(self) -> float:
+        """Reserve ratio in percent (float, for display)."""
+        liabilities = self.sigusd_circ_cents * self.rate
+        if liabilities <= 0:
+            return float("inf")
+        return self.bank_erg_nano * 100 / liabilities
+
+    def nominal_price(self) -> int:
+        """Contract scNominalPrice: min(rate, liabilities / circulating)."""
+        if self.sigusd_circ_cents <= 0:
+            return self.rate
+        liabilities = max(min(self.bank_erg_nano, self.sigusd_circ_cents * self.rate), 0)
+        return min(self.rate, liabilities // self.sigusd_circ_cents)
+
+
+def quote_redeem_sigusd(state: BankState, cents: int) -> int:
+    """nanoERG paid to the user for redeeming `cents` SigUSD.
+
+    Contract-exact: nominal price (pro-rata when RR < 100%), 2% protocol fee
+    truncated toward zero, then the UI fee. Miner fee and receipt box are not
+    included (see config.SIGMAUSD_REDEEM_EXTRA_ERG).
+    """
+    if cents <= 0:
+        return 0
+    br_delta_expected = state.nominal_price() * -cents
+    fee = abs(_trunc_div(br_delta_expected * PROTOCOL_FEE_PERCENT, 100))
+    bc_delta = -(br_delta_expected + fee)  # ERG leaving the bank
+    return max(bc_delta - ui_fee_nanoerg(bc_delta), 0)
+
+
+def _mint_bc_delta(state: BankState, cents: int) -> int:
+    br_delta_expected = state.nominal_price() * cents
+    fee = abs(_trunc_div(br_delta_expected * PROTOCOL_FEE_PERCENT, 100))
+    return br_delta_expected + fee
+
+
+def mint_cost_nanoerg(state: BankState, cents: int) -> int:
+    """Total nanoERG the user pays (bank + UI fee) to mint `cents` SigUSD."""
+    if cents <= 0:
+        return 0
+    bc_delta = _mint_bc_delta(state, cents)
+    return bc_delta + ui_fee_nanoerg(bc_delta)
+
+
+def can_mint_sigusd(state: BankState, cents: int) -> bool:
+    """True if minting `cents` SigUSD keeps the post-mint RR >= 400%."""
+    if cents <= 0 or state.rate <= 0:
+        return False
+    bank_out = state.bank_erg_nano + _mint_bc_delta(state, cents)
+    liabilities_out = min(bank_out, (state.sigusd_circ_cents + cents) * state.rate)
+    if liabilities_out <= 0:
+        return True
+    return bank_out * 100 // liabilities_out >= MIN_RESERVE_RATIO
+
+
+def _max_true(lo: int, hi: int, pred) -> int:
+    """Largest n in [lo, hi] with pred(n) True, assuming pred is monotone decreasing."""
+    if not pred(lo):
+        return lo - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if pred(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def affordable_mint_cents(state: BankState, budget_nanoerg: int) -> int:
+    """Max SigUSD cents whose mint cost fits `budget_nanoerg`, ignoring the RR rule."""
+    if state.rate <= 0 or budget_nanoerg <= 0:
+        return 0
+    upper = budget_nanoerg // state.rate + 1
+    return max(_max_true(1, upper, lambda c: mint_cost_nanoerg(state, c) <= budget_nanoerg), 0)
+
+
+def quote_mint_sigusd(state: BankState, budget_nanoerg: int) -> int:
+    """Max SigUSD cents mintable with `budget_nanoerg` (0 if minting is blocked)."""
+    affordable = affordable_mint_cents(state, budget_nanoerg)
+    if affordable < 1:
+        return 0
+    return max(_max_true(1, affordable, lambda c: can_mint_sigusd(state, c)), 0)
+
+
+def parse_bank_box(box: dict) -> tuple[int, int]:
+    """(bank nanoERG, SigUSD circulating cents) from an explorer/node bank box."""
+    regs = box.get("additionalRegisters", {})
+    r4 = regs.get("R4", {})
+    circ = r4.get("renderedValue") if isinstance(r4, dict) else None
+    return int(box["value"]), int(circ)
+
+
+def parse_oracle_box(box: dict) -> int:
+    regs = box.get("additionalRegisters", {})
+    r4 = regs.get("R4", {})
+    return int(r4.get("renderedValue") if isinstance(r4, dict) else r4)
 
 
 class SigmaUSDBank(DEXBase):
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self._oracle_price: Optional[float] = None  # USD per ERG from oracle
-        self._reserve_ratio: Optional[float] = None
+        self.state: Optional[BankState] = None
+        self._oracle_price: Optional[float] = None  # USD per ERG
+        self._oracle_r4: Optional[int] = None
         self._bank_erg_reserve: Optional[float] = None
         self._sigusd_circulating: Optional[float] = None
+        self._bank_erg_nano: Optional[int] = None
+        self._sigusd_circ_cents: Optional[int] = None
 
     async def connect(self):
         self.session = aiohttp.ClientSession()
@@ -31,128 +168,121 @@ class SigmaUSDBank(DEXBase):
             self.session = None
         logger.info("SigmaUSD Bank disconnected")
 
+    async def _explorer_unspent_by_token(self, token_id: str) -> Optional[dict]:
+        url = f"{config.ERGO_EXPLORER_API_URL}/boxes/unspent/byTokenId/{token_id}?limit=1"
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                logger.warning(f"Explorer byTokenId {token_id[:8]} returned {resp.status}")
+                return None
+            data = await resp.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            return items[0] if items else None
+
+    async def _fetch_frontend_oracle_price(self) -> Optional[float]:
+        async with self.session.get(ORACLE_POOL_API, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            raw = await resp.json(content_type=None)
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            price = data.get("latest_price", 0)
+            return float(price) if isinstance(price, (int, float)) and price > 0 else None
+
     async def fetch_oracle_price(self) -> Optional[float]:
-        """Fetch ERG/USD price from oracle pool."""
+        """ERG/USD from the on-chain oracle pool box (what the bank contract uses).
+
+        Falls back to the spirepools frontend if the box can't be read, and warns
+        when the two disagree.
+        """
         if not self.session:
             return None
+        onchain = frontend = None
         try:
-            async with self.session.get(
-                ORACLE_POOL_API,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    raw = await resp.json()
-                    # API returns a JSON string that needs to be parsed again
-                    import json
-                    data = json.loads(raw) if isinstance(raw, str) else raw
-                    price = data.get("latest_price", 0)
-                    if isinstance(price, (int, float)) and price > 0:
-                        # latest_price is already in USD per ERG
-                        self._oracle_price = price
-                        return self._oracle_price
-                logger.warning(f"Oracle API returned {resp.status}")
-                return None
+            box = await self._explorer_unspent_by_token(config.SIGMAUSD_ORACLE_NFT)
+            if box:
+                self._oracle_r4 = parse_oracle_box(box)
+                onchain = 1e9 / self._oracle_r4
         except Exception as e:
-            logger.error(f"Oracle price fetch error: {e}")
+            logger.error(f"On-chain oracle fetch error: {e}")
+        try:
+            frontend = await self._fetch_frontend_oracle_price()
+        except Exception as e:
+            logger.debug(f"Frontend oracle fetch error: {e}")
+
+        if onchain and frontend and abs(onchain - frontend) / onchain > ORACLE_DIVERGENCE_WARN:
+            logger.warning(f"Oracle divergence: on-chain ${onchain:.4f} vs frontend ${frontend:.4f}")
+        if onchain:
+            self._oracle_price = onchain
+        elif frontend:
+            logger.warning("On-chain oracle unavailable, using frontend price (bank quotes disabled)")
+            self._oracle_price = frontend
+            self._oracle_r4 = None
+        else:
             return None
+        return self._oracle_price
 
     async def fetch_bank_state(self) -> bool:
-        """Fetch current bank state (reserves, circulating supply)."""
+        """Fetch bank box: reserve (nanoERG) and SigUSD circulating (R4, cents)."""
         if not self.session:
             return False
         try:
-            # Query the bank box by its NFT token ID
-            url = f"{EXPLORER_API}/boxes/unspent/byTokenId/{config.SIGMAUSD_BANK_NFT}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    items = data.get("items", data) if isinstance(data, dict) else data
-                    if items and len(items) > 0:
-                        bank_box = items[0]
-                        # Bank box value is in nanoERG
-                        self._bank_erg_reserve = bank_box.get("value", 0) / 1e9
-                        # Get circulating SigUSD from registers
-                        # R4 contains circulating SigUSD, R5 contains circulating SigRSV
-                        registers = bank_box.get("additionalRegisters", {})
-                        if "R4" in registers:
-                            r4 = registers["R4"]
-                            r4_value = r4.get("renderedValue", r4.get("serializedValue", "0"))
-                            try:
-                                self._sigusd_circulating = int(r4_value) / 100  # 2 decimals
-                            except (ValueError, TypeError):
-                                pass
-                        return True
-                logger.warning(f"Explorer bank box query returned {resp.status}")
+            box = await self._explorer_unspent_by_token(config.SIGMAUSD_BANK_NFT)
+            if not box:
                 return False
+            self._bank_erg_nano, self._sigusd_circ_cents = parse_bank_box(box)
+            self._bank_erg_reserve = self._bank_erg_nano / 1e9
+            self._sigusd_circulating = self._sigusd_circ_cents / 100
+            return True
         except Exception as e:
             logger.error(f"Bank state fetch error: {e}")
             return False
 
+    def _refresh_state(self):
+        if None not in (self._bank_erg_nano, self._sigusd_circ_cents, self._oracle_r4):
+            self.state = BankState(self._bank_erg_nano, self._sigusd_circ_cents, self._oracle_r4)
+        else:
+            self.state = None
+
     @property
     def reserve_ratio(self) -> Optional[float]:
-        """Calculate current reserve ratio as percentage."""
+        """Current reserve ratio as a percentage."""
         if (
             self._bank_erg_reserve is not None
             and self._oracle_price is not None
             and self._sigusd_circulating is not None
             and self._sigusd_circulating > 0
         ):
-            # reserve_ratio = (ERG_reserve * ERG_USD_price) / SigUSD_circulating
             reserve_value_usd = self._bank_erg_reserve * self._oracle_price
             return (reserve_value_usd / self._sigusd_circulating) * 100
         return None
 
-    def can_mint_sigusd(self) -> bool:
-        """Check if minting SigUSD is allowed (reserve ratio > 400%)."""
-        rr = self.reserve_ratio
-        return rr is not None and rr > 400
+    def can_mint_sigusd(self, cents: int = 1) -> bool:
+        """True if minting `cents` SigUSD keeps RR >= 400% after the mint."""
+        return self.state is not None and can_mint_sigusd(self.state, cents)
 
     def can_redeem_sigusd(self) -> bool:
-        """Check if redeeming SigUSD is allowed (reserve ratio < 800%)."""
-        rr = self.reserve_ratio
-        return rr is not None and rr < 800
+        """SigUSD redeem has no RR restriction; only needs known bank state."""
+        return self.reserve_ratio is not None
 
     def erg_to_sigusd(self, erg_amount: float) -> float:
-        """Calculate SigUSD received for minting with ERG (after fees)."""
-        if self._oracle_price is None or self._oracle_price == 0:
+        """SigUSD received for minting with `erg_amount` ERG (contract-exact)."""
+        if self.state is None:
             return 0
-        # _oracle_price is USD per ERG
-        gross_sigusd = erg_amount * self._oracle_price
-        # Apply 2% protocol fee first, then 0.229% UI fee on the remainder
-        after_protocol = gross_sigusd * (1 - config.SIGMAUSD_PROTOCOL_FEE)
-        net_sigusd = after_protocol * (1 - config.SIGMAUSD_FRONTEND_FEE)
-        return net_sigusd
+        return quote_mint_sigusd(self.state, int(erg_amount * 1e9)) / 100
 
     def sigusd_to_erg(self, sigusd_amount: float) -> float:
-        """Calculate ERG received for redeeming SigUSD (after fees)."""
-        if self._oracle_price is None or self._oracle_price == 0:
+        """ERG received for redeeming SigUSD, after receipt box and miner fee."""
+        if self.state is None:
             return 0
-        gross_erg = sigusd_amount / self._oracle_price
-        # Apply 2% protocol fee first, then 0.229% UI fee on the remainder
-        after_protocol = gross_erg * (1 - config.SIGMAUSD_PROTOCOL_FEE)
-        net_erg = after_protocol * (1 - config.SIGMAUSD_FRONTEND_FEE)
-        # Subtract receipt box + miner fee
-        net_erg -= config.SIGMAUSD_REDEEM_EXTRA_ERG
-        return max(net_erg, 0)
+        net = quote_redeem_sigusd(self.state, int(sigusd_amount * 100)) / 1e9
+        return max(net - config.SIGMAUSD_REDEEM_EXTRA_ERG, 0)
 
     async def get_price(self, pair: str = "ERG/SigUSD") -> Optional[PriceQuote]:
         oracle_price = await self.fetch_oracle_price()
         if oracle_price is None:
             return None
-
-        # oracle_price is USD per ERG
-        # Bid = what you get selling ERG (mint SigUSD) after fees
-        # Apply 2% protocol fee then 0.229% UI fee
         bid = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
-        # Ask = what you pay buying ERG (redeem SigUSD) including fees
         ask = oracle_price / ((1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE))
-
-        return PriceQuote(
-            exchange="SigmaUSD Bank",
-            pair=pair,
-            bid=bid,
-            ask=ask,
-        )
+        return PriceQuote(exchange="SigmaUSD Bank", pair=pair, bid=bid, ask=ask)
 
     async def get_pool_state(self, pair: str = "ERG/SigUSD") -> Optional[PoolState]:
         # SigmaUSD bank is not an AMM pool, but we can represent its state
@@ -169,14 +299,16 @@ class SigmaUSDBank(DEXBase):
         )
 
     async def get_full_state(self) -> dict:
-        """Get comprehensive bank state for logging."""
-        await self.fetch_oracle_price()
-        await self.fetch_bank_state()
+        """Bank state for the scanner. `state` is the contract-exact BankState (or None)."""
+        import asyncio
+        await asyncio.gather(self.fetch_oracle_price(), self.fetch_bank_state())
+        self._refresh_state()
         return {
             "oracle_erg_usd": self._oracle_price,
             "bank_erg_reserve": self._bank_erg_reserve,
             "sigusd_circulating": self._sigusd_circulating,
             "reserve_ratio": self.reserve_ratio,
             "can_mint_sigusd": self.can_mint_sigusd(),
-            "can_redeem_sigusd": self.can_redeem_sigusd(),
+            "can_redeem_sigusd": self.can_redeem_sigusd() and self.state is not None,
+            "state": self.state,
         }

@@ -14,7 +14,13 @@ import config
 from exchanges.nonkyc import NonKYCExchange
 from exchanges.kucoin import KucoinExchange
 from exchanges.spectrum import SpectrumDEX
-from exchanges.sigmausd import SigmaUSDBank
+from exchanges.sigmausd import (
+    SigmaUSDBank,
+    BankState,
+    affordable_mint_cents,
+    can_mint_sigusd,
+    quote_redeem_sigusd,
+)
 from exchanges.ergo_node import ErgoNodeClient
 from arbitrage.calculator import ArbitrageCalculator, ArbitrageOpportunity, FeeBreakdown
 from tracker.profit_tracker import ProfitTracker
@@ -25,7 +31,7 @@ logger = logging.getLogger("ergo_arb.scanner")
 
 
 class ArbitrageScanner:
-    def __init__(self, mode: str = "monitor"):
+    def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db"):
         """
         mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
         """
@@ -36,7 +42,7 @@ class ArbitrageScanner:
         self.sigmausd = SigmaUSDBank()
         self.ergo_node = ErgoNodeClient()
         self.calculator = ArbitrageCalculator()
-        self.tracker = ProfitTracker()
+        self.tracker = ProfitTracker(db_path)
         self.discord = DiscordNotifier()
         self._crux_session: Optional[aiohttp.ClientSession] = None
         self.scan_count = 0
@@ -257,6 +263,25 @@ class ArbitrageScanner:
 
         console.print(table)
 
+    @staticmethod
+    def _bank_mint(state: Optional[BankState], erg: float) -> tuple[int, bool]:
+        """(SigUSD cents minted for `erg` ERG, mint allowed by post-mint RR)."""
+        if state is None:
+            return 0, False
+        cents = affordable_mint_cents(state, int(erg * 1e9))
+        return cents, can_mint_sigusd(state, cents)
+
+    @staticmethod
+    def _bank_redeem_erg(state: Optional[BankState], sigusd: float) -> tuple[int, float]:
+        """(cents redeemed, ERG paid out by the bank) for `sigusd` SigUSD.
+
+        Excludes the receipt box + miner fee (config.SIGMAUSD_REDEEM_EXTRA_ERG).
+        """
+        if state is None:
+            return 0, 0.0
+        cents = int(sigusd * 100)
+        return cents, quote_redeem_sigusd(state, cents) / 1e9
+
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
         """Analyze prices and find all arbitrage opportunities."""
         opportunities = []
@@ -269,6 +294,7 @@ class ArbitrageScanner:
         can_mint = bank.get("can_mint_sigusd", False)
         can_redeem = bank.get("can_redeem_sigusd", False)
         reserve_ratio = bank.get("reserve_ratio")
+        bank_state: Optional[BankState] = bank.get("state")
 
         # USE data
         use_data = prices.get("use_data")
@@ -286,8 +312,7 @@ class ArbitrageScanner:
 
         # Build blocked reason strings
         rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
-        mint_blocked_reason = f"Bank mint blocked (RR={rr_str}, need >400%)" if not can_mint else ""
-        redeem_blocked_reason = f"Bank redeem blocked (RR={rr_str}, need <800%)" if not can_redeem else ""
+        mint_blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR must stay >=400%)" if not can_mint else ""
 
         for trade_size in self._trade_sizes:
             slippage = config.get_recommended_slippage(trade_size)
@@ -295,9 +320,10 @@ class ArbitrageScanner:
             # ---- SigUSD Paths ----
 
             # Path 1: Bank mint -> Spectrum (always calculate, mark blocked)
-            if oracle_price and spectrum_price and spectrum_price > 0:
-                bank_rate_after_fees = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
-                sigusd_from_bank = trade_size * bank_rate_after_fees
+            if bank_state and spectrum_price and spectrum_price > 0:
+                mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
+                sigusd_from_bank = mint_cents / 100
+                bank_rate_after_fees = sigusd_from_bank / trade_size
                 erg_from_dex = sigusd_from_bank / spectrum_price
                 erg_from_dex_after_fee = erg_from_dex * (1 - config.SPECTRUM_POOL_FEE)
 
@@ -316,16 +342,20 @@ class ArbitrageScanner:
                     f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
                     f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
                 ]
-                if not can_mint:
+                opp.details = {"sigusd_cents": mint_cents}
+                if not mint_ok:
                     opp.blocked = True
-                    opp.blocked_reason = mint_blocked_reason
+                    opp.blocked_reason = (
+                        f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
+                    )
                     opp.is_profitable = False
                 opportunities.append(opp)
 
             # Path 2: Spectrum -> Bank redeem (always calculate, mark blocked)
-            if oracle_price and spectrum_price and spectrum_price > 0:
+            if bank_state and spectrum_price and spectrum_price > 0:
                 sigusd_from_dex = trade_size * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
-                bank_redeem_rate = (1.0 / oracle_price) * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+                redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
+                bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
 
                 opp = self.calculator.calc_dex_to_bank(
                     input_erg=trade_size,
@@ -335,7 +365,7 @@ class ArbitrageScanner:
                 )
                 opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
                 fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                erg_from_bank = sigusd_from_dex * bank_redeem_rate
+                opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
                 opp.steps = [
                     f"START: Have {trade_size} ERG in wallet",
                     f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
@@ -343,10 +373,6 @@ class ArbitrageScanner:
                     f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
                     f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
                 ]
-                if not can_redeem:
-                    opp.blocked = True
-                    opp.blocked_reason = redeem_blocked_reason
-                    opp.is_profitable = False
                 opportunities.append(opp)
 
             # Path 3: NonKYC vs Spectrum (note SigUSD != USDT assumption)
@@ -894,8 +920,8 @@ class ArbitrageScanner:
 
         oracle_price = prices.get("bank", {}).get("oracle_erg_usd")
         spectrum_price = prices.get("spectrum_erg_sigusd")
-        can_redeem = prices.get("bank", {}).get("can_redeem_sigusd", False)
-        can_mint = prices.get("bank", {}).get("can_mint_sigusd", False)
+        bank_state: Optional[BankState] = prices.get("bank", {}).get("state")
+        can_redeem = bank_state is not None  # SigUSD redeem has no RR restriction
         nonkyc_price = prices.get("nonkyc_erg_usdt")
         kucoin_price = prices.get("kucoin_erg_usdt")
         fee_factor = (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
@@ -911,10 +937,10 @@ class ArbitrageScanner:
         # ===================== ERG OPTIONS =====================
         if erg > 2:
             # 1. Bank mint -> Spectrum sell
-            if oracle_price and spectrum_price:
-                if can_mint:
-                    bank_rate = oracle_price * fee_factor
-                    sigusd_out = erg * bank_rate
+            if bank_state and spectrum_price:
+                mint_cents, mint_ok = self._bank_mint(bank_state, erg)
+                if mint_ok:
+                    sigusd_out = mint_cents / 100
                     erg_before_fees = (sigusd_out / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
                     total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
                     erg_back = erg_before_fees - total_fees
@@ -936,13 +962,13 @@ class ArbitrageScanner:
                     rr = prices.get('bank', {}).get('reserve_ratio', 0)
                     erg_options.append({"name": "Bank mint -> Spectrum sell", "steps": [], "profit_pct": 0,
                         "profit_desc": "", "result": "", "blocked": True,
-                        "blocked_reason": f"Bank mint BLOCKED (RR={rr:.0f}%, need >400%)"})
+                        "blocked_reason": f"Bank mint BLOCKED (RR={rr:.0f}%, post-mint RR would drop below 400%)"})
 
             # 2. Spectrum buy SigUSD -> Bank redeem
-            if oracle_price and spectrum_price:
+            if bank_state and spectrum_price:
                 if can_redeem:
                     sigusd_out = erg * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
-                    erg_from_bank = (sigusd_out / oracle_price) * fee_factor
+                    _, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_out)
                     total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE + config.SIGMAUSD_REDEEM_EXTRA_ERG
                     erg_back = erg_from_bank - total_fees
                     net = erg_back - erg
@@ -1000,7 +1026,7 @@ class ArbitrageScanner:
 
             # 1. Bank redeem (SigUSD -> ERG)
             if can_redeem:
-                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                erg_out = self._bank_redeem_erg(bank_state, sigusd)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
                 pct = ((erg_out - baseline_erg) / baseline_erg) * 100
                 sigusd_options.append({
                     "name": "Bank redeem",
@@ -1077,7 +1103,7 @@ class ArbitrageScanner:
 
             # 5. Bank redeem -> Kucoin (SigUSD -> ERG via bank -> USDT)
             if can_redeem and kucoin_price:
-                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                erg_out = self._bank_redeem_erg(bank_state, sigusd)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
                 if erg_out > 0:
                     usdt_out = erg_out * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
                     baseline_usdt = sigusd
@@ -1097,7 +1123,7 @@ class ArbitrageScanner:
 
             # 6. Bank redeem -> NonKYC (SigUSD -> ERG via bank -> USDT)
             if can_redeem and nonkyc_price:
-                erg_out = (sigusd / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                erg_out = self._bank_redeem_erg(bank_state, sigusd)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
                 if erg_out > 0:
                     usdt_out = erg_out * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
                     baseline_usdt = sigusd
@@ -1173,7 +1199,7 @@ class ArbitrageScanner:
                     # 4. USE -> ERG -> Spectrum buy SigUSD -> Bank redeem -> ERG (arb loop)
                     if spectrum_price and can_redeem:
                         sigusd_from_spectrum = erg_from_crux * spectrum_price * (1 - config.SPECTRUM_POOL_FEE)
-                        erg_hop2 = (sigusd_from_spectrum / oracle_price) * fee_factor - config.SIGMAUSD_REDEEM_EXTRA_ERG
+                        erg_hop2 = self._bank_redeem_erg(bank_state, sigusd_from_spectrum)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
                         total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE
                         erg_final = erg_hop2 - total_fees_hop2
                         net = erg_final - erg_from_crux
@@ -1193,9 +1219,9 @@ class ArbitrageScanner:
                         })
 
                     # 5. USE -> ERG -> Bank mint SigUSD -> Spectrum sell -> ERG (if mint available)
-                    if spectrum_price and can_mint:
-                        bank_rate = oracle_price * fee_factor
-                        sigusd_from_bank = erg_from_crux * bank_rate
+                    use_mint_cents, use_mint_ok = self._bank_mint(bank_state, erg_from_crux)
+                    if spectrum_price and use_mint_ok:
+                        sigusd_from_bank = use_mint_cents / 100
                         erg_from_spectrum = (sigusd_from_bank / spectrum_price) * (1 - config.SPECTRUM_POOL_FEE)
                         total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
                         erg_final = erg_from_spectrum - total_fees_hop2
@@ -1214,7 +1240,7 @@ class ArbitrageScanner:
                             "result": f"{erg_final:.2f} ERG in wallet",
                             "blocked": False, "blocked_reason": "",
                         })
-                    elif spectrum_price and not can_mint:
+                    elif spectrum_price and bank_state:
                         rr = prices.get('bank', {}).get('reserve_ratio', 0)
                         use_options.append({"name": "Crux -> Bank mint -> Spectrum sell", "steps": [], "profit_pct": 0,
                             "profit_desc": "", "result": "", "blocked": True,

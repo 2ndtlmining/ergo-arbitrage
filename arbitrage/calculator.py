@@ -47,6 +47,7 @@ class ArbitrageOpportunity:
     estimated_execution_minutes: float = 0  # How long the full path takes
     price_risk_percent: float = 0  # Estimated price risk during execution
     profit_usd: float = 0  # Profit in USD terms
+    details: dict = field(default_factory=dict)  # Exact leg amounts (e.g. sigusd_cents, bank_erg)
     timestamp: datetime = field(default_factory=datetime.now)
 
     @property

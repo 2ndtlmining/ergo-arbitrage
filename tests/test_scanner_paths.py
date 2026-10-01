@@ -1,0 +1,85 @@
+"""Scanner path tests against a fixed `prices` snapshot (no network)."""
+import pytest
+
+from arbitrage.scanner import ArbitrageScanner
+from exchanges.sigmausd import BankState, quote_redeem_sigusd
+
+ORACLE_R4 = 3_100_000_000  # 3.1 ERG per USD -> $0.3226/ERG
+
+
+def bank_dict(state: BankState) -> dict:
+    return {
+        "oracle_erg_usd": state.oracle_usd_per_erg,
+        "bank_erg_reserve": state.bank_erg_nano / 1e9,
+        "sigusd_circulating": state.sigusd_circ_cents / 100,
+        "reserve_ratio": state.reserve_ratio,
+        "can_mint_sigusd": True,
+        "can_redeem_sigusd": True,
+        "state": state,
+    }
+
+
+@pytest.fixture
+def scanner(tmp_path):
+    s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
+    yield s
+    s.tracker.close()
+
+
+def make_prices(state: BankState, spectrum_price: float) -> dict:
+    return {
+        "nonkyc_erg_usdt": None,
+        "kucoin_erg_usdt": None,
+        "spectrum_erg_sigusd": spectrum_price,
+        "bank": bank_dict(state),
+        "use_data": None,
+        "use_mint": None,
+    }
+
+
+def by_path(opps, prefix):
+    return [o for o in opps if o.path.startswith(prefix)]
+
+
+class TestBankPaths:
+    def test_redeem_path_not_blocked_above_800_rr(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        assert state.reserve_ratio > 800
+        opps = scanner._find_opportunities(make_prices(state, 0.31))
+        redeem = by_path(opps, "Spectrum buy->Bank redeem")
+        assert redeem and not any(o.blocked for o in redeem)
+
+    def test_redeem_leg_uses_contract_quote(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        opps = scanner._find_opportunities(make_prices(state, 0.31))
+        opp = next(o for o in by_path(opps, "Spectrum buy->Bank redeem") if o.input_erg == 10)
+        cents = opp.details["sigusd_cents"]
+        assert cents > 0
+        assert opp.details["bank_erg"] == pytest.approx(quote_redeem_sigusd(state, cents) / 1e9)
+
+    def test_mint_path_blocked_when_post_mint_rr_below_400(self, scanner):
+        # RR 401%: even a 1 ERG mint pushes it under 400%? Use a tiny bank to make sure.
+        state = BankState(bank_erg_nano=401 * 10**9, sigusd_circ_cents=100 * 100, oracle_r4=10**9)
+        prices = make_prices(state, 0.95)
+        prices["bank"]["can_mint_sigusd"] = True
+        opps = scanner._find_opportunities(prices)
+        mint_100 = next(o for o in by_path(opps, "Bank mint->Spectrum sell") if o.input_erg == 100)
+        assert mint_100.blocked
+        assert "400%" in mint_100.blocked_reason
+
+
+class TestWalletAnalysis:
+    def test_sigusd_bank_redeem_offered_above_800_rr(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        analysis = scanner._build_wallet_analysis({"erg": 0, "sigusd": 10, "use": 0}, make_prices(state, 0.31))
+        redeem = next(o for o in analysis["sigusd"]["options"] if o["name"] == "Bank redeem")
+        assert not redeem["blocked"]
+        expected = quote_redeem_sigusd(state, 1000) / 1e9 - 0.0021
+        assert f"{expected:.2f} ERG" in redeem["result"]
+
+    def test_erg_mint_option_runs_with_bank_state(self, scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        analysis = scanner._build_wallet_analysis({"erg": 50, "sigusd": 0, "use": 0}, make_prices(state, 0.31))
+        names = {o["name"]: o for o in analysis["erg"]["options"]}
+        assert not names["Bank mint -> Spectrum sell"]["blocked"]
+        assert not names["Spectrum buy -> Bank redeem"]["blocked"]

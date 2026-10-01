@@ -10,6 +10,8 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 
+from exchanges.sigmausd import BankState, PROTOCOL_FEE_PERCENT, ui_fee_nanoerg, quote_redeem_sigusd
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 EXPLORER = "https://api.ergoplatform.com/api/v1"
@@ -83,12 +85,8 @@ async def main():
     print(f"  Bank ERG:    {bank_erg / 1e9:.4f}")
     print(f"  SigUSD circ: {sigusd_circ / 100:.2f}")
     print(f"  Oracle:      1 SigUSD = {oracle_rate / 1e9:.6f} ERG")
-    print(f"  RR:          {rr:.0f}% (redeem: {'YES' if rr < 800 else 'NO'})")
+    print(f"  RR:          {rr:.0f}% (SigUSD redeem has no RR limit)")
     print()
-
-    if rr >= 800:
-        print("ABORTED: RR >= 800%, redeem blocked")
-        return
 
     # --- Wallet ---
     print("--- Step 2: Wallet ---")
@@ -128,20 +126,15 @@ async def main():
 
     # --- Calculate (must match contract integer math exactly) ---
     print("--- Step 3: Calculate ---")
-    # Contract: rate = oracleR4 / 100, then scNominalPrice * scCircDelta
-    rate = oracle_rate // 100  # integer division, matches contract
-    bc_reserve_needed_in = sigusd_circ * rate
-    liabilities_in = max(min(bank_erg, bc_reserve_needed_in), 0)
-    liable_rate = liabilities_in // sigusd_circ if sigusd_circ else 0
-    sc_nominal_price = min(rate, liable_rate)
+    # Shared contract-exact math (exchanges/sigmausd.py)
+    state = BankState(bank_erg_nano=bank_erg, sigusd_circ_cents=sigusd_circ, oracle_r4=oracle_rate)
+    sc_nominal_price = state.nominal_price()
     br_delta_expected = sc_nominal_price * (-REDEEM_CENTS)
-    # Contract: fee = brDeltaExpected * 2 / 100 (Scala truncates toward zero)
-    fee_raw = br_delta_expected * 2
-    fee = fee_raw // 100 if fee_raw >= 0 else -((-fee_raw) // 100)  # truncate toward zero
-    actual_fee = -fee if fee < 0 else fee
+    actual_fee = abs(br_delta_expected) * PROTOCOL_FEE_PERCENT // 100
     bc_delta = -(br_delta_expected + actual_fee)  # positive = ERG leaving bank
-    ui_fee = max(bc_delta * 229 // 100000, 1000000)  # 0.229% UI fee, min 0.001 ERG
-    user_receives = bc_delta - ui_fee  # miner fee deducted from user's input box value
+    ui_fee = ui_fee_nanoerg(bc_delta)
+    user_receives = quote_redeem_sigusd(state, REDEEM_CENTS)  # miner fee deducted from user's input box value
+    assert user_receives == bc_delta - ui_fee
 
     gross_erg = sc_nominal_price * REDEEM_CENTS
     print(f"  Gross:    {gross_erg / 1e9:.6f} ERG")
