@@ -254,9 +254,21 @@ ergo_arbitrage/
 
 ### Execution Scripts
 
+Every script builds the transaction, checks it with the TX guard (`ergo/tx_guard.py`) and
+stops there unless you pass `--execute`. The guard resolves all inputs from your own node
+and refuses to sign if any output goes somewhere other than your wallet, the recreated
+pool/bank box, the miner fee or a whitelisted service-fee address, or if the wallet would
+spend more / receive less than the quote allows (`SLIPPAGE_TOLERANCE`, `MAX_FEE_BUDGET_ERG`,
+`MAX_TRADE_SIZE_ERG`).
+
+```bash
+python execute_bank_redeem.py --sigusd 1.0            # dry run: build + verify
+python execute_bank_redeem.py --sigusd 1.0 --execute  # sign and submit
+python execute_swap_sigusd_to_erg.py --execute
+```
+
 | Script | Direction | Status | TX Proof |
 |--------|-----------|--------|----------|
-| `execute_swap_sigusd.py` | ERG -> SigUSD (Mew) | TESTED LIVE | Confirmed on-chain |
 | `execute_swap_use.py` | ERG -> USE (Crux mint) | TESTED LIVE | Confirmed on-chain |
 | `execute_swap_use_to_erg.py` | USE -> ERG (Crux LP) | TESTED LIVE | TX `bf544106...` |
 | `execute_swap_erg_to_use_lp.py` | ERG -> USE (Crux LP) | TESTED LIVE | TX `e2582256...` |

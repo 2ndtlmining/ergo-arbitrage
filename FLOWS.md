@@ -19,7 +19,7 @@ All available swap flows, their status, and test results.
 
 | # | Method | Route | Code | Tested Live | Notes |
 |---|--------|-------|------|-------------|-------|
-| 1 | Mew Finance batcher | ERG -> SigUSD | `execute_swap_sigusd.py` | YES (1 ERG) | Template-based, replaces pubkey in ErgoTree |
+| 1 | Mew Finance batcher | ERG -> SigUSD | `archive/execute_swap_sigusd.py` (archived) | YES (1 ERG) | One-off; replaced pubkey in ErgoTree, not guarded |
 | 2 | SigmaUSD Bank mint | ERG -> SigUSD | Not yet | BLOCKED | Same issue as #5 - needs bank contract TX builder. Currently RR=262% so also blocked by reserve ratio. |
 | 3 | Spectrum DEX swap | ERG -> SigUSD | `execute_swap_erg_to_sigusd_spectrum.py` | QUOTE ONLY | Via Crux /dex/swap routing to Spectrum pool, 0.5% LP fee, ~0.785 ERG service fee |
 

@@ -320,7 +320,6 @@ class ArbitrageScanner:
         bank = prices.get("bank", {})
         oracle_price = bank.get("oracle_erg_usd")
         can_mint = bank.get("can_mint_sigusd", False)
-        can_redeem = bank.get("can_redeem_sigusd", False)
         reserve_ratio = bank.get("reserve_ratio")
         bank_state: Optional[BankState] = bank.get("state")
 

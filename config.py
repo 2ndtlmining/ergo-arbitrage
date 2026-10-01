@@ -43,6 +43,13 @@ CRUX_API_URL = "https://api.cruxfinance.io"
 DEXY_USE_LP_NFT = "4ecaa1aac9846b1454563ae51746db95a3a40ee9f8c5f5301afbe348ae803d41"
 CRUX_MINT_SERVICE_FEE = 0.79  # ERG, Crux /dexy/build_mint_tx service fee
 
+# Service-fee addresses the TX guard lets a third-party-built TX pay (ErgoTrees).
+# Crux Finance swap/mint fee, SigmaUSD UI fee. Extend via env (comma separated).
+SERVICE_FEE_ERGO_TREES = {
+    "0008cd03c50363c9ed382bce675ef307b387410511d1d06dfa64dfd6f2f1de95e5020b61",  # Crux Finance
+    "0008cd02c5f61c83056a746a19a9e449e3c9596314cc417a2ef496b7567af558518f2bc7",  # SigmaUSD UI fee
+} | {t.strip() for t in os.getenv("EXTRA_SERVICE_FEE_ERGO_TREES", "").split(",") if t.strip()}
+
 # Ergo network fees
 ERGO_TX_FEE = 0.0011  # ERG
 ERGO_MIN_BOX_VALUE = 0.001  # ERG
@@ -73,6 +80,7 @@ ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
 MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
+MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
 
 # Buffer for state changing between quote and inclusion, applied to legs whose
