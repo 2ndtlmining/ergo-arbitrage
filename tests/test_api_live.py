@@ -8,6 +8,7 @@ import pytest
 import config
 
 pytestmark = [
+    pytest.mark.live,
     pytest.mark.skipif(not config.NONKYC_API_KEY, reason="NONKYC_API_KEY not set"),
     pytest.mark.asyncio,
 ]

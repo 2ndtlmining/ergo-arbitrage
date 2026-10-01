@@ -16,7 +16,7 @@ load_dotenv()
 NODE_URL = os.getenv("ERGO_NODE_URL", "http://127.0.0.1:9053")
 NODE_API_KEY = os.getenv("ERGO_NODE_API_KEY", "")
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.live, pytest.mark.asyncio]
 
 
 class TestNodeConnectivity:

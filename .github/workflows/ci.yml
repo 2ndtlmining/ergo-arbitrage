@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt pyflakes
+      - name: Check for undefined names
+        run: python -m pyflakes $(git ls-files '*.py' | grep -v '^archive/') | grep -E "undefined name|unable to detect undefined" && exit 1 || true
+      - name: Offline tests (live API/node tests are deselected by pytest.ini)
+        run: python -m pytest -q

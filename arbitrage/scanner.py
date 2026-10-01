@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 import time
 from datetime import datetime
 from typing import Optional
@@ -65,6 +66,8 @@ class ArbitrageScanner:
         self._last_summary_time: float = 0.0
         self._price_timestamps: dict[str, float] = {}
         self._nonkyc_usdt_fee: float = 0.0
+        self._stop = asyncio.Event()
+        self.node_health: dict = {}
         self._kucoin_usdt_fee: float = 1.0
 
     @property
@@ -82,9 +85,15 @@ class ArbitrageScanner:
         await asyncio.gather(*venues)
         self._crux_session = aiohttp.ClientSession()
 
-        node_ok = await self.ergo_node.check_connection()
-        if not node_ok:
+        self.node_health = await self.ergo_node.get_health()
+        if not self.node_health["reachable"]:
             logger.warning("Ergo node not reachable - continuing without node features")
+        elif not self.node_health["synced"]:
+            logger.warning(
+                f"Ergo node not synced (height {self.node_health['height']}, headers {self.node_health['headers']})"
+            )
+        if self.trading_enabled and not self.node_health["ok_to_trade"]:
+            logger.warning("LIVE mode: trading stays disabled until the node is synced and the wallet is unlocked")
 
         if not self.enable_cex:
             logger.info("CEX venues disabled (on-chain only). Set ENABLE_CEX=true to enable.")
@@ -1410,8 +1419,40 @@ class ArbitrageScanner:
             f"{profitable_count} profitable"
         )
 
+    def request_stop(self):
+        """Ask the main loop to finish the current scan and shut down cleanly."""
+        self._stop.set()
+
+    def _install_signal_handlers(self) -> list:
+        """Route SIGINT/SIGTERM to request_stop. Returns (signal, previous handler) pairs to restore."""
+        loop = asyncio.get_running_loop()
+        restore = []
+        for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(sig, self.request_stop)
+                restore.append((sig, None))
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows: no loop signal handlers; use signal.signal from the main thread
+                try:
+                    previous = signal.signal(sig, lambda *_: loop.call_soon_threadsafe(self.request_stop))
+                    restore.append((sig, previous))
+                except ValueError:
+                    pass  # not the main thread
+        return restore
+
+    @staticmethod
+    def _restore_signal_handlers(restore: list):
+        loop = asyncio.get_running_loop()
+        for sig, previous in restore:
+            if previous is None:
+                loop.remove_signal_handler(sig)
+            else:
+                signal.signal(sig, previous)
+
     async def run(self):
-        """Main scan loop."""
+        """Main scan loop: fixed-rate scans until request_stop() or SIGINT/SIGTERM."""
         mode_display = {
             "monitor": "MONITOR ONLY (console output)",
             "notify": "NOTIFICATION (console + Discord alerts)",
@@ -1446,6 +1487,7 @@ class ArbitrageScanner:
             border_style="red" if self.mode == "live" else "magenta",
         ))
 
+        restore = self._install_signal_handlers()
         await self.connect_all()
 
         pruned = self.tracker.prune_scan_results(config.SCAN_RESULTS_RETENTION_DAYS)
@@ -1456,15 +1498,21 @@ class ArbitrageScanner:
             await self.discord.send_startup_message(mode=self.mode)
 
         try:
-            while True:
+            loop = asyncio.get_running_loop()
+            next_tick = loop.time()
+            while not self._stop.is_set():
                 try:
                     await self.scan_once()
                 except Exception as e:
                     logger.error(f"Scan error: {e}", exc_info=True)
-                await asyncio.sleep(config.SCAN_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
+                next_tick = max(next_tick + config.SCAN_INTERVAL_SECONDS, loop.time())
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=next_tick - loop.time())
+                except asyncio.TimeoutError:
+                    pass
             console.print("\n[bold yellow]Shutting down...[/bold yellow]")
         finally:
+            self._restore_signal_handlers(restore)
             self.tracker.print_summary()
             if self.discord_enabled:
                 await self.discord.send_summary_message(self.tracker.get_session_stats())
