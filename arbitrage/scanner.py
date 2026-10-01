@@ -22,7 +22,14 @@ from exchanges.sigmausd import (
     quote_redeem_sigusd,
 )
 from exchanges.ergo_node import ErgoNodeClient
-from arbitrage.calculator import ArbitrageCalculator, ArbitrageOpportunity, FeeBreakdown
+from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
+from arbitrage.calculator import (
+    ArbitrageCalculator,
+    ArbitrageOpportunity,
+    FeeBreakdown,
+    EXECUTION_TIMES,
+    PRICE_RISK_PER_MINUTE,
+)
 from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
 from logging_config import console
@@ -110,39 +117,28 @@ class ArbitrageScanner:
         )
         self.tracker.close()
 
-    async def _fetch_use_price(self) -> Optional[dict]:
-        """Fetch USE (DexyUSD) price and status from Crux Finance API."""
-        if not self._crux_session:
-            return None
-        try:
-            async with self._crux_session.get(
-                f"{config.CRUX_API_URL}/dexy/analytics/use",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status == 200:
-                    return await r.json()
-            return None
-        except Exception as e:
-            logger.error(f"Crux USE price fetch error: {e}")
-            return None
-
     async def _fetch_use_mint_status(self) -> Optional[dict]:
         """Check if USE free_mint or arb_mint is available."""
         if not self._crux_session:
             return None
-        results = {}
-        for mint_type in ("free_mint", "arb_mint"):
+        async def one(mint_type: str):
             try:
                 async with self._crux_session.get(
                     f"{config.CRUX_API_URL}/dexy/mint_status/use?mint_type={mint_type}",
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as r:
                     if r.status == 200:
-                        data = await r.json()
-                        results[mint_type] = data
+                        return mint_type, await r.json()
             except Exception as e:
                 logger.error(f"Crux {mint_type} status error: {e}")
+            return mint_type, None
+
+        pairs = await asyncio.gather(one("free_mint"), one("arb_mint"))
+        results = {k: v for k, v in pairs if v is not None}
         return results if results else None
+
+    async def _fetch_use_lp(self):
+        return await fetch_use_lp(self._crux_session) if self._crux_session else None
 
     async def fetch_all_prices(self) -> dict:
         """Fetch prices from all sources concurrently."""
@@ -151,12 +147,12 @@ class ArbitrageScanner:
         async def _none():
             return None
 
-        nonkyc_price, kucoin_price, spectrum_pool, bank_state, use_data, use_mint = await asyncio.gather(
+        nonkyc_price, kucoin_price, spectrum_pool, bank_state, use_lp, use_mint = await asyncio.gather(
             self.nonkyc.fetch_erg_usdt_price() if self.enable_cex else _none(),
             self.kucoin.fetch_erg_usdt_price() if self.enable_cex else _none(),
             self.spectrum.get_pool_state(),
             self.sigmausd.get_full_state(),
-            self._fetch_use_price(),
+            self._fetch_use_lp(),
             self._fetch_use_mint_status(),
             return_exceptions=True,
         )
@@ -174,9 +170,9 @@ class ArbitrageScanner:
         if isinstance(bank_state, Exception):
             logger.error(f"SigmaUSD state fetch failed: {bank_state}")
             bank_state = {}
-        if isinstance(use_data, Exception):
-            logger.error(f"Crux USE data fetch failed: {use_data}")
-            use_data = None
+        if isinstance(use_lp, Exception):
+            logger.error(f"USE LP fetch failed: {use_lp}")
+            use_lp = None
         if isinstance(use_mint, Exception):
             logger.error(f"Crux USE mint status fetch failed: {use_mint}")
             use_mint = None
@@ -186,7 +182,7 @@ class ArbitrageScanner:
         results["spectrum_erg_sigusd"] = spectrum_price
         results["spectrum_pool"] = spectrum_pool
         results["bank"] = bank_state
-        results["use_data"] = use_data
+        results["use_lp"] = use_lp
         results["use_mint"] = use_mint
 
         # Track price freshness for staleness guard
@@ -199,7 +195,7 @@ class ArbitrageScanner:
             self._price_timestamps["spectrum"] = now
         if bank_state and bank_state.get("oracle_erg_usd"):
             self._price_timestamps["bank"] = now
-        if use_data is not None:
+        if use_lp is not None:
             self._price_timestamps["use"] = now
 
         nonkyc_ob = kucoin_ob = None
@@ -262,18 +258,17 @@ class ArbitrageScanner:
             table.add_row("", "SigUSD Peg", "", peg_status)
 
         # USE (DexyUSD)
-        use_data = prices.get("use_data")
-        if use_data:
-            use_price = use_data.get("erg_price") or use_data.get("price")
-            if use_price:
-                table.add_row("Crux/Dexy", "ERG/USE", f"{use_price:.4f} USE", "DexyUSD price")
+        use_lp = prices.get("use_lp")
+        if use_lp:
+            table.add_row(
+                "Dexy USE LP", "USE/ERG", f"{use_lp.price_y_in_x:.4f} ERG",
+                f"LP spot, {use_lp.reserve_x:,.3f} ERG / {use_lp.reserve_y:,.3f} USE",
+            )
 
         use_mint = prices.get("use_mint")
         if use_mint:
-            fm = use_mint.get("free_mint", {})
-            am = use_mint.get("arb_mint", {})
-            fm_ok = fm.get("available", fm.get("can_mint", False))
-            am_ok = am.get("available", am.get("can_mint", False))
+            fm_ok = (use_mint.get("free_mint") or {}).get("is_available", False)
+            am_ok = (use_mint.get("arb_mint") or {}).get("is_available", False)
             table.add_row("", "USE Mint", "", f"FreeMint: {'YES' if fm_ok else 'NO'} | ArbMint: {'YES' if am_ok else 'NO'}")
 
         console.print(table)
@@ -329,19 +324,11 @@ class ArbitrageScanner:
         reserve_ratio = bank.get("reserve_ratio")
         bank_state: Optional[BankState] = bank.get("state")
 
-        # USE data
-        use_data = prices.get("use_data")
+        # USE (Dexy): LP read on-chain, mint status/state from Crux
+        use_lp = prices.get("use_lp")
         use_mint = prices.get("use_mint")
-        use_price = None
-        if use_data:
-            use_price = use_data.get("erg_price") or use_data.get("price")
-        use_free_mint_ok = False
-        use_arb_mint_ok = False
-        if use_mint:
-            fm = use_mint.get("free_mint", {})
-            am = use_mint.get("arb_mint", {})
-            use_free_mint_ok = fm.get("available", fm.get("can_mint", False))
-            use_arb_mint_ok = am.get("available", am.get("can_mint", False))
+        use_mint_ok = mint_available(use_mint)
+        use_box_state = mint_box_state(use_mint)
 
         # Build blocked reason strings
         rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
@@ -602,53 +589,48 @@ class ArbitrageScanner:
 
             # ---- USE (DexyUSD) Paths ----
 
-            # Path 8: ERG -> USE mint -> sell USE for ERG
-            # USE can be minted via Crux, price from oracle-based mechanism
-            if use_price and oracle_price and use_price > 0:
-                # Mint USE: spend ERG, get USE at Crux rate (~0.79 ERG flat fee)
-                crux_flat_fee = 0.79  # ERG
-                use_minted = (trade_size - crux_flat_fee) * use_price if trade_size > crux_flat_fee else 0
-                # To profit, we need to sell USE back for more ERG than we spent
-                # USE on Spectrum or elsewhere - for now just show the mint cost
-                use_mint_blocked = not (use_free_mint_ok or use_arb_mint_ok)
-                use_blocked_reason = "USE mint not available" if use_mint_blocked else ""
+            # Path 8: ERG -> USE (Dexy bank mint via Crux) -> ERG (Dexy LP via Crux)
+            if use_lp is not None and use_box_state:
+                mint_budget = trade_size - config.CRUX_MINT_SERVICE_FEE - config.ERGO_TX_FEE
+                use_raw = quote_dexy_mint(int(mint_budget * 1e9), use_box_state) if mint_budget > 0 else 0
+                use_minted = use_raw / 10**config.USE_DECIMALS
+                erg_from_lp = use_lp.swap_output(use_minted, input_is_x=False)
+                buffer_cost = erg_from_lp * config.EXECUTION_BUFFER
+                erg_out = erg_from_lp - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE - buffer_cost
+                profit = erg_out - trade_size
+                pct = (profit / trade_size) * 100 if trade_size > 0 else 0
+                oracle_use_erg = use_box_state["oracle_rate"] / 1e9  # ERG per USE at the oracle
 
-                # USE value in ERG at oracle rate (USE is pegged to $1)
-                if oracle_price > 0:
-                    use_value_in_erg = use_minted / oracle_price  # if 1 USE = $1
-                    erg_out = use_value_in_erg - config.ERGO_TX_FEE
-                    profit = erg_out - trade_size
-                    pct = (profit / trade_size) * 100 if trade_size > 0 else 0
-
-                    opp = ArbitrageOpportunity(
-                        path=f"Crux mint+sell USE [{trade_size} ERG]",
-                        input_erg=trade_size,
-                        output_erg=erg_out,
-                        profit_erg=profit,
-                        profit_percent=pct,
-                        fees=FeeBreakdown(
-                            execution_fee_erg=crux_flat_fee,
-                            network_fee_erg=config.ERGO_TX_FEE,
-                        ),
-                        source_price=oracle_price,
-                        target_price=use_price,
-                        source_exchange="Crux Finance",
-                        target_exchange="USE holder",
-                        is_profitable=pct > config.MIN_PROFIT_PERCENT and not use_mint_blocked,
-                        blocked=use_mint_blocked,
-                        blocked_reason=use_blocked_reason,
-                        estimated_execution_minutes=5,
-                        price_risk_percent=5 * 0.02,
-                        assumption="USE sell path not yet built",
-                        steps=[
-                            f"START: Have {trade_size} ERG in wallet",
-                            f"Mint USE via Crux Finance (/dexy/build_mint_tx, {crux_flat_fee} ERG fee)",
-                            f"Receive ~{use_minted:.2f} USE at oracle rate (${oracle_price:.4f}/ERG)",
-                            f"Sell USE -> ERG via Crux LP (/dex/swap, ~0.785 ERG service fee)",
-                            f"END RESULT: ~{erg_out:.2f} ERG in wallet (net {profit:+.2f} ERG)",
-                        ],
-                    )
-                    opportunities.append(opp)
+                opportunities.append(ArbitrageOpportunity(
+                    path=f"Crux mint+sell USE [{trade_size} ERG]",
+                    input_erg=trade_size,
+                    output_erg=erg_out,
+                    profit_erg=profit,
+                    profit_percent=pct,
+                    fees=FeeBreakdown(
+                        execution_fee_erg=config.CRUX_MINT_SERVICE_FEE + config.SPECTRUM_EXECUTION_FEE,
+                        network_fee_erg=config.ERGO_TX_FEE * 2,
+                        slippage_cost=buffer_cost,
+                    ),
+                    source_price=oracle_use_erg,
+                    target_price=use_lp.price_y_in_x,
+                    source_exchange="Dexy bank (via Crux)",
+                    target_exchange="Dexy USE LP (via Crux)",
+                    is_profitable=pct > config.MIN_PROFIT_PERCENT and use_mint_ok,
+                    blocked=not use_mint_ok,
+                    blocked_reason="" if use_mint_ok else "USE mint not available (FreeMint/ArbMint closed)",
+                    estimated_execution_minutes=EXECUTION_TIMES["bank_to_dex"],
+                    price_risk_percent=EXECUTION_TIMES["bank_to_dex"] * PRICE_RISK_PER_MINUTE,
+                    details={"use_raw": use_raw, "lp_erg": erg_from_lp},
+                    steps=[
+                        f"START: Have {trade_size} ERG in wallet",
+                        f"Mint USE via Crux (/dexy/build_mint_tx, -{config.CRUX_MINT_SERVICE_FEE} ERG service fee): "
+                        f"~{use_minted:.3f} USE at {oracle_use_erg:.4f} ERG/USE +0.5% bank fees",
+                        f"Sell {use_minted:.3f} USE -> {erg_from_lp:.2f} ERG on the Dexy LP "
+                        f"({use_lp.reserve_x:,.0f} ERG deep, -0.3% LP fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"END RESULT: ~{erg_out:.2f} ERG in wallet (net {profit:+.2f} ERG)",
+                    ],
+                ))
 
         return opportunities
 
@@ -1173,21 +1155,26 @@ class ArbitrageScanner:
 
         # ===================== USE OPTIONS =====================
         # USE -> ERG is the first hop, then ERG unlocks more paths
+        use_lp = prices.get("use_lp")
         if use > 0.01:
-            if oracle_price and oracle_price > 0:
+            if oracle_price and oracle_price > 0 and use_lp is not None:
                 baseline_usdt = use  # 1 USE ~= $1
-                erg_before_fees = use / oracle_price
+                oracle_erg = use / oracle_price  # value at the oracle rate
+                erg_before_fees = use_lp.swap_output(use, input_is_x=False)
                 erg_from_crux = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
-                crux_step = f"Swap via Crux: {use:.3f} USE -> {erg_from_crux:.2f} ERG (-{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)"
+                crux_step = (
+                    f"Swap via Crux on the Dexy LP: {use:.3f} USE -> {erg_from_crux:.2f} ERG "
+                    f"(-0.3% LP fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)"
+                )
 
                 if erg_from_crux > 0:
                     # 1. USE -> ERG (keep)
-                    pct = ((erg_from_crux - erg_before_fees) / erg_before_fees) * 100
+                    pct = ((erg_from_crux - oracle_erg) / oracle_erg) * 100
                     use_options.append({
                         "name": "Crux -> keep ERG",
                         "steps": [crux_step],
                         "profit_pct": pct,
-                        "profit_desc": f"{erg_from_crux:.2f} ERG ({pct:+.1f}% after fees, baseline {erg_before_fees:.2f} ERG)",
+                        "profit_desc": f"{erg_from_crux:.2f} ERG ({pct:+.1f}% vs oracle value {oracle_erg:.2f} ERG)",
                         "result": f"{erg_from_crux:.2f} ERG in wallet",
                         "blocked": False, "blocked_reason": "",
                     })

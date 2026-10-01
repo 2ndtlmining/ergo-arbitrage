@@ -40,6 +40,8 @@ USE_DECIMALS = 3
 
 # Crux Finance (USE / DexyUSD)
 CRUX_API_URL = "https://api.cruxfinance.io"
+DEXY_USE_LP_NFT = "4ecaa1aac9846b1454563ae51746db95a3a40ee9f8c5f5301afbe348ae803d41"
+CRUX_MINT_SERVICE_FEE = 0.79  # ERG, Crux /dexy/build_mint_tx service fee
 
 # Ergo network fees
 ERGO_TX_FEE = 0.0011  # ERG

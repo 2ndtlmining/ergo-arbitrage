@@ -138,3 +138,39 @@ class TestOnChainOnly:
             assert [o for o in opps if o.path.startswith(self.CEX_PREFIXES)]
         finally:
             s.tracker.close()
+
+
+class TestUsePath:
+    BOX_STATE = {"oracle_rate": ORACLE_R4, "bank_fee_num": 3, "buyback_fee_num": 2, "fee_denom": 1000}
+
+    def _prices(self, lp, available=True):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        p = make_prices(state, 0.31)
+        p["use_lp"] = lp
+        p["use_mint"] = {
+            "free_mint": {"is_available": available, "box_state": self.BOX_STATE},
+            "arb_mint": {"is_available": False, "box_state": self.BOX_STATE},
+        }
+        return p
+
+    def _lp(self, erg, use):
+        from exchanges.base import PoolState
+        return PoolState(exchange="t", pool_id="lp", token_x="ERG", token_y="USE",
+                         reserve_x=erg, reserve_y=use, fee_num=997, fee_denom=1000)
+
+    def test_empty_lp_makes_path_lose_everything(self, scanner):
+        opps = scanner._find_opportunities(self._prices(self._lp(0.002, 0.001)))
+        o = next(o for o in opps if o.path.startswith("Crux mint+sell USE") and o.input_erg == 25)
+        assert o.profit_percent < -90
+        assert not o.blocked
+
+    def test_rich_lp_above_oracle_is_profitable(self, scanner):
+        # LP prices USE at 3.4 ERG vs ~3.1 ERG at the oracle: mint at oracle, sell to LP
+        opps = scanner._find_opportunities(self._prices(self._lp(340_000, 100_000)))
+        o = next(o for o in opps if o.path.startswith("Crux mint+sell USE") and o.input_erg == 100)
+        assert o.profit_erg > 0
+
+    def test_blocked_when_mint_unavailable(self, scanner):
+        opps = scanner._find_opportunities(self._prices(self._lp(340_000, 100_000), available=False))
+        o = next(o for o in opps if o.path.startswith("Crux mint+sell USE"))
+        assert o.blocked and not o.is_profitable
