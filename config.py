@@ -64,6 +64,9 @@ NONKYC_ERG_WITHDRAW_FEE = 3.3  # ERG (confirmed via /asset/info)
 KUCOIN_TRADING_FEE = 0.001  # 0.1% maker/taker
 KUCOIN_ERG_WITHDRAW_FEE = 0.73  # ERG (confirmed via /api/v1/currencies/ERG)
 
+# Venues. CEX paths (Kucoin/NonKYC) are off by default: on-chain only.
+ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "yes")
+
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
 MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))

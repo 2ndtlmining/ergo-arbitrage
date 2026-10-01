@@ -107,3 +107,34 @@ class TestPoolLegs:
         prices["spectrum_pool"] = pool
         opps = {o.input_erg: o for o in by_path(scanner._find_opportunities(prices), "Spectrum buy->Bank redeem")}
         assert opps[100].profit_percent < opps[25].profit_percent
+
+
+class TestOnChainOnly:
+    CEX_PREFIXES = ("NonKYC", "Kucoin")
+
+    def _prices(self):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        p = make_prices(state, 0.31)
+        p["nonkyc_erg_usdt"] = 0.33
+        p["kucoin_erg_usdt"] = 0.34
+        return p
+
+    def test_cex_paths_skipped_when_disabled(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_cex=False)
+        try:
+            opps = s._find_opportunities(self._prices())
+            assert opps
+            assert not [o for o in opps if o.path.startswith(self.CEX_PREFIXES)]
+            analysis = s._build_wallet_analysis({"erg": 50, "sigusd": 10, "use": 0}, self._prices())
+            names = [o["name"] for a in analysis.values() for o in a["options"]]
+            assert not [n for n in names if "Kucoin" in n or "NonKYC" in n]
+        finally:
+            s.tracker.close()
+
+    def test_cex_paths_present_when_enabled(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_cex=True)
+        try:
+            opps = s._find_opportunities(self._prices())
+            assert [o for o in opps if o.path.startswith(self.CEX_PREFIXES)]
+        finally:
+            s.tracker.close()

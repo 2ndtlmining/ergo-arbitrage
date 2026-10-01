@@ -31,11 +31,14 @@ logger = logging.getLogger("ergo_arb.scanner")
 
 
 class ArbitrageScanner:
-    def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db"):
+    def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db",
+                 enable_cex: Optional[bool] = None):
         """
         mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
         """
         self.mode = mode
+        # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
+        self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.nonkyc = NonKYCExchange()
         self.kucoin = KucoinExchange()
         self.spectrum = SpectrumDEX()
@@ -54,6 +57,8 @@ class ArbitrageScanner:
         self._last_wallet_analysis_time: float = 0.0
         self._last_summary_time: float = 0.0
         self._price_timestamps: dict[str, float] = {}
+        self._nonkyc_usdt_fee: float = 0.0
+        self._kucoin_usdt_fee: float = 1.0
 
     @property
     def discord_enabled(self) -> bool:
@@ -64,18 +69,19 @@ class ArbitrageScanner:
         return self.mode == "live"
 
     async def connect_all(self):
-        await asyncio.gather(
-            self.nonkyc.connect(),
-            self.kucoin.connect(),
-            self.spectrum.connect(),
-            self.sigmausd.connect(),
-            self.ergo_node.connect(),
-        )
+        venues = [self.spectrum.connect(), self.sigmausd.connect(), self.ergo_node.connect()]
+        if self.enable_cex:
+            venues += [self.nonkyc.connect(), self.kucoin.connect()]
+        await asyncio.gather(*venues)
         self._crux_session = aiohttp.ClientSession()
 
         node_ok = await self.ergo_node.check_connection()
         if not node_ok:
             logger.warning("Ergo node not reachable - continuing without node features")
+
+        if not self.enable_cex:
+            logger.info("CEX venues disabled (on-chain only). Set ENABLE_CEX=true to enable.")
+            return
 
         nonkyc_fee, kucoin_fee, nonkyc_usdt_fee, kucoin_usdt_fee = await asyncio.gather(
             self.nonkyc.get_withdraw_fee("ERG"),
@@ -142,9 +148,12 @@ class ArbitrageScanner:
         """Fetch prices from all sources concurrently."""
         results = {}
 
+        async def _none():
+            return None
+
         nonkyc_price, kucoin_price, spectrum_pool, bank_state, use_data, use_mint = await asyncio.gather(
-            self.nonkyc.fetch_erg_usdt_price(),
-            self.kucoin.fetch_erg_usdt_price(),
+            self.nonkyc.fetch_erg_usdt_price() if self.enable_cex else _none(),
+            self.kucoin.fetch_erg_usdt_price() if self.enable_cex else _none(),
             self.spectrum.get_pool_state(),
             self.sigmausd.get_full_state(),
             self._fetch_use_price(),
@@ -193,10 +202,12 @@ class ArbitrageScanner:
         if use_data is not None:
             self._price_timestamps["use"] = now
 
-        nonkyc_ob, kucoin_ob = await asyncio.gather(
-            self.nonkyc.get_orderbook("ERG/USDT", depth=20),
-            self.kucoin.get_orderbook("ERG/USDT", depth=20),
-        )
+        nonkyc_ob = kucoin_ob = None
+        if self.enable_cex:
+            nonkyc_ob, kucoin_ob = await asyncio.gather(
+                self.nonkyc.get_orderbook("ERG/USDT", depth=20),
+                self.kucoin.get_orderbook("ERG/USDT", depth=20),
+            )
         results["nonkyc_orderbook"] = nonkyc_ob
         results["kucoin_orderbook"] = kucoin_ob
 
@@ -308,8 +319,8 @@ class ArbitrageScanner:
         """Analyze prices and find all arbitrage opportunities."""
         opportunities = []
 
-        nonkyc_price = prices.get("nonkyc_erg_usdt")
-        kucoin_price = prices.get("kucoin_erg_usdt")
+        nonkyc_price = prices.get("nonkyc_erg_usdt") if self.enable_cex else None
+        kucoin_price = prices.get("kucoin_erg_usdt") if self.enable_cex else None
         spectrum_price = prices.get("spectrum_erg_sigusd")
         bank = prices.get("bank", {})
         oracle_price = bank.get("oracle_erg_usd")
@@ -411,7 +422,7 @@ class ArbitrageScanner:
                 )
                 opp.path = f"NonKYC<>Spectrum [{trade_size} ERG]"
                 opp.assumption = "SigUSD=USDT assumed (depegged!)"
-                nonkyc_usdt_fee = getattr(self, '_nonkyc_usdt_fee', 0)
+                nonkyc_usdt_fee = self._nonkyc_usdt_fee
                 if direction == "buy_dex_sell_cex":
                     usdt_result = trade_size * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
                     opp.steps = [
@@ -447,7 +458,7 @@ class ArbitrageScanner:
                 )
                 opp.path = f"Kucoin<>Spectrum [{trade_size} ERG]"
                 opp.assumption = "SigUSD=USDT assumed (depegged!)"
-                kucoin_usdt_fee = getattr(self, '_kucoin_usdt_fee', 1.0)
+                kucoin_usdt_fee = self._kucoin_usdt_fee
                 if direction == "buy_dex_sell_cex":
                     usdt_result = trade_size * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
                     opp.steps = [
@@ -944,13 +955,13 @@ class ArbitrageScanner:
         spectrum_price = prices.get("spectrum_erg_sigusd")
         bank_state: Optional[BankState] = prices.get("bank", {}).get("state")
         can_redeem = bank_state is not None  # SigUSD redeem has no RR restriction
-        nonkyc_price = prices.get("nonkyc_erg_usdt")
-        kucoin_price = prices.get("kucoin_erg_usdt")
+        nonkyc_price = prices.get("nonkyc_erg_usdt") if self.enable_cex else None
+        kucoin_price = prices.get("kucoin_erg_usdt") if self.enable_cex else None
         fee_factor = (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
         bank_fee_pct = (1 - fee_factor) * 100  # ~2.225%
 
-        nonkyc_usdt_fee = getattr(self, '_nonkyc_usdt_fee', 0)
-        kucoin_usdt_fee = getattr(self, '_kucoin_usdt_fee', 1.0)
+        nonkyc_usdt_fee = self._nonkyc_usdt_fee
+        kucoin_usdt_fee = self._kucoin_usdt_fee
 
         erg_options = []
         sigusd_options = []
@@ -1445,6 +1456,7 @@ class ArbitrageScanner:
             f"Max trade size: {config.MAX_TRADE_SIZE_ERG} ERG\n"
             f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s\n"
             f"Trade sizes monitored: {self._trade_sizes}\n"
+            f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}\n"
             f"{discord_line}",
             title="Starting Up",
             border_style="red" if self.mode == "live" else "magenta",
