@@ -42,9 +42,12 @@ class FakeNode:
         self.sign_requests = []
         self.checked = []
         self.check_status = 200
+        self.unlocked = True
 
     def get(self, url, **kw):
         path = url[len(NODE):]
+        if path == "/wallet/status":
+            return FakeResp(200, {"isUnlocked": self.unlocked})
         if path == "/wallet/addresses":
             return FakeResp(200, ["9wallet"])
         if path == "/utils/addressToRaw/9wallet":
@@ -132,3 +135,18 @@ def test_check_on_node_rejected():
     node.check_status = 400
     ok, detail = run(check_on_node(node, NODE, {"id": "signed"}))
     assert not ok and "Script reduced to false" in detail
+
+
+def test_locked_wallet_is_reported_before_signing():
+    node = FakeNode(FIXTURE["input_boxes"])
+    node.unlocked = False
+    with pytest.raises(TxGuardError, match="locked"):
+        run(guarded_sign(node, NODE, copy.deepcopy(FIXTURE["unsigned_tx"]), POLICY, execute=True))
+    assert node.sign_requests == []
+
+
+def test_locked_wallet_does_not_block_dry_run():
+    node = FakeNode(FIXTURE["input_boxes"])
+    node.unlocked = False
+    with pytest.raises(DryRun):
+        run(guarded_sign(node, NODE, copy.deepcopy(FIXTURE["unsigned_tx"]), POLICY, execute=False))
