@@ -141,6 +141,12 @@ class TestOnChainOnly:
 
 
 class TestUsePath:
+    @pytest.fixture
+    def scanner(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_use=True)
+        yield s
+        s.tracker.close()
+
     BOX_STATE = {"oracle_rate": ORACLE_R4, "bank_fee_num": 3, "buyback_fee_num": 2, "fee_denom": 1000}
 
     def _prices(self, lp, available=True):
@@ -174,3 +180,22 @@ class TestUsePath:
         opps = scanner._find_opportunities(self._prices(self._lp(340_000, 100_000), available=False))
         o = next(o for o in opps if o.path.startswith("Crux mint+sell USE"))
         assert o.blocked and not o.is_profitable
+
+
+class TestUseDisabled:
+    def test_use_path_and_wallet_options_skipped(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_use=False)
+        try:
+            prices = TestUsePath()._prices(TestUsePath()._lp(340_000, 100_000))
+            assert not [o for o in s._find_opportunities(prices) if "USE" in o.path]
+            analysis = s._build_wallet_analysis({"erg": 0, "sigusd": 0, "use": 50}, prices)
+            assert analysis["use"]["options"] == []
+        finally:
+            s.tracker.close()
+
+    def test_default_follows_config(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
+        try:
+            assert s.enable_use is False
+        finally:
+            s.tracker.close()

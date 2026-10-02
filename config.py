@@ -30,7 +30,8 @@ SIGUSD_TOKEN_ID = "03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcb
 SIGRSV_TOKEN_ID = "003bd19d0187117f130b62e1bcab0939929ff5c7709f843c5c4dd158949285d0"
 SIGMAUSD_BANK_NFT = "7d672d1def471720ca5782fd6473e47e796d9ac0c138d9911346f118b2f6d9d9"
 SIGMAUSD_ORACLE_NFT = "011d3364de07e5a26f0c4eef0852cddb387039a921b7154ef3cab22c6eda887f"
-USE_TOKEN_ID = "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669"
+# USE (Dexy USD). Override in .env when the token is migrated.
+USE_TOKEN_ID = os.getenv("USE_TOKEN_ID", "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669")
 
 # Decimals
 ERG_DECIMALS = 9
@@ -40,7 +41,7 @@ USE_DECIMALS = 3
 
 # Crux Finance (USE / DexyUSD)
 CRUX_API_URL = "https://api.cruxfinance.io"
-DEXY_USE_LP_NFT = "4ecaa1aac9846b1454563ae51746db95a3a40ee9f8c5f5301afbe348ae803d41"
+DEXY_USE_LP_NFT = os.getenv("DEXY_USE_LP_NFT", "4ecaa1aac9846b1454563ae51746db95a3a40ee9f8c5f5301afbe348ae803d41")
 CRUX_MINT_SERVICE_FEE = 0.79  # ERG, Crux /dexy/build_mint_tx service fee
 
 # Service-fee addresses the TX guard lets a third-party-built TX pay (ErgoTrees).
@@ -75,6 +76,8 @@ KUCOIN_ERG_WITHDRAW_FEE = 0.73  # ERG (confirmed via /api/v1/currencies/ERG)
 
 # Venues. CEX paths (Kucoin/NonKYC) are off by default: on-chain only.
 ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "yes")
+# USE paths are off by default: the USE LP was drained (Oct 2026) and a token migration is expected.
+ENABLE_USE = os.getenv("ENABLE_USE", "false").strip().lower() in ("1", "true", "yes")
 
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))

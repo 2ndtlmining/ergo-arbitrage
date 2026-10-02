@@ -25,7 +25,7 @@ CRUX_API = "https://api.cruxfinance.io"
 NODE = os.getenv("ERGO_NODE_URL", "http://127.0.0.1:9053")
 API_KEY = os.getenv("ERGO_NODE_API_KEY", "")
 
-USE_TOKEN = "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669"
+USE_TOKEN = config.USE_TOKEN_ID
 
 # Swap amount in nanoERG (1 ERG = 1,000,000,000 nanoERG)
 SWAP_ERG = 1.0
@@ -234,6 +234,9 @@ async def recover_stuck_box(ns, s, box_id, our_address):
 
 
 async def main():
+    if not config.ENABLE_USE:
+        print("USE is disabled (ENABLE_USE=false): the USE LP was drained and a token migration is expected.")
+        return
     node_headers = {"api_key": API_KEY, "Content-Type": "application/json"}
 
     print("=" * 60)
