@@ -100,6 +100,17 @@ class DiscordNotifier:
             logger.error(f"Discord webhook error: {e}")
             return False
 
+    async def notify_watch(self, exchange: str, text: str) -> bool:
+        """Watch-only CEX gap alert, at most once per CEX_WATCH_COOLDOWN_SECONDS per exchange."""
+        key = f"watch:{exchange}"
+        if time.time() - self._last_notified.get(key, 0) < config.CEX_WATCH_COOLDOWN_SECONDS:
+            return False
+        content = f"**CEX watch-only: {exchange}**\n{text}\nNot executable: {exchange} is not connected (no API keys)."
+        sent = await self._send(content)
+        if sent:
+            self._last_notified[key] = time.time()
+        return sent
+
     def _format_opportunity(self, opp: ArbitrageOpportunity, scan_number: int = 0, tier: int = 1) -> str:
         """Format an opportunity as a clear action-oriented message."""
         path_key = self._get_path_key(opp)
