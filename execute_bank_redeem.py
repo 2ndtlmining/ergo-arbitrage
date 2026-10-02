@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo.chain import explorer_box_id, node_box, wallet_context
+from ergo.chain import find_box_id, node_box, wallet_context
 from ergo.signing import DryRun, guarded_sign
 from ergo.sigmausd_tx import build_redeem_tx
 from ergo.tx_guard import SignPolicy, TxGuardError
@@ -40,12 +40,10 @@ async def main(redeem_sigusd: float, execute: bool):
     print()
 
     print("--- Step 1: Fetch State ---")
-    async with aiohttp.ClientSession() as s:
-        bank_id = await explorer_box_id(s, config.SIGMAUSD_BANK_NFT)
-        oracle_id = await explorer_box_id(s, config.SIGMAUSD_ORACLE_NFT)
-
     async with aiohttp.ClientSession(headers=node_headers) as ns:
         try:
+            bank_id = await find_box_id(config.SIGMAUSD_BANK_NFT, ns)
+            oracle_id = await find_box_id(config.SIGMAUSD_ORACLE_NFT, ns)
             bank_box = await node_box(ns, bank_id)
             oracle_box = await node_box(ns, oracle_id)
         except RuntimeError as e:

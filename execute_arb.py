@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo.chain import explorer_box_id, node_box, wait_for_box, wallet_context
+from ergo.chain import find_box_id, node_box, wait_for_box, wallet_context
 from ergo.chain_arb import build_redeem_leg, plan_pool_buy_redeem, tx_output_box
 from ergo.signing import DryRun, check_on_node, guarded_sign, wallet_trees
 from ergo.tx_guard import TxGuardError, verify_unsigned_tx
@@ -31,9 +31,8 @@ TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 async def fetch_state(ns):
-    async with aiohttp.ClientSession() as s:
-        ids = [await explorer_box_id(s, nft) for nft in
-               (config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT)]
+    ids = [await find_box_id(nft, ns) for nft in
+           (config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT)]
     return [await node_box(ns, i) for i in ids]
 
 
@@ -122,9 +121,9 @@ async def main(erg: float, check: bool, execute: bool, force: bool):
         try:
             leg1_out = tx_output_box(signed1, 1)
             await wait_for_box(ns, leg1_out["boxId"], timeout=60)
-            async with aiohttp.ClientSession() as s:  # fresh bank/oracle for leg 2 (pool box is spent by leg 1)
-                bank_id = await explorer_box_id(s, config.SIGMAUSD_BANK_NFT)
-                oracle_id = await explorer_box_id(s, config.SIGMAUSD_ORACLE_NFT)
+            # fresh bank/oracle for leg 2 (the old pool box is spent by leg 1)
+            bank_id = await find_box_id(config.SIGMAUSD_BANK_NFT, ns)
+            oracle_id = await find_box_id(config.SIGMAUSD_ORACLE_NFT, ns)
             bank_box, oracle_box = await node_box(ns, bank_id), await node_box(ns, oracle_id)
             tx2_unsigned, info2, policy2 = build_redeem_leg(bank_box, oracle_box, leg1_out, cents, height,
                                                             our_tree, UI_FEE_TREE)

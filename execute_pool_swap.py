@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo.chain import explorer_box_id, node_box, wallet_context
+from ergo.chain import find_box_id, node_box, wallet_context
 from ergo.pool_swap import build_pool_swap_tx
 from ergo.signing import DryRun, check_on_node, guarded_sign
 from ergo.tx_guard import SignPolicy, TxGuardError
@@ -39,10 +39,9 @@ async def main(sell: str, amount: float, execute: bool, check: bool):
     print(f"Direct pool swap: sell {amount} {'ERG' if sell_erg else 'SigUSD'}  [{mode}]")
     print("=" * 60)
 
-    async with aiohttp.ClientSession() as s:
-        pool_id = await explorer_box_id(s, config.SPECTRUM_SIGUSD_POOL_NFT)
     async with aiohttp.ClientSession(headers=node_headers) as ns:
         try:
+            pool_id = await find_box_id(config.SPECTRUM_SIGUSD_POOL_NFT, ns)
             pool_box = await node_box(ns, pool_id)
         except RuntimeError as e:
             print(f"ABORTED: {e}")
