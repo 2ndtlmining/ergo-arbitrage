@@ -146,6 +146,14 @@ DISCORD_MIN_PROFIT_ERG = float(os.getenv("DISCORD_MIN_PROFIT_ERG", "0.5"))
 DISCORD_TIER1_PROFIT_PERCENT = float(os.getenv("DISCORD_TIER1_PROFIT_PERCENT", "2.0"))
 DISCORD_WALLET_COOLDOWN_SECONDS = int(os.getenv("DISCORD_WALLET_COOLDOWN_SECONDS", "600"))
 DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
+DISCORD_CONFIRM_SECONDS = float(os.getenv("DISCORD_CONFIRM_SECONDS", "10"))   # held this long before a message opens
+DISCORD_CLOSE_SECONDS = float(os.getenv("DISCORD_CLOSE_SECONDS", "10"))       # gone this long before it closes
+DISCORD_EDIT_SECONDS = float(os.getenv("DISCORD_EDIT_SECONDS", "30"))         # at most one edit per this
+DISCORD_HEALTH_CHAIN_SECONDS = float(os.getenv("DISCORD_HEALTH_CHAIN_SECONDS", "120"))
+DISCORD_HEALTH_VENUE_SECONDS = float(os.getenv("DISCORD_HEALTH_VENUE_SECONDS", "300"))
+DISCORD_HEALTH_ORACLE_SECONDS = float(os.getenv("DISCORD_HEALTH_ORACLE_SECONDS", "600"))
+DISCORD_HEALTH_REPEAT_SECONDS = float(os.getenv("DISCORD_HEALTH_REPEAT_SECONDS", "1800"))
+DISCORD_DIGEST_HOUR = int(os.getenv("DISCORD_DIGEST_HOUR", "8"))              # local hour, -1 = off
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
 # --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
