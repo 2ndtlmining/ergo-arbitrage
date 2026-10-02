@@ -256,7 +256,8 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
         return result
 
     try:
-        signed1 = await guarded_sign(ns, node, plan["leg1_tx"], plan["leg1_policy"], execute=execute or check)
+        signed1 = await guarded_sign(ns, node, plan["leg1_tx"], plan["leg1_policy"], execute=execute or check,
+                                     log=log)
     except DryRun:
         log("  Leg 1 verified, not signed (dry run). Use --check for a node validation, --execute to run.")
         result.status = "dry_run"
@@ -296,7 +297,7 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
             (pool,) = await _leg2_boxes(ns, path)
             tx2, info2, policy2 = build_pool_sell_leg(pool, leg1_out, cents, height, our_tree)
             erg_back = info2["amount_out"]
-        signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True)
+        signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True, log=log)
         tx_id = await _submit(ns, signed2)
         last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])
         return tx_id

@@ -10,6 +10,15 @@ from arbitrage.scanner import ArbitrageScanner
 from logging_config import EventLogHandler, console, setup_logging
 
 
+def positive(kind):
+    def parse(text):
+        value = kind(text)
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"must be greater than 0, got {text}")
+        return value
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Ergo Arbitrage Monitor (live dashboard by default)")
     mode = p.add_mutually_exclusive_group()
@@ -19,8 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("--plain", action="store_true", help="scrolling output instead of the dashboard")
     view.add_argument("--json", action="store_true", help="one JSON line per full scan on stdout")
     p.add_argument("--once", action="store_true", help="one full scan, then exit")
-    p.add_argument("--interval", type=int, help="seconds between full scans (SCAN_INTERVAL_SECONDS)")
-    p.add_argument("--max-trade-erg", type=float, help="cap on any executed trade (MAX_TRADE_SIZE_ERG)")
+    p.add_argument("--interval", type=positive(int), help="seconds between full scans (SCAN_INTERVAL_SECONDS)")
+    p.add_argument("--max-trade-erg", type=positive(float), help="cap on any executed trade (MAX_TRADE_SIZE_ERG)")
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
                    help="log file level (arbitrage.log, rotated daily, 14 days kept)")
     p.add_argument("--db", default="arbitrage_tracker.db", help="tracker database path")
@@ -37,9 +46,9 @@ def mode_of(args) -> str:
 
 
 def apply_overrides(args):
-    if args.interval:
+    if args.interval is not None:
         config.SCAN_INTERVAL_SECONDS = args.interval
-    if args.max_trade_erg:
+    if args.max_trade_erg is not None:
         config.MAX_TRADE_SIZE_ERG = args.max_trade_erg
 
 

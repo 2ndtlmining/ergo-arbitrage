@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import logging
 import os
 import signal
@@ -87,6 +88,8 @@ class ArbitrageScanner:
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
         self._chain_prices: Optional[dict] = None           # its price entries
         self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
+        self._last_blocked_logged: Optional[tuple] = None   # their shape, last written to the log
+        self._health_blocker: Optional[str] = None          # node health from the last live gate check
         self._chain_error: Optional[str] = None             # set while chain reads fail
         self._last_full_scan = float("-inf")
         self._last_key: Optional[tuple] = None
@@ -1153,8 +1156,11 @@ class ArbitrageScanner:
             self._live_start_value = self._wallet_value_erg(wallet, prices)
         blockers = self._sync_global_blockers(wallet, prices)
         health = await self.ergo_node.get_health()
+        self._health_blocker = None
         if not health.get("ok_to_trade"):
-            blockers.append(f"node not ready (synced={health.get('synced')}, unlocked={health.get('unlocked')})")
+            self._health_blocker = (f"node not ready (synced={health.get('synced')}, "
+                                    f"unlocked={health.get('unlocked')})")
+            blockers.append(self._health_blocker)
         return blockers
 
     async def _live_blockers(self, wallet: dict, prices: dict, key: str = LIVE_PATH) -> list[str]:
@@ -1162,12 +1168,22 @@ class ArbitrageScanner:
         return self._path_blockers(key, wallet) + await self._global_blockers(wallet, prices)
 
     def _trade_log(self, message: str):
-        """Runner progress: printed in plain view, an event otherwise, always in the log file."""
-        self.out.print(message)
-        text = (Text.from_markup(message).plain if "[" in message else message).strip()
+        """Runner progress: always in the log file, printed in plain view, an event otherwise.
+
+        Runs between the two legs of a live trade, so it must never raise: node error text can
+        contain things that look like rich markup (e.g. "[/detail]").
+        """
+        logger.info(f"LIVE {message.strip()}")
+        try:
+            self.out.print(message)
+        except Exception:
+            self.out.print(message, markup=False)
+        try:
+            text = Text.from_markup(message).plain.strip()
+        except Exception:
+            text = message.strip()
         if text:
             self.state.add_event("trade", text)
-            logger.info(f"LIVE {text}")
 
     async def _execute_trades(self, wallet: dict, prices: dict, quiet: bool = False):
         """--live: run the most profitable executable path at its best size when every check passes.
@@ -1185,6 +1201,11 @@ class ArbitrageScanner:
                 for line in lines:
                     self.out.print(f"  [dim]{line}[/dim]")
             self._last_blocked = lines
+            shape = tuple(re.sub(r"\d+(\.\d+)?", "#", line) for line in lines)  # ignore ticking counters
+            if self.view != "plain" and shape != self._last_blocked_logged:
+                for line in lines:
+                    logger.info(line)
+            self._last_blocked_logged = shape
             return
         self._last_blocked = None
 
@@ -1830,11 +1851,14 @@ class ArbitrageScanner:
         elif self._live_paused:
             s.set_live("paused", [self._live_paused, "restart to resume"])
         else:
+            # Global reasons first (they block every path), then the closest path's own reasons.
             reasons = self._sync_global_blockers(wallet, prices)
+            if self._health_blocker:
+                reasons.append(self._health_blocker)
             ready = [k for k in LIVE_PATHS if not self._path_blockers(k, wallet or {})]
             if not ready:
                 best = max(LIVE_PATHS, key=lambda k: self._live_streak.get(k, 0))
-                reasons = self._path_blockers(best, wallet or {}) + reasons
+                reasons = reasons + self._path_blockers(best, wallet or {})
             s.set_live("blocked" if reasons else "armed", reasons)
 
     async def _poll(self, now: float):

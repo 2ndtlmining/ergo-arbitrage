@@ -20,6 +20,21 @@ custom_theme = Theme({
 console = Console(theme=custom_theme)
 
 
+class SafeTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """Midnight rotation that keeps logging when the rename fails (file held by another process or
+    OneDrive on Windows): the current file is kept and the next attempt is scheduled for the next
+    midnight, instead of retrying (and failing) on every record."""
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            import time
+            self.rolloverAt = self.computeRollover(int(time.time()))
+            if self.stream is None or self.stream.closed:
+                self.stream = self._open()
+
+
 class EventLogHandler(logging.Handler):
     """WARNING+ log records as dashboard events (the dashboard replaces the console log)."""
 
@@ -44,7 +59,7 @@ def setup_logging(log_level: str = "INFO", console_handler: bool = True,
         h.close()
     root_logger.setLevel(logging.DEBUG)
 
-    file_handler = logging.handlers.TimedRotatingFileHandler(log_path, when="midnight", backupCount=14,
+    file_handler = SafeTimedRotatingFileHandler(log_path, when="midnight", backupCount=14,
                                                              encoding="utf-8")
     file_handler.setLevel(getattr(logging, log_level.upper()))
     file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"))

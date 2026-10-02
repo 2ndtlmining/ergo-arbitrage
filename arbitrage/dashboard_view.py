@@ -18,6 +18,7 @@ STATUS_STYLE = {"GO": "bold green", "no edge": "dim", "BLOCKED": "red", "stale":
 LIVE_STYLE = {"armed": "bold green", "blocked": "yellow", "paused": "bold red", "off": "dim"}
 EVENT_STYLE = {"good": "green", "warn": "yellow", "error": "bold red", "trade": "bold cyan", "info": ""}
 EVENTS_SHOWN = 10
+LIVE_REASONS_SHOWN = 5
 
 
 def sparkline(values) -> str:
@@ -80,11 +81,14 @@ def prices_panel(s: DashboardState) -> Panel:
 def live_panel(s: DashboardState) -> Panel:
     if not s.live:
         return Panel(Text("waiting for the first scan…", style="dim"), title="Live")
-    lines = Text(s.live, style=LIVE_STYLE.get(s.live, ""))
+    lines = Text(s.live, style=LIVE_STYLE.get(s.live, ""), no_wrap=True, overflow="ellipsis")  # one line per reason
     lines.append(f"   trades today {s.trades_today}/{config.LIVE_MAX_TRADES_PER_DAY}  "
                  f"drawdown {s.drawdown:.2f}/{config.LIVE_MAX_DRAWDOWN_ERG:g} ERG", style="dim")
-    for d in s.live_detail[:3]:
+    shown = s.live_detail[:LIVE_REASONS_SHOWN]
+    for d in shown:
         lines.append(f"\n  {d}", style="dim")
+    if len(s.live_detail) > len(shown):
+        lines.append(f"\n  +{len(s.live_detail) - len(shown)} more", style="dim")
     return Panel(lines, title="Live")
 
 
@@ -166,7 +170,7 @@ def render(s: DashboardState) -> Layout:
                                                if r.choice and r.choice.ok), default=0)
     layout.split_column(
         Layout(header(s), size=1),
-        Layout(name="top", size=7),
+        Layout(name="top", size=max(7, 6 + min(len(s.live_detail), LIVE_REASONS_SHOWN + 1))),
         Layout(paths_panel(s), size=paths_rows),
         Layout(events_panel(s), minimum_size=4),
         Layout(venues_panel(s), size=len(s.venues) + 3 if s.venues else 3),
