@@ -1078,7 +1078,7 @@ class ArbitrageScanner:
             ep.db_id = self.tracker.open_chain_episode(ep)
             tier1 = ep.profit_percent >= config.DISCORD_TIER1_PROFIT_PERCENT
             self.discord.post(self._episode_embed(ep, "open"), content=self.discord._ping() if tier1 else "",
-                              on_id=lambda mid, ep=ep: setattr(ep, "message_id", mid))
+                              on_id=lambda mid, ep=ep: self._episode_posted(ep, mid))
             self.state.add_event("info", f"Discord: opened {ep.label} {ep.profit_percent:+.2f}%")
         elif event.kind == "update":
             self.tracker.update_chain_episode(ep.db_id, ep)
@@ -1087,6 +1087,23 @@ class ArbitrageScanner:
             self.tracker.close_chain_episode(ep.db_id, ep)
             self.discord.edit(lambda ep=ep: ep.message_id, self._episode_embed(ep, "closed"))
             self.state.add_event("info", f"Discord: closed {ep.label} (peak {ep.peak_percent:+.2f}%)")
+
+    def _episode_posted(self, ep, message_id: str):
+        ep.message_id = message_id
+        self.tracker.set_chain_episode_message(ep.db_id, message_id)  # so a restart can close it
+
+    def _close_stale_discord_messages(self):
+        """Grey out the Discord messages of episodes a previous run left open (crash, closed window)."""
+        for row in getattr(self.tracker, "stale_chain_episodes", []):
+            if row.get("message_id"):
+                self.discord.edit(lambda mid=row["message_id"]: mid, embeds.stale_episode_embed(row))
+
+    def _close_episodes_on_shutdown(self):
+        try:
+            for event in self.episodes.close_all(self._now, "bot stopped"):
+                self._handle_episode(event)
+        except Exception as e:  # shutdown must still send the summary and close connections
+            logger.error(f"Closing Discord episodes failed: {e}", exc_info=True)
 
     def _discord_tick(self, now: float):
         """Episodes and health alerts from the freshly refreshed state. Never awaits Discord."""
@@ -2020,6 +2037,7 @@ class ArbitrageScanner:
 
         if self.discord_enabled:
             await self.discord.send_startup_message(mode=self.mode)
+            self._close_stale_discord_messages()
 
         try:
             loop = asyncio.get_running_loop()
@@ -2042,8 +2060,7 @@ class ArbitrageScanner:
             if self.view == "plain":
                 self.tracker.print_summary()
             if self.discord_enabled:
-                for event in self.episodes.close_all(self._now, "bot stopped"):
-                    self._handle_episode(event)
+                self._close_episodes_on_shutdown()
             if self.discord_enabled:
                 await self.discord.send_summary_message(self.tracker.get_session_stats())
             await self.disconnect_all()

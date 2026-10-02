@@ -153,3 +153,36 @@ def test_digest_error_does_not_block_trading(notify, monkeypatch):
     monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
     run(notify.poll_once(0))
     assert traded
+
+
+def test_shutdown_survives_a_failing_episode_close(notify, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    for t in (0, 2, 4):
+        run(notify.poll_once(t))
+    assert notify.episodes.open
+
+    def locked(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(notify.tracker, "close_chain_episode", locked)
+    notify._close_episodes_on_shutdown()  # must not raise
+
+
+def test_message_id_is_saved_with_the_episode(notify, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    for t in (0, 2, 4):
+        run(notify.poll_once(t))
+    (row,) = notify.tracker.conn.execute("SELECT message_id FROM chain_episodes").fetchall()
+    opened = next(i for i, (e, _) in enumerate(notify.posts) if e["title"].startswith("OPEN"))
+    assert row["message_id"] == f"m{opened + 1}"
+
+
+def test_restart_closes_the_stale_discord_message(notify):
+    notify.tracker.stale_chain_episodes = [
+        {"path": "pool→redeem", "message_id": "m9", "peak_profit_percent": 3.5, "peak_profit_erg": 1.5,
+         "opened_at": "2026-10-03T08:00:00", "closed_at": "2026-10-03T08:06:40"},
+        {"path": "pool→redeem", "message_id": None, "peak_profit_percent": 1.0, "peak_profit_erg": 0.6,
+         "opened_at": "2026-10-03T07:00:00", "closed_at": "2026-10-03T07:00:00"},
+    ]
+    notify._close_stale_discord_messages()
+    assert [(mid, e["title"].split(" · ")[0]) for mid, e in notify.edits] == [("m9", "Closed")]

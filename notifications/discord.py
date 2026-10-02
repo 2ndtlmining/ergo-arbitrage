@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime
 from typing import Optional
 
@@ -134,10 +135,20 @@ class DiscordNotifier:
         self._start_worker()
 
     def _start_worker(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop yet: the job waits in the queue for the next post or stop()
         if self._worker is None or self._worker.done():
             self._wake = asyncio.Event()
-            self._worker = asyncio.get_running_loop().create_task(self._run_worker())
+            self._worker = loop.create_task(self._run_worker())
         self._wake.set()
+
+    def _url(self, path: str = "", query: str = "") -> str:
+        """The webhook URL plus a path and query, keeping any query it already has (?thread_id=...)."""
+        u = urlsplit(self.webhook_url)
+        q = "&".join(x for x in (u.query, query) if x)
+        return urlunsplit((u.scheme, u.netloc, u.path + path, q, u.fragment))
 
     async def _run_worker(self):
         while True:
@@ -159,7 +170,7 @@ class DiscordNotifier:
             await self._send(job[1])
         elif job[0] == "post":
             _, embed, content, on_id = job
-            status, body = await self._request("POST", f"{self.webhook_url}?wait=true",
+            status, body = await self._request("POST", self._url(query="wait=true"),
                                                {"content": content, "embeds": [embed]})
             if status == 200 and body and body.get("id") and on_id:
                 on_id(str(body["id"]))
@@ -169,7 +180,7 @@ class DiscordNotifier:
             if not message_id:
                 logger.warning("Discord edit dropped: the original message was not posted")
                 return
-            await self._request("PATCH", f"{self.webhook_url}/messages/{message_id}", {"embeds": [embed]})
+            await self._request("PATCH", self._url(f"/messages/{message_id}"), {"embeds": [embed]})
 
     async def _request(self, method: str, url: str, payload: dict) -> tuple[int, Optional[dict]]:
         """One HTTP call to the webhook; on 429 waits retry_after (<= 30 s) and retries once."""
@@ -188,7 +199,10 @@ class DiscordNotifier:
                     reset = min(float(headers.get("X-RateLimit-Reset-After") or 1), RETRY_CAP_S)
                     self._bucket_until = loop.time() + reset
                 if status == 429 and attempt == 0:
-                    data = await r.json(content_type=None) or {}
+                    try:
+                        data = await r.json(content_type=None) or {}
+                    except Exception:  # e.g. a Cloudflare HTML page: fall back to the header
+                        data = {}
                     retry = data.get("retry_after") or headers.get("Retry-After") or 5
                     await self._sleep(min(float(retry), RETRY_CAP_S))
                     continue

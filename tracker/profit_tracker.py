@@ -11,7 +11,7 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.tracker")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ProfitTracker:
@@ -28,8 +28,14 @@ class ProfitTracker:
         self._open_episodes: dict[str, int] = {}  # path_key -> episode id
         self._session_episode_best: dict[int, float] = {}  # episode id -> best profit
         self._close_stale_episodes()
-        self.conn.execute("UPDATE chain_episodes SET closed_at = opened_at WHERE closed_at IS NULL")
+        # Episodes a stopped process left open: kept so the scanner can close their Discord message
+        self.stale_chain_episodes = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM chain_episodes WHERE closed_at IS NULL").fetchall()]
+        self.conn.execute("UPDATE chain_episodes SET closed_at = COALESCE(last_seen_at, opened_at) "
+                          "WHERE closed_at IS NULL")
         self.conn.commit()
+        for row in self.stale_chain_episodes:
+            row["closed_at"] = row.get("last_seen_at") or row["opened_at"]
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -170,6 +176,12 @@ class ProfitTracker:
                 CREATE INDEX IF NOT EXISTS ix_chain_episodes_opened ON chain_episodes(opened_at);
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """)
+        if version < 3:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(chain_episodes)")}
+            if "message_id" not in cols:
+                self.conn.execute("ALTER TABLE chain_episodes ADD COLUMN message_id TEXT")
+            if "last_seen_at" not in cols:
+                self.conn.execute("ALTER TABLE chain_episodes ADD COLUMN last_seen_at TEXT")
         if version < SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.commit()
@@ -657,8 +669,13 @@ class ProfitTracker:
     def update_chain_episode(self, episode_id: int, ep):
         self.conn.execute(
             """UPDATE chain_episodes SET peak_profit_erg = ?, peak_profit_percent = ?, peak_size_erg = ?,
-               last_profit_percent = ? WHERE id = ?""",
-            (ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent, episode_id))
+               last_profit_percent = ?, last_seen_at = ? WHERE id = ?""",
+            (ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent, datetime.now().isoformat(),
+             episode_id))
+        self.conn.commit()
+
+    def set_chain_episode_message(self, episode_id: int, message_id: str):
+        self.conn.execute("UPDATE chain_episodes SET message_id = ? WHERE id = ?", (message_id, episode_id))
         self.conn.commit()
 
     def close_chain_episode(self, episode_id: int, ep):

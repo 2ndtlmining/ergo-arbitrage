@@ -90,3 +90,24 @@ def test_digest_due_once_per_day_and_survives_restart(tmp_path):
         assert not digest_due(t2, nine + timedelta(days=1), -1)
     finally:
         t2.close()
+
+
+def test_digest_without_a_health_monitor(tracker):
+    d = build_digest(tracker, None, None, datetime.now())
+    assert d.outages == [] and d.outage_since == ""
+
+
+def test_restart_keeps_the_message_id_and_last_seen_time(tmp_path):
+    t = ProfitTracker(str(tmp_path / "s.db"))
+    i = t.open_chain_episode(ep())
+    t.set_chain_episode_message(i, "m42")
+    t.update_chain_episode(i, ep(peak_erg=2.0, peak_pct=4.0))
+    t.close()
+    t2 = ProfitTracker(str(tmp_path / "s.db"))
+    try:
+        (stale,) = t2.stale_chain_episodes
+        assert stale["message_id"] == "m42" and stale["peak_profit_percent"] == 4.0
+        (row,) = t2.chain_episodes_since("2000-01-01")
+        assert row["closed_at"] == row["last_seen_at"] and row["closed_at"] > row["opened_at"]
+    finally:
+        t2.close()

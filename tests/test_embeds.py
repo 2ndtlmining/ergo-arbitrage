@@ -90,3 +90,17 @@ def test_startup_and_shutdown():
     assert "LIVE" in embeds.startup_embed("live")["title"]
     s = embeds.shutdown_embed({"session_duration": "1:02:03", "opportunities_seen": 4})
     assert "1:02:03" in values(s)
+
+
+def test_wallet_embed_survives_none_values():
+    analysis = {"erg": {"balance": None, "options": [{"name": "x", "profit_pct": None}]}}
+    e = embeds.wallet_embed({"erg": None, "sigusd": None, "use": None}, analysis)
+    assert e["title"] == "Wallet" and "0.0000 ERG" in values(e)
+
+
+def test_stale_episode_embed_after_a_restart():
+    row = {"path": "pool→redeem", "peak_profit_percent": 3.5, "peak_profit_erg": 1.5,
+           "opened_at": "2026-10-03T08:00:00", "closed_at": "2026-10-03T08:06:40"}
+    e = embeds.stale_episode_embed(row)
+    assert e["color"] == embeds.GREY and e["title"].startswith("Closed · pool→redeem")
+    assert "bot restarted" in values(e) and "+3.50%" in values(e) and "6m 40s" in values(e)
