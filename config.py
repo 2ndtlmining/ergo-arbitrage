@@ -154,6 +154,9 @@ DISCORD_HEALTH_VENUE_SECONDS = float(os.getenv("DISCORD_HEALTH_VENUE_SECONDS", "
 DISCORD_HEALTH_ORACLE_SECONDS = float(os.getenv("DISCORD_HEALTH_ORACLE_SECONDS", "600"))
 DISCORD_HEALTH_REPEAT_SECONDS = float(os.getenv("DISCORD_HEALTH_REPEAT_SECONDS", "1800"))
 DISCORD_DIGEST_HOUR = int(os.getenv("DISCORD_DIGEST_HOUR", "8"))              # local hour, -1 = off
+MINT_GATE_CONFIRM_POLLS = int(os.getenv("MINT_GATE_CONFIRM_POLLS", "3"))       # agreeing polls before an alert
+MINT_GATE_MIN_ROOM_ERG = float(os.getenv("MINT_GATE_MIN_ROOM_ERG", str(MIN_TRADE_SIZE_ERG)))  # smaller = closed
+MINT_GATE_PING_COOLDOWN_SECONDS = float(os.getenv("MINT_GATE_PING_COOLDOWN_SECONDS", "3600"))
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
 # --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
