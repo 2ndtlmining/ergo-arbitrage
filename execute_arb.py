@@ -21,17 +21,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo.arb_runner import run_pool_buy_redeem
+from ergo.arb_runner import PATHS, run_arb
 
 
-async def main(erg: float, check: bool, execute: bool, force: bool):
+async def main(erg: float, check: bool, execute: bool, force: bool, path: str):
     mode = "EXECUTE" if execute else ("CHECK (no broadcast)" if check else "dry run")
     print("=" * 64)
-    print(f"Pool buy -> bank redeem with {erg} ERG  [{mode}]")
+    print(f"{PATHS[path][0]} with {erg} ERG  [{mode}]")
     print("=" * 64)
     headers = {"api_key": config.ERGO_NODE_API_KEY, "Content-Type": "application/json"}
     async with aiohttp.ClientSession(headers=headers) as ns:
-        await run_pool_buy_redeem(ns, int(round(erg * 1e9)), check=check, execute=execute, force=force)
+        await run_arb(ns, path, int(round(erg * 1e9)), check=check, execute=execute, force=force)
 
 
 if __name__ == "__main__":
@@ -40,6 +40,8 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true", help="Sign leg 1 and validate on the node, no broadcast")
     parser.add_argument("--execute", action="store_true", help="Submit both legs (only if profitable)")
     parser.add_argument("--force", action="store_true", help="Execute even below MIN_PROFIT_PERCENT (testing)")
+    parser.add_argument("--path", choices=["redeem", "mint"], default="redeem",
+                        help="redeem: pool buy -> bank redeem; mint: bank mint -> pool sell")
     args = parser.parse_args()
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    asyncio.run(main(args.erg, args.check, args.execute, args.force))
+    asyncio.run(main(args.erg, args.check, args.execute, args.force, args.path))

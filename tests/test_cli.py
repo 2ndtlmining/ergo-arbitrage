@@ -66,3 +66,11 @@ class TestBalance:
         assert "pending" in text.lower() and "-1.0000 ERG" in text  # unconfirmed change shown
         assert "SigUSD on the pool: $1.03" in text
         assert "RR 330%" in text and "mint blocked" in text
+
+
+def test_arb_path_option():
+    p = build_parser()
+    assert p.parse_args(["arb", "--erg", "10"]).path == "redeem"
+    assert p.parse_args(["arb", "--erg", "10", "--path", "mint", "--check"]).path == "mint"
+    with pytest.raises(SystemExit):
+        p.parse_args(["arb", "--erg", "10", "--path", "sideways"])

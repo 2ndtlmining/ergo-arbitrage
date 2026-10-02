@@ -7,7 +7,13 @@ import aiohttp
 
 import config
 from ergo.chain import find_box_id, node_box, wait_for_box, wallet_context
-from ergo.chain_arb import build_redeem_leg, plan_pool_buy_redeem, tx_output_box
+from ergo.chain_arb import (
+    build_pool_sell_leg,
+    build_redeem_leg,
+    plan_bank_mint_pool_sell,
+    plan_pool_buy_redeem,
+    tx_output_box,
+)
 from ergo.signing import DryRun, check_on_node, guarded_sign, wallet_trees
 from ergo.tx_guard import TxGuardError, verify_unsigned_tx
 
@@ -25,10 +31,14 @@ class ArbResult:
     profit_percent: float = 0.0
     tx1: Optional[str] = None
     tx2: Optional[str] = None
+    path: str = "redeem"
 
     @property
     def recover_command(self) -> str:
-        return f"python execute_bank_redeem.py --sigusd {self.sigusd_cents / 100:.2f} --execute"
+        amount = f"{self.sigusd_cents / 100:.2f}"
+        if self.path == "mint":
+            return f"python arb.py swap --sell sigusd --amount {amount} --execute"
+        return f"python arb.py redeem --sigusd {amount} --execute"
 
 
 async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interval: float,
@@ -96,37 +106,63 @@ async def _submit(ns, signed: dict) -> str:
     return signed.get("id", "?")
 
 
-async def run_pool_buy_redeem(ns, erg_in: int, *, check: bool = False, execute: bool = False,
-                              force: bool = False, wait_leg2: bool = True,
-                              log: Callable[[str], None] = print) -> ArbResult:
-    """Plan, verify and (optionally) execute leg 1 (pool buy) then leg 2 (bank redeem)."""
+def _describe_redeem(plan: dict, erg_in: int, log) -> None:
+    i1, i2, cents = plan["leg1_info"], plan["leg2_info"], plan["sigusd_cents"]
+    log(f"  Leg 1  pool swap:   {erg_in / 1e9:.4f} ERG -> {cents / 100:.2f} SigUSD "
+        f"(impact {i1['price_impact_percent']:.2f}%, miner {i1['miner_fee'] / 1e9:.4f})")
+    log(f"  Leg 2  bank redeem: {cents / 100:.2f} SigUSD -> {i2['user_receives'] / 1e9:.6f} ERG "
+        f"(2% + UI fee {i2['ui_fee'] / 1e9:.4f}, miner {i2['miner_fee'] / 1e9:.4f})")
+
+
+def _describe_mint(plan: dict, erg_in: int, log) -> None:
+    i1, i2, cents = plan["leg1_info"], plan["leg2_info"], plan["sigusd_cents"]
+    log(f"  Leg 1  bank mint:   {i1['cost_nanoerg'] / 1e9:.6f} ERG -> {cents / 100:.2f} SigUSD "
+        f"(2% + UI fee {i1['ui_fee'] / 1e9:.4f}, miner {i1['miner_fee'] / 1e9:.4f}; RR after >= 400%)")
+    log(f"  Leg 2  pool sell:   {cents / 100:.2f} SigUSD -> {i2['amount_out'] / 1e9:.6f} ERG "
+        f"(impact {i2['price_impact_percent']:.2f}%, miner {i2['miner_fee'] / 1e9:.4f})")
+
+
+PATHS = {
+    "redeem": ("pool buy -> bank redeem", plan_pool_buy_redeem, _describe_redeem),
+    "mint": ("bank mint -> pool sell", plan_bank_mint_pool_sell, _describe_mint),
+}
+
+
+async def run_arb(ns, path: str, erg_in: int, *, check: bool = False, execute: bool = False,
+                  force: bool = False, wait_leg2: bool = True,
+                  log: Callable[[str], None] = print) -> ArbResult:
+    """Plan, verify and (optionally) execute one two-leg arbitrage.
+
+    path "redeem": leg 1 pool buy (ERG -> SigUSD), leg 2 bank redeem.
+    path "mint":   leg 1 bank mint (ERG -> SigUSD), leg 2 pool sell. `erg_in` is the mint budget.
+    """
+    _, planner, describe = PATHS[path]
     node = config.ERGO_NODE_URL
     try:
         pool_box, bank_box, oracle_box = await _fetch_boxes(
             ns, (config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
         wallet_boxes, height, our_tree = await wallet_context(ns)
         trees = await wallet_trees(ns, node)
-        plan = plan_pool_buy_redeem(pool_box, bank_box, oracle_box, wallet_boxes, erg_in,
-                                    height=height, our_tree=our_tree, ui_fee_tree=UI_FEE_TREE)
+        plan = planner(pool_box, bank_box, oracle_box, wallet_boxes, erg_in,
+                       height=height, our_tree=our_tree, ui_fee_tree=UI_FEE_TREE)
     except (RuntimeError, ValueError, TxGuardError) as e:
         log(f"ABORTED: {e}")
-        return ArbResult("aborted", str(e), erg_in)
+        return ArbResult("aborted", str(e), erg_in, path=path)
 
-    i1, i2 = plan["leg1_info"], plan["leg2_info"]
+    erg_in = plan.get("erg_in", erg_in)
     cents = plan["sigusd_cents"]
-    result = ArbResult("planned", erg_in=erg_in, sigusd_cents=cents,
+    result = ArbResult("planned", erg_in=erg_in, sigusd_cents=cents, path=path,
                        profit_nanoerg=plan["profit_nanoerg"], profit_percent=plan["profit_percent"])
-    log(f"  Leg 1  pool swap:   {erg_in / 1e9:.4f} ERG -> {cents / 100:.2f} SigUSD "
-        f"(impact {i1['price_impact_percent']:.2f}%, miner {i1['miner_fee'] / 1e9:.4f})")
-    log(f"  Leg 2  bank redeem: {cents / 100:.2f} SigUSD -> {i2['user_receives'] / 1e9:.6f} ERG "
-        f"(2% + UI fee {i2['ui_fee'] / 1e9:.4f}, miner {i2['miner_fee'] / 1e9:.4f})")
+    describe(plan, erg_in, log)
     profitable = plan["profit_percent"] >= config.MIN_PROFIT_PERCENT
     log(f"  Net:   {plan['profit_nanoerg'] / 1e9:+.6f} ERG ({plan['profit_percent']:+.2f}%)  -> "
         f"{'PROFITABLE' if profitable else 'NOT profitable'} (MIN_PROFIT_PERCENT={config.MIN_PROFIT_PERCENT}%)")
     log("")
 
+    leg2_contract_box = bank_box if path == "redeem" else pool_box
     try:
-        verify_unsigned_tx(plan["leg2_tx"], [bank_box, plan["leg1_output_box"]], trees, plan["leg2_policy"])
+        verify_unsigned_tx(plan["leg2_tx"], [leg2_contract_box, plan["leg1_output_box"]], trees,
+                           plan["leg2_policy"])
         log("  Leg 2 TX guard OK (against leg 1's planned output)")
     except TxGuardError as e:
         log(f"  REFUSED: leg 2 fails the TX guard: {e}")
@@ -167,21 +203,27 @@ async def run_pool_buy_redeem(ns, erg_in: int, *, check: bool = False, execute: 
         return result
     log(f"  Leg 1 submitted: https://explorer.ergoplatform.com/en/transactions/{result.tx1}")
 
-    leg1_out = tx_output_box(signed1, 1)
-    last_info = {}
+    leg1_out = tx_output_box(signed1, plan["leg1_output_index"])
+    last = {}
 
     async def build_and_submit_leg2() -> str:
-        bank, oracle = await _fetch_boxes(ns, (config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
-        tx2_unsigned, info2, policy2 = build_redeem_leg(bank, oracle, leg1_out, cents, height,
-                                                        our_tree, UI_FEE_TREE)
-        signed2 = await guarded_sign(ns, node, tx2_unsigned, policy2, execute=True)
+        if path == "redeem":
+            bank, oracle = await _fetch_boxes(ns, (config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
+            tx2, info2, policy2 = build_redeem_leg(bank, oracle, leg1_out, cents, height, our_tree, UI_FEE_TREE)
+            erg_back = info2["user_receives"]
+        else:
+            (pool,) = await _fetch_boxes(ns, (config.SPECTRUM_SIGUSD_POOL_NFT,))
+            tx2, info2, policy2 = build_pool_sell_leg(pool, leg1_out, cents, height, our_tree)
+            erg_back = info2["amount_out"]
+        signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True)
         tx_id = await _submit(ns, signed2)
-        last_info.update(info2)
+        last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])
         return tx_id
 
     def fail(message: str) -> ArbResult:
         log(f"  Leg 2 FAILED: {message}")
-        log(f"  You now hold {cents / 100:.2f} SigUSD from leg 1. Finish with:\n    {result.recover_command}")
+        log(f"  You now hold {cents / 100:.2f} SigUSD from leg 1. Finish with:")
+        log(f"    {result.recover_command}")
         result.status, result.message = "leg2_failed", message
         return result
 
@@ -206,7 +248,12 @@ async def run_pool_buy_redeem(ns, erg_in: int, *, check: bool = False, execute: 
         log(f"  Leg 2 CONFIRMED: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
         result.status = "executed"
 
-    result.profit_nanoerg = last_info["user_receives"] - last_info["miner_fee"] - erg_in - i1["miner_fee"]
+    leg1_miner = plan["leg1_info"]["miner_fee"] if path == "redeem" else 0  # mint cost already includes it
+    result.profit_nanoerg = last["erg_back"] - last["miner_fee"] - erg_in - leg1_miner
     result.profit_percent = result.profit_nanoerg / erg_in * 100
     log(f"  Expected net: {result.profit_nanoerg / 1e9:+.6f} ERG")
     return result
+
+
+async def run_pool_buy_redeem(ns, erg_in: int, **kw) -> ArbResult:
+    return await run_arb(ns, "redeem", erg_in, **kw)

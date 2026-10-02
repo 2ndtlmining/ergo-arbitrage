@@ -270,8 +270,10 @@ python arb.py arb    --erg 10 --check                   # two-leg pool buy -> ba
 
 ### Live mode (`python main.py --live`)
 
-Live mode executes **pool buy -> bank redeem** (the same code as `execute_arb.py --execute`)
-at the best size found by the optimizer, only when every check passes:
+Live mode executes whichever of **pool buy -> bank redeem** and **bank mint -> pool sell**
+(the same code as `arb.py arb --path redeem|mint --execute`) passes every check with the higher
+profit, at the best size found by the optimizer. Bank mint is only possible while the reserve
+ratio stays >= 400% after minting:
 
 | Check | Setting (default) |
 |---|---|

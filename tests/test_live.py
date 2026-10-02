@@ -21,14 +21,14 @@ def live(tmp_path, monkeypatch):
     s = ArbitrageScanner(mode="live", db_path=str(tmp_path / "t.db"))
     calls = []
 
-    async def fake_run(ns, erg_in, **kw):
-        calls.append((erg_in, kw))
+    async def fake_run(ns, path, erg_in, **kw):
+        calls.append((erg_in, dict(kw, path=path)))
         return s._next_result
 
     async def healthy():
         return dict(HEALTHY)
 
-    monkeypatch.setattr(scanner_module, "run_pool_buy_redeem", fake_run)
+    monkeypatch.setattr(scanner_module, "run_arb", fake_run)
     monkeypatch.setattr(s.ergo_node, "get_health", healthy)
     s._next_result = ArbResult("executed", erg_in=1, sigusd_cents=100, profit_nanoerg=10**8,
                                profit_percent=1.0, tx1="t1", tx2="t2")
@@ -69,7 +69,7 @@ def test_not_in_monitor_mode(tmp_path, monkeypatch):
     async def fake_run(*a, **k):
         called.append(1)
 
-    monkeypatch.setattr(scanner_module, "run_pool_buy_redeem", fake_run)
+    monkeypatch.setattr(scanner_module, "run_arb", fake_run)
     run(s._execute_trades(WALLET, discount_prices()))
     assert called == []
     s.tracker.close()
@@ -135,7 +135,7 @@ def test_leg2_failure_pauses_and_alerts(live, monkeypatch):
     live._next_result = ArbResult("leg2_failed", "oracle moved", erg_in=10**10, sigusd_cents=310, tx1="t1")
     run(live._execute_trades(WALLET, live._prices))
     assert live._live_paused
-    assert sent and "execute_bank_redeem.py --sigusd 3.10" in sent[-1]
+    assert sent and "arb.py redeem --sigusd 3.10" in sent[-1]
     row = live.tracker.conn.execute("SELECT status FROM trades").fetchone()
     assert row["status"] == "failed"
     run(live._execute_trades(WALLET, live._prices))
@@ -147,3 +147,42 @@ def test_drawdown_limit(live, monkeypatch):
     run(live._live_blockers({"erg": 50.0, "sigusd": 0, "use": 0}, live._prices))  # sets the baseline
     blockers = run(live._live_blockers({"erg": 44.0, "sigusd": 0, "use": 0}, live._prices))
     assert any("drawdown" in b for b in blockers)
+
+
+def test_redeem_path_passed_to_runner(live):
+    run(live._execute_trades(WALLET, live._prices))
+    assert live.calls[0][1]["path"] == "redeem"
+
+
+def test_mint_path_executed_when_it_is_the_profitable_one(tmp_path, monkeypatch):
+    """SigUSD at a premium on the pool and RR far above 400%: mint -> pool sell is the trade."""
+    from exchanges.base import PoolState
+    from exchanges.sigmausd import BankState
+    from tests.test_scanner_paths import ORACLE_R4, make_prices
+    monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
+    monkeypatch.setattr(config, "LIVE_STOP_FILE", str(tmp_path / "STOP"))
+    s = ArbitrageScanner(mode="live", db_path=str(tmp_path / "t.db"))
+    calls = []
+
+    async def fake_run(ns, path, erg_in, **kw):
+        calls.append(path)
+        return ArbResult("executed", erg_in=erg_in, sigusd_cents=100, profit_nanoerg=10**8, profit_percent=1.0,
+                         tx1="m1", tx2="m2", path=path)
+
+    async def healthy():
+        return dict(HEALTHY)
+
+    monkeypatch.setattr(scanner_module, "run_arb", fake_run)
+    monkeypatch.setattr(s.ergo_node, "get_health", healthy)
+    state = BankState(bank_erg_nano=5_000_000 * 10**9, sigusd_circ_cents=16_000_000, oracle_r4=ORACLE_R4)  # RR ~1000%
+    spot = 0.30  # SigUSD ~7.5% above $1 on the pool
+    pool = PoolState(exchange="t", pool_id="p", token_x="ERG", token_y="SigUSD",
+                     reserve_x=20_000, reserve_y=20_000 * spot, fee_num=995, fee_denom=1000)
+    prices = make_prices(state, spot)
+    prices["spectrum_pool"] = pool
+    s._find_opportunities(prices)
+    for _ in range(config.LIVE_CONFIRM_SCANS):
+        s._update_live_streak()
+    run(s._execute_trades(WALLET, prices))
+    assert calls == ["mint"]
+    s.tracker.close()
