@@ -13,3 +13,6 @@ venv/
 .idea/
 .vscode/
 .claude/
+*.db-shm
+*.db-wal
+*.db-journal
