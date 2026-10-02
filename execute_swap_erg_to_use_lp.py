@@ -13,6 +13,7 @@ load_dotenv()
 import config
 from ergo.signing import DryRun, execute_requested, guarded_sign
 from ergo.tx_guard import SignPolicy
+from exchanges.crux import parse_quote
 
 FEE_BUDGET = int(config.MAX_FEE_BUDGET_ERG * 1e9)  # service + miner fees allowed per TX
 
@@ -138,10 +139,11 @@ async def main():
     async with aiohttp.ClientSession() as s:
         quote = await get_quote(s, SWAP_RAW)
 
-    use_output_raw = quote.get("requested_amount", 0)
+    parsed = parse_quote(quote)
+    use_output_raw = parsed.output
     use_output = use_output_raw / 1000  # 3 decimals
-    price_impact = quote.get("price_impact", 0)
-    lp_fee = quote.get("lp_fee_percent", 0)
+    price_impact = parsed.price_impact
+    lp_fee = parsed.lp_fee_percent
     pool_id = quote.get("details", {}).get("amm", {}).get("pool_id", "?")
 
     print(f"  Selling:       {SWAP_ERG:.4f} ERG")
@@ -168,8 +170,8 @@ async def main():
 
     # Crux /dex/swap returns {unsigned_tx, pool_id, expected_output, price_impact, fee_amount, fee_token}
     unsigned_tx = result.get("unsigned_tx", result)
-    expected_output = result.get("expected_output", 0)
-    swap_fee = result.get("fee_amount", 0)
+    expected_output = (result.get("expected_output") or 0)
+    swap_fee = (result.get("fee_amount") or 0)
     print(f"  Expected output: {expected_output / 1000:.3f} USE")
     print(f"  Service fee:     {swap_fee / 1e9:.6f} ERG")
 
