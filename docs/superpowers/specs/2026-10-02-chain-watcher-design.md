@@ -151,9 +151,10 @@ with "chain state stale/unavailable".
 - **Node index missing:** explorer fallback for box ids only (boxes are still read
   from the node). This is slower but correct.
 - **A pending box that disappears** (its tx was dropped): the next poll returns the
-  confirmed box, the key changes, and the streak restarts naturally because sizing
-  changes. A trade already built on it fails at the node (nothing spent) or is
-  rebuilt by the leg-2 watcher.
+  confirmed box and the key changes. Sizing is re-run on it; the streak continues only if
+  that state is still profitable, and the runner re-sizes on fresh boxes anyway. A trade
+  already built on the dropped box fails at the node (nothing spent), or is reported as
+  `leg1_dropped` (nothing spent) when leg 2 fails because leg 1 vanished with it.
 
 ## Testing
 
