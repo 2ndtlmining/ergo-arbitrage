@@ -5,8 +5,9 @@ API is compromised, buggy or MITM'd it could build a TX that sends wallet
 funds elsewhere, and the node would sign it. The guard only accepts a TX when:
 
 - the input boxes (resolved by the caller from our own node) match the TX;
-- every non-wallet input is a singleton contract box (pool, bank, ...) that
-  the TX recreates under the same ErgoTree with its NFT;
+- every non-wallet input is a known contract box (pool, bank, ... identified by
+  its NFT, see KNOWN_CONTRACT_NFTS) that the TX recreates under the same
+  ErgoTree with that NFT, and never someone else's wallet (P2PK) box;
 - every other output goes to our wallet, the miner fee contract, or a
   whitelisted service-fee address, within fee caps;
 - the wallet's net ERG/token flows stay inside the policy: ERG spent under
@@ -14,6 +15,7 @@ funds elsewhere, and the node would sign it. The guard only accepts a TX when:
   wallet token lost unless explicitly allowed.
 """
 from dataclasses import dataclass, field
+from typing import Optional
 
 import config
 
@@ -22,6 +24,14 @@ MINER_FEE_TREE = (
     "ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a573010074730273"
     "03830108cdeeac93b1a57304"
 )
+
+
+# Singleton contracts a transaction may spend and recreate. Any other foreign input is refused, so the
+# policy slack cannot be routed into a box that only looks like a contract (an amount-1 token on a
+# script that needs no signature).
+KNOWN_CONTRACT_NFTS = frozenset({config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT,
+                                 config.DEXY_USE_LP_NFT})
+P2PK_PREFIX = "0008cd"
 
 
 class TxGuardError(Exception):
@@ -39,6 +49,9 @@ class SignPolicy:
     service_fee_trees: frozenset = field(default_factory=lambda: frozenset(config.SERVICE_FEE_ERGO_TREES))
     # Explicit recipients for a send: ErgoTree -> {"ERG": max nanoERG, token id: max raw amount}
     payees: dict = field(default_factory=dict)
+    # NFTs a foreign input may carry; None accepts any singleton token (only for third-party contracts
+    # whose NFTs this bot does not know, e.g. Crux's Dexy mint boxes).
+    contract_nfts: Optional[frozenset] = field(default_factory=lambda: KNOWN_CONTRACT_NFTS)
 
 
 @dataclass
@@ -85,9 +98,15 @@ def verify_unsigned_tx(tx: dict, input_boxes: list[dict], wallet_trees: set[str]
             for t, a in _tokens(box).items():
                 wallet_in_tok[t] = wallet_in_tok.get(t, 0) + a
             continue
+        if box["ergoTree"].startswith(P2PK_PREFIX):
+            raise TxGuardError(f"foreign input {box['boxId'][:12]} is someone else's wallet box")
         singletons = [t for t, a in _tokens(box).items() if a == 1]
         if not singletons:
             raise TxGuardError(f"foreign input {box['boxId'][:12]} is not an NFT-identified contract box")
+        if policy.contract_nfts is not None:
+            singletons = [t for t in singletons if t in policy.contract_nfts]
+            if not singletons:
+                raise TxGuardError(f"foreign input {box['boxId'][:12]} is not a known contract box")
         match = next(
             (i for i, o in enumerate(outputs)
              if i not in contract_outputs

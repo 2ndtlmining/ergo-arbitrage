@@ -109,6 +109,34 @@ async def _leg2_status(ns, tx_id: str, leg1_box_id: str, explorer=None) -> str:
         return "dropped" if r.status == 200 else "pending"
 
 
+def leg2_floor_nanoerg(plan: dict, path: str) -> int:
+    """Least ERG leg 2 may return: the planned amount minus SLIPPAGE_TOLERANCE. Below it, holding the
+    SigUSD (always redeemable) beats selling it into a moved pool or at a moved oracle."""
+    info = plan["leg2_info"]
+    planned = info["user_receives"] if path == "redeem" else info["amount_out"]
+    return int(planned * (1 - config.SLIPPAGE_TOLERANCE))
+
+
+async def build_leg2(ns, path: str, leg1_out: dict, cents: int, height: int, our_tree: str,
+                     floor: int) -> tuple[dict, dict, object, int]:
+    """Leg 2 on fresh boxes: (tx, info, guard policy, ERG back). Raises LegNotReady while it would
+    return less than `floor`, and makes the guard enforce the floor as well."""
+    if path == "redeem":
+        bank, oracle = await _leg2_boxes(ns, path)
+        tx2, info2, policy2 = build_redeem_leg(bank, oracle, leg1_out, cents, height, our_tree, UI_FEE_TREE)
+        erg_back = info2["user_receives"]
+    else:
+        (pool,) = await _leg2_boxes(ns, path)
+        tx2, info2, policy2 = build_pool_sell_leg(pool, leg1_out, cents, height, our_tree)
+        erg_back = info2["amount_out"]
+    if erg_back < floor:
+        raise LegNotReady(f"leg 2 would return {erg_back / 1e9:.6f} ERG, below the floor {floor / 1e9:.6f} ERG "
+                          f"(plan minus SLIPPAGE_TOLERANCE {config.SLIPPAGE_TOLERANCE:.1%}); "
+                          f"holding the SigUSD until the price recovers")
+    policy2.min_erg_received = max(policy2.min_erg_received, floor - info2["miner_fee"])
+    return tx2, info2, policy2, erg_back
+
+
 async def leg1_landed(ns, tx1: str, leg1_box_id: str, attempts: int = 3, delay: float = 3.0) -> bool:
     """False only if leg 1 is provably gone: not confirmed, not in the mempool and its output not
     visible, on every one of `attempts` checks. Any doubt (node errors included) returns True."""
@@ -287,16 +315,10 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
 
     leg1_out = tx_output_box(signed1, plan["leg1_output_index"])
     last = {}
+    floor = leg2_floor_nanoerg(plan, path)
 
     async def build_and_submit_leg2() -> str:
-        if path == "redeem":
-            bank, oracle = await _leg2_boxes(ns, path)
-            tx2, info2, policy2 = build_redeem_leg(bank, oracle, leg1_out, cents, height, our_tree, UI_FEE_TREE)
-            erg_back = info2["user_receives"]
-        else:
-            (pool,) = await _leg2_boxes(ns, path)
-            tx2, info2, policy2 = build_pool_sell_leg(pool, leg1_out, cents, height, our_tree)
-            erg_back = info2["amount_out"]
+        tx2, info2, policy2, erg_back = await build_leg2(ns, path, leg1_out, cents, height, our_tree, floor)
         signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True, log=log)
         tx_id = await _submit(ns, signed2)
         last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])

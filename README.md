@@ -425,6 +425,17 @@ Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 
 TX-guard refusal pauses live trading until restart and is sent to Discord with the redeem
 command to finish.
 
+**Leg 2 price floor.** Leg 2 is built again on fresh boxes right before it is signed, and again if it
+drops from the mempool. It must return at least the planned ERG minus `SLIPPAGE_TOLERANCE` (1%);
+the TX guard enforces the same floor. Below it, the bot keeps the SigUSD and retries until the price
+recovers or the watch times out (`leg2_failed`, with the command to finish by hand), instead of
+selling into a moved pool or at a moved oracle.
+
+**What the TX guard accepts.** Foreign inputs must be known contract boxes (the ErgoDEX pool, the
+SigmaUSD bank, the Dexy LP), identified by their NFT and recreated by the transaction; someone
+else's wallet box is never accepted. `MAX_TRADE_SIZE_ERG` caps the ERG a transaction takes from the
+wallet; SigUSD sells and redeems are capped by the amount you ask for.
+
 ### First live run
 
 1. **Wallet unlocked.** Live mode signs with your node wallet. Unlock it in the node panel
