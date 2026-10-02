@@ -125,3 +125,10 @@ def test_digest_embed_shows_the_mint_line_only_when_known():
     assert "Bank mint" in values(embeds.digest_embed(d)) and "$0.398" in values(embeds.digest_embed(d))
     d.mint = None
     assert "Bank mint" not in values(embeds.digest_embed(d))
+
+
+
+def test_closed_mint_embed_for_a_too_small_room_says_so():
+    """Review: closing at RR >= 400% because the room is tiny must not read 'Reopens at ... +0.0%'."""
+    e = embeds.mint_gate_embed(MintGateEvent("closed", 400.2, 0.3, 0.3124, 0.3125, MintOpening(0.0), 60.0, False))
+    assert "room only 0.30 ERG" in values(e) and "+0.0%" not in values(e) and "-0.0%" not in values(e)

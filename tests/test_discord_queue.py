@@ -233,3 +233,27 @@ def test_post_outside_an_event_loop_is_kept_for_later(notifier):
     notifier.post({"title": "early"})  # no running loop: must not raise
     run(notifier.stop())
     assert [c[2]["embeds"][0]["title"] for c in hook.calls] == ["early"]
+
+
+
+def test_a_full_queue_never_drops_a_live_alert(notifier):
+    """Review: notify_live is the only ping for a live failure; queue pressure must not evict it."""
+    notifier._start_worker = lambda: None
+    run(notifier.notify_live("LEG 2 FAILED", ping=False))
+    for i in range(QUEUE_MAX + 5):
+        notifier.post({"title": f"p{i}"})
+    assert any(j[0] == "text" and "LEG 2 FAILED" in j[1] for j in notifier._jobs)
+    assert len(notifier._jobs) == QUEUE_MAX
+
+
+def test_shutdown_does_not_wait_out_a_long_rate_limit(notifier):
+    """Review: stop() drains for 10 s; a 25 s retry_after must not keep the worker past it."""
+    hook = FakeHook(Resp(429, {"retry_after": 25}), Resp(200, {"id": "m1"}))
+    notifier._session = hook
+
+    async def go():
+        notifier.post({"title": "closing"})
+        await notifier.stop(timeout=10)
+
+    run(go())
+    assert all(s < 10 for s in notifier.slept) and len(hook.calls) == 1

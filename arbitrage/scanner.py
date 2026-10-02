@@ -52,6 +52,8 @@ from notifications.mint_gate import MintGateWatcher, mint_gate_text
 from logging_config import console
 
 MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
+EPISODE_HEARTBEAT_S = 60                 # how often an open episode's last-seen time is saved
+DIGEST_RETRY_S = 600                     # a digest not confirmed by Discord is queued again after this
 
 logger = logging.getLogger("ergo_arb.scanner")
 
@@ -81,6 +83,8 @@ class ArbitrageScanner:
         self.health = HealthMonitor(config.DISCORD_HEALTH_CHAIN_SECONDS, config.DISCORD_HEALTH_VENUE_SECONDS,
                                     config.DISCORD_HEALTH_ORACLE_SECONDS, config.DISCORD_HEALTH_REPEAT_SECONDS,
                                     started_at=time.time())
+        self._episode_touched: dict[int, float] = {}   # episode db id -> poll time of the last heartbeat
+        self._digest_queued_at: Optional[float] = None
         self.mint_gate = MintGateWatcher(config.MINT_GATE_CONFIRM_POLLS, config.MINT_GATE_MIN_ROOM_ERG,
                                          config.MINT_GATE_PING_COOLDOWN_SECONDS, config.MINT_GATE_CLOSE_SECONDS)
         self._last_wallet: Optional[dict] = None
@@ -1114,7 +1118,7 @@ class ArbitrageScanner:
 
     def _close_stale_discord_messages(self):
         """Grey out the Discord messages of episodes a previous run left open (crash, closed window)."""
-        for row in getattr(self.tracker, "stale_chain_episodes", []):
+        for row in self.tracker.claim_stale_chain_episodes():
             if row.get("message_id"):
                 self.discord.edit(lambda mid=row["message_id"]: mid, embeds.stale_episode_embed(row))
         mint_message = self.tracker.get_meta(MINT_MESSAGE_KEY)
@@ -1132,22 +1136,56 @@ class ArbitrageScanner:
         except Exception as e:  # shutdown must still send the summary and close connections
             logger.error(f"Closing Discord episodes failed: {e}", exc_info=True)
 
-    def _discord_tick(self, now: float):
-        """Episodes and health alerts from the freshly refreshed state. Never awaits Discord."""
+    def _maybe_send_digest(self):
+        """Queue the daily digest when due; it counts as sent once Discord returns the message id.
+        One that never comes back (Discord down) is queued again after DIGEST_RETRY_S."""
         if not self.discord_enabled:
             return
-        try:
-            for event in self.episodes.update(now, self.state.paths):
-                self._handle_episode(event)
-            for h in self.health.update(time.time(), self.state):
-                self.discord.post(embeds.health_embed(h), content=self.discord._ping() if h.ping else "")
-                self.state.add_event("warn" if h.kind == "alert" else "info", f"Discord: {h.text}")
-            bank = None if self.state.chain_error else (self.state.prices or {}).get("bank")
-            gate = self.mint_gate.update(now, bank)
-            if gate:
-                self._handle_mint_gate(gate)
-        except Exception as e:
-            logger.error(f"Discord tick error: {e}", exc_info=True)
+        in_flight = self._digest_queued_at is not None and time.time() - self._digest_queued_at < DIGEST_RETRY_S
+        now = datetime.now()
+        if in_flight or not digest_due(self.tracker, now, config.DISCORD_DIGEST_HOUR):
+            return
+        digest = build_digest(self.tracker, self.health, self._last_wallet, now, bank=self._bank_for_alerts())
+        self._digest_queued_at = time.time()
+        self.discord.post(embeds.digest_embed(digest), on_id=lambda mid, now=now: self._digest_delivered(now))
+
+    def _digest_delivered(self, queued_at: datetime):
+        mark_digest_sent(self.tracker, queued_at)
+        self._digest_queued_at = None
+
+    def _bank_for_alerts(self) -> Optional[dict]:
+        """The latest bank state, or None while the chain is unreadable (never a stale reading)."""
+        return None if self._chain_error else (self._chain_prices or {}).get("bank")
+
+    def _tick_episodes(self, now: float):
+        for event in self.episodes.update(now, self.state.paths):
+            self._handle_episode(event)
+        for ep in list(self.episodes.open.values()):
+            if ep.db_id and now - self._episode_touched.get(ep.db_id, now) >= EPISODE_HEARTBEAT_S:
+                self.tracker.touch_chain_episode(ep.db_id)
+                self._episode_touched[ep.db_id] = now
+            self._episode_touched.setdefault(ep.db_id, now)
+
+    def _tick_health(self, now: float):
+        for h in self.health.update(time.time(), self.state):
+            self.discord.post(embeds.health_embed(h), content=self.discord._ping() if h.ping else "")
+            self.state.add_event("warn" if h.kind == "alert" else "info", f"Discord: {h.text}")
+
+    def _tick_mint_gate(self, now: float):
+        gate = self.mint_gate.update(now, self._bank_for_alerts())
+        if gate:
+            self._handle_mint_gate(gate)
+
+    def _discord_tick(self, now: float):
+        """Episodes, health alerts and the mint gate from the refreshed state. Never awaits Discord;
+        each part has its own error handler, so one failing never skips the others."""
+        if not self.discord_enabled:
+            return
+        for part in (self._tick_episodes, self._tick_health, self._tick_mint_gate):
+            try:
+                part(now)
+            except Exception as e:
+                logger.error(f"Discord tick error ({part.__name__}): {e}", exc_info=True)
 
     async def _notify_discord(self, opportunities: list[ArbitrageOpportunity]):
         """Send Discord notifications for confirmed, non-stale opportunities."""
@@ -1882,11 +1920,7 @@ class ArbitrageScanner:
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
         try:
-            if self.discord_enabled and digest_due(self.tracker, datetime.now(), config.DISCORD_DIGEST_HOUR):
-                self.discord.post(embeds.digest_embed(build_digest(self.tracker, self.health, self._last_wallet,
-                                                                   datetime.now(),
-                                                                   bank=(self.state.prices or {}).get("bank"))))
-                mark_digest_sent(self.tracker, datetime.now())
+            self._maybe_send_digest()
         except Exception as e:  # the digest must never block a scan or a trade
             logger.error(f"Daily digest error: {e}", exc_info=True)
 
@@ -2070,7 +2104,8 @@ class ArbitrageScanner:
 
         if self.discord_enabled:
             await self.discord.send_startup_message(mode=self.mode)
-            self._close_stale_discord_messages()
+            if not once:  # a one-off run must leave a running bot's open messages alone
+                self._close_stale_discord_messages()
 
         try:
             loop = asyncio.get_running_loop()
