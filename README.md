@@ -278,6 +278,7 @@ python execute_pool_swap.py --sell sigusd --amount 0.5 --execute
 
 | Script | Direction | Status | TX Proof |
 |--------|-----------|--------|----------|
+| `execute_arb.py` | Full loop: pool buy -> bank redeem (two chained TXs) | NEW: dry run / `--check` first; executes only if profitable | - |
 | `execute_pool_swap.py` | ERG <-> SigUSD (direct pool spend, no Crux fee) | NEW: dry run / `--check` first | - |
 | `execute_swap_use.py` | ERG -> USE (Crux mint) | TESTED LIVE | Confirmed on-chain |
 | `execute_swap_use_to_erg.py` | USE -> ERG (Crux LP) | TESTED LIVE | TX `bf544106...` |

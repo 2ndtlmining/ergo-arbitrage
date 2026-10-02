@@ -41,3 +41,17 @@ async def wallet_context(ns) -> tuple[list[dict], int, str]:
         our_tree = "0008cd" + (await r.json())["raw"]
     trees = await wallet_trees(ns, node)
     return [b for b in boxes if b.get("ergoTree") in trees], height, our_tree
+
+
+async def wait_for_box(ns, box_id: str, timeout: float = 60, interval: float = 1.0) -> dict:
+    """Poll the node until `box_id` is visible (UTXO set or mempool); TimeoutError otherwise."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            return await node_box(ns, box_id)
+        except RuntimeError:
+            if loop.time() >= deadline:
+                raise TimeoutError(f"box {box_id[:12]} not visible on the node after {timeout:.0f}s")
+            await asyncio.sleep(interval)
