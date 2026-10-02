@@ -506,6 +506,15 @@ class ArbitrageScanner:
                 self.last_sizing[opp.path_key] = choice
         return optima
 
+    @staticmethod
+    def _cex_side_price(prices: dict, cex: str, erg: float, side: str) -> Optional[float]:
+        """Average USDT per ERG for `erg` on that side of the CEX order book (buy = asks, sell = bids).
+        None when there is no book or not enough depth; callers fall back to the mid price."""
+        book = prices.get(f"{cex.lower()}_orderbook")
+        if book is None or isinstance(book, Exception) or not hasattr(book, "effective_buy_price"):
+            return None
+        return book.effective_buy_price(erg) if side == "buy" else book.effective_sell_price(erg)
+
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
         """Analyze prices and find all arbitrage opportunities (grid sizes); best sizes go to last_optima."""
         opportunities = []
@@ -515,9 +524,6 @@ class ArbitrageScanner:
         kucoin_price = prices.get("kucoin_erg_usdt") if self.enable_cex else None
         spectrum_price = prices.get("spectrum_erg_sigusd")
         bank = prices.get("bank", {})
-        oracle_price = bank.get("oracle_erg_usd")
-        can_mint = bank.get("can_mint_sigusd", False)
-        reserve_ratio = bank.get("reserve_ratio")
         bank_state: Optional[BankState] = bank.get("state")
 
         # USE (Dexy): LP read on-chain, mint status/state from Crux
@@ -526,9 +532,6 @@ class ArbitrageScanner:
         use_mint_ok = mint_available(use_mint)
         use_box_state = mint_box_state(use_mint)
 
-        # Build blocked reason strings
-        rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
-        mint_blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR must stay >=400%)" if not can_mint else ""
 
         for trade_size in self._trade_sizes:
             slippage = config.get_recommended_slippage(trade_size)  # legs without known depth (CEX)
@@ -541,196 +544,91 @@ class ArbitrageScanner:
                 if opp is not None:
                     opportunities.append(opp)
 
-            # Path 3: NonKYC vs Spectrum (note SigUSD != USDT assumption)
-            if nonkyc_price and spectrum_price:
-                direction = "buy_dex_sell_cex" if nonkyc_price > spectrum_price else "buy_cex_sell_dex"
-                opp = self.calculator.calc_cex_vs_dex(
-                    input_erg=trade_size,
-                    cex_erg_usdt_price=nonkyc_price,
-                    dex_erg_sigusd_price=spectrum_price,
-                    direction=direction,
-                    cex_trading_fee=config.NONKYC_TRADING_FEE,
-                    erg_withdraw_fee=config.NONKYC_ERG_WITHDRAW_FEE,
-                    slippage=slippage,
-                )
-                opp.path = f"NonKYC<>Spectrum [{trade_size} ERG]"
-                opp.assumption = "SigUSD=USDT assumed (depegged!)"
-                nonkyc_usdt_fee = self._nonkyc_usdt_fee
-                if direction == "buy_dex_sell_cex":
-                    usdt_result = trade_size * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
+            # Paths 3-4: CEX vs the pool. Both directions are computed and the better one is kept.
+            # Watch-only: nothing converts SigUSD and USDT (WATCH_ONLY_REASON).
+            pool = prices.get("spectrum_pool")
+            for cex, mid, trading_fee, withdraw_fee in (
+                    ("NonKYC", nonkyc_price, config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE),
+                    ("Kucoin", kucoin_price, config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE)):
+                if not (mid and spectrum_price):
+                    continue
+                ask = self._cex_side_price(prices, cex, trade_size, "buy") or mid
+                bid = self._cex_side_price(prices, cex, trade_size, "sell") or mid
+                opp = max((self.calculator.calc_cex_vs_dex(
+                    input_erg=trade_size, cex_buy_price=ask, cex_sell_price=bid,
+                    dex_erg_sigusd_price=spectrum_price, direction=d, cex_trading_fee=trading_fee,
+                    erg_withdraw_fee=withdraw_fee, slippage=slippage, pool=pool)
+                    for d in ("buy_cex_sell_dex", "buy_dex_sell_cex")), key=lambda o: o.profit_erg)
+                buy_on_cex = opp.source_exchange == "CEX"
+                opp.path = f"{cex}<>Spectrum [{trade_size} ERG]"
+                if buy_on_cex:
                     opp.steps = [
-                        f"START: Have SigUSD in wallet",
-                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
-                        f"Deposit ERG to NonKYC (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
-                        f"Sell ERG on NonKYC for USDT at ${nonkyc_price:.4f}/ERG ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ~${usdt_result:.2f} USDT on NonKYC (USDT withdrawal fee: {nonkyc_usdt_fee} USDT)",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                        f"START: Have USDT on {cex}",
+                        f"Buy ERG on {cex} at ask ${ask:.4f} USDT ({trading_fee*100:.1f}% fee)",
+                        f"Withdraw ERG to wallet (-{withdraw_fee} ERG withdrawal fee)",
+                        f"Swap ERG -> SigUSD on the pool ({spectrum_price:.4f} SigUSD/ERG, {config.pool_fee_text()})",
+                        "END RESULT: SigUSD tokens in Ergo wallet",
+                        f"WATCH-ONLY: {opp.assumption}; no SigUSD<->USDT venue to close the loop",
                     ]
                 else:
                     opp.steps = [
-                        f"START: Have USDT on NonKYC",
-                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
-                        f"Withdraw ERG to wallet (-{config.NONKYC_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
-                        f"END RESULT: SigUSD tokens in Ergo wallet",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
+                        "START: Have SigUSD in wallet",
+                        f"Swap SigUSD -> ERG on the pool ({spectrum_price:.4f} SigUSD/ERG, {config.pool_fee_text()})",
+                        f"Deposit ERG to {cex} (~{config.ERGO_TX_FEE} ERG network fee)",
+                        f"Sell ERG on {cex} at bid ${bid:.4f} USDT ({trading_fee*100:.1f}% fee)",
+                        f"END RESULT: USDT on {cex}",
+                        f"WATCH-ONLY: {opp.assumption}; no SigUSD<->USDT venue to close the loop",
                     ]
                 opportunities.append(opp)
 
-            # Path 4: Kucoin vs Spectrum
-            if kucoin_price and spectrum_price:
-                direction = "buy_dex_sell_cex" if kucoin_price > spectrum_price else "buy_cex_sell_dex"
-                opp = self.calculator.calc_cex_vs_dex(
-                    input_erg=trade_size,
-                    cex_erg_usdt_price=kucoin_price,
-                    dex_erg_sigusd_price=spectrum_price,
-                    direction=direction,
-                    cex_trading_fee=config.KUCOIN_TRADING_FEE,
-                    erg_withdraw_fee=config.KUCOIN_ERG_WITHDRAW_FEE,
-                    slippage=slippage,
-                )
-                opp.path = f"Kucoin<>Spectrum [{trade_size} ERG]"
-                opp.assumption = "SigUSD=USDT assumed (depegged!)"
-                kucoin_usdt_fee = self._kucoin_usdt_fee
-                if direction == "buy_dex_sell_cex":
-                    usdt_result = trade_size * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
-                    opp.steps = [
-                        f"START: Have SigUSD in wallet",
-                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
-                        f"Deposit ERG to Kucoin (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
-                        f"Sell ERG on Kucoin for USDT at ${kucoin_price:.4f}/ERG ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ~${usdt_result:.2f} USDT on Kucoin (USDT withdrawal fee: {kucoin_usdt_fee} USDT)",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
-                    ]
-                else:
-                    opp.steps = [
-                        f"START: Have USDT on Kucoin",
-                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
-                        f"Withdraw ERG to wallet (-{config.KUCOIN_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
-                        f"END RESULT: SigUSD tokens in Ergo wallet",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
-                    ]
-                opportunities.append(opp)
-
-            # Path 5: NonKYC vs Kucoin (CEX to CEX)
+            # Path 5: NonKYC vs Kucoin (CEX to CEX): buy at the ask on one, sell at the bid on the other
             if nonkyc_price and kucoin_price:
-                if nonkyc_price > kucoin_price:
-                    opp = self.calculator.calc_cex_to_cex(
+                quotes = {name: (self._cex_side_price(prices, name, trade_size, "buy") or mid,
+                                 self._cex_side_price(prices, name, trade_size, "sell") or mid)
+                          for name, mid in (("NonKYC", nonkyc_price), ("Kucoin", kucoin_price))}
+                fees_by = {"NonKYC": (config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE),
+                           "Kucoin": (config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE)}
+                options = []
+                for buy_on, sell_on in (("Kucoin", "NonKYC"), ("NonKYC", "Kucoin")):
+                    o = self.calculator.calc_cex_to_cex(
                         input_erg=trade_size,
-                        sell_price_usdt=nonkyc_price,
-                        buy_price_usdt=kucoin_price,
-                        sell_trading_fee=config.NONKYC_TRADING_FEE,
-                        buy_trading_fee=config.KUCOIN_TRADING_FEE,
-                        erg_withdraw_fee=config.KUCOIN_ERG_WITHDRAW_FEE,
+                        sell_price_usdt=quotes[sell_on][1],
+                        buy_price_usdt=quotes[buy_on][0],
+                        sell_trading_fee=fees_by[sell_on][0],
+                        buy_trading_fee=fees_by[buy_on][0],
+                        erg_withdraw_fee=fees_by[buy_on][1],
                     )
-                    opp.path = f"Kucoin->NonKYC [{trade_size} ERG]"
-                    usdt_result = opp.output_erg * nonkyc_price
-                    opp.steps = [
-                        f"START: Have USDT on Kucoin",
-                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
-                        f"Withdraw ERG to NonKYC (-{config.KUCOIN_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Sell ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ~${usdt_result:.2f} USDT on NonKYC",
+                    o.path = f"{buy_on}->{sell_on} [{trade_size} ERG]"
+                    o.steps = [
+                        f"START: Have USDT on {buy_on}",
+                        f"Buy ERG on {buy_on} at ask ${quotes[buy_on][0]:.4f} USDT ({fees_by[buy_on][0]*100:.1f}% fee)",
+                        f"Withdraw ERG to {sell_on} (-{fees_by[buy_on][1]} ERG withdrawal fee)",
+                        f"Sell ERG on {sell_on} at bid ${quotes[sell_on][1]:.4f} USDT ({fees_by[sell_on][0]*100:.1f}% fee)",
+                        f"END RESULT: ~${o.output_erg * quotes[sell_on][1]:.2f} USDT on {sell_on}",
                     ]
-                else:
-                    opp = self.calculator.calc_cex_to_cex(
-                        input_erg=trade_size,
-                        sell_price_usdt=kucoin_price,
-                        buy_price_usdt=nonkyc_price,
-                        sell_trading_fee=config.KUCOIN_TRADING_FEE,
-                        buy_trading_fee=config.NONKYC_TRADING_FEE,
-                        erg_withdraw_fee=config.NONKYC_ERG_WITHDRAW_FEE,
-                    )
-                    opp.path = f"NonKYC->Kucoin [{trade_size} ERG]"
-                    usdt_result = opp.output_erg * kucoin_price
-                    opp.steps = [
-                        f"START: Have USDT on NonKYC",
-                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
-                        f"Withdraw ERG to Kucoin (-{config.NONKYC_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Sell ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ~${usdt_result:.2f} USDT on Kucoin",
-                    ]
-                opportunities.append(opp)
+                    options.append(o)
+                opportunities.append(max(options, key=lambda o: o.profit_erg))
 
-            # Path 6: Kucoin vs SigmaUSD Bank (always calculate, mark blocked)
-            if kucoin_price and oracle_price:
-                bank_effective = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
-                diff_pct = ((kucoin_price - bank_effective) / bank_effective) * 100
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                sigusd_minted = trade_size * bank_effective
-                opp = ArbitrageOpportunity(
-                    path=f"Kucoin<>Bank [{trade_size} ERG]",
-                    input_erg=trade_size,
-                    output_erg=trade_size * (1 + diff_pct / 100),
-                    profit_erg=trade_size * diff_pct / 100,
-                    profit_percent=diff_pct,
-                    fees=FeeBreakdown(
-                        trading_fee=trade_size * kucoin_price * config.KUCOIN_TRADING_FEE,
-                        withdraw_fee_erg=config.KUCOIN_ERG_WITHDRAW_FEE,
-                        network_fee_erg=config.ERGO_TX_FEE,
-                        protocol_fee=trade_size * oracle_price * (1 - (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)),
-                    ),
-                    source_price=oracle_price,
-                    target_price=kucoin_price,
-                    source_exchange="SigmaUSD Bank",
-                    target_exchange="Kucoin",
-                    is_profitable=diff_pct > config.MIN_PROFIT_PERCENT and can_mint,
-                    blocked=not can_mint,
-                    blocked_reason=mint_blocked_reason if not can_mint else "",
-                    assumption="SigUSD=USDT assumed (depegged!)",
-                    requires_transfer=True,
-                    estimated_execution_minutes=60,
-                    price_risk_percent=60 * 0.02,
-                    steps=[
-                        f"START: Have {trade_size} ERG in wallet",
-                        f"Mint SigUSD at Bank: send {trade_size} ERG, receive ~{sigusd_minted:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% fees)",
-                        f"Sell SigUSD for USDT somewhere (assumes 1:1 peg)",
-                        f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ERG on Kucoin (withdraw to wallet: -{config.KUCOIN_ERG_WITHDRAW_FEE} ERG)",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
-                    ],
-                )
-                opportunities.append(opp)
-
-            # Path 7: NonKYC vs SigmaUSD Bank (always calculate, mark blocked)
-            if nonkyc_price and oracle_price:
-                bank_effective = oracle_price * (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
-                diff_pct = ((nonkyc_price - bank_effective) / bank_effective) * 100
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                sigusd_minted = trade_size * bank_effective
-                opp = ArbitrageOpportunity(
-                    path=f"NonKYC<>Bank [{trade_size} ERG]",
-                    input_erg=trade_size,
-                    output_erg=trade_size * (1 + diff_pct / 100),
-                    profit_erg=trade_size * diff_pct / 100,
-                    profit_percent=diff_pct,
-                    fees=FeeBreakdown(
-                        trading_fee=trade_size * nonkyc_price * config.NONKYC_TRADING_FEE,
-                        withdraw_fee_erg=config.NONKYC_ERG_WITHDRAW_FEE,
-                        network_fee_erg=config.ERGO_TX_FEE,
-                        protocol_fee=trade_size * oracle_price * (1 - (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)),
-                    ),
-                    source_price=oracle_price,
-                    target_price=nonkyc_price,
-                    source_exchange="SigmaUSD Bank",
-                    target_exchange="NonKYC",
-                    is_profitable=diff_pct > config.MIN_PROFIT_PERCENT and can_mint,
-                    blocked=not can_mint,
-                    blocked_reason=mint_blocked_reason if not can_mint else "",
-                    assumption="SigUSD=USDT assumed (depegged!)",
-                    requires_transfer=True,
-                    estimated_execution_minutes=40,
-                    price_risk_percent=40 * 0.02,
-                    steps=[
-                        f"START: Have {trade_size} ERG in wallet",
-                        f"Mint SigUSD at Bank: send {trade_size} ERG, receive ~{sigusd_minted:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% fees)",
-                        f"Sell SigUSD for USDT somewhere (assumes 1:1 peg)",
-                        f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
-                        f"END RESULT: ERG on NonKYC (withdraw to wallet: -{config.NONKYC_ERG_WITHDRAW_FEE} ERG)",
-                        f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
-                    ],
-                )
+            # Paths 6-7: bank mint -> (SigUSD -> USDT: no venue) -> buy ERG on a CEX. Watch-only.
+            for cex, mid, trading_fee, withdraw_fee, minutes in (
+                    ("Kucoin", kucoin_price, config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE, 60),
+                    ("NonKYC", nonkyc_price, config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE, 40)):
+                if not (mid and bank_state is not None):
+                    continue
+                ask = self._cex_side_price(prices, cex, trade_size, "buy") or mid
+                opp = self.calculator.calc_bank_to_cex(trade_size, bank_state, ask, trading_fee, withdraw_fee,
+                                                       execution_minutes=minutes)
+                opp.path = f"{cex}<>Bank [{trade_size} ERG]"
+                opp.target_exchange = cex
+                sigusd = opp.details["sigusd_cents"] / 100
+                opp.steps = [
+                    f"START: Have {trade_size} ERG in wallet",
+                    f"Mint SigUSD at the bank: {trade_size} ERG -> {sigusd:.2f} SigUSD (contract-exact, fees included)",
+                    "Sell SigUSD for USDT (no venue in this bot)",
+                    f"Buy ERG on {cex} at ask ${ask:.4f} USDT ({trading_fee*100:.1f}% fee)",
+                    f"Withdraw ERG to wallet (-{withdraw_fee} ERG)",
+                    f"WATCH-ONLY: {opp.assumption}",
+                ]
                 opportunities.append(opp)
 
             # ---- USE (DexyUSD) Paths ----

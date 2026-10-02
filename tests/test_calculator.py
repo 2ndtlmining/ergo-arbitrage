@@ -152,7 +152,8 @@ class TestCexVsDex:
     def test_large_spread_detected(self):
         opp = self.calc.calc_cex_vs_dex(
             input_erg=100,
-            cex_erg_usdt_price=0.31,
+            cex_buy_price=0.31,
+            cex_sell_price=0.31,
             dex_erg_sigusd_price=0.29,
             direction="buy_dex_sell_cex",
             slippage=0.01,
@@ -164,9 +165,11 @@ class TestCexVsDex:
         """0.3% spread should not be profitable after fees."""
         opp = self.calc.calc_cex_vs_dex(
             input_erg=10,
-            cex_erg_usdt_price=0.301,
+            cex_buy_price=0.301,
+            cex_sell_price=0.301,
             dex_erg_sigusd_price=0.300,
             direction="buy_dex_sell_cex",
             slippage=0.01,
+            sigusd_usd=1.0,  # the premise: SigUSD at $1, so only the 0.3% spread is on offer
         )
         assert not opp.is_profitable
