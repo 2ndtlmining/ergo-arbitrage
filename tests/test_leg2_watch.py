@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from ergo.arb_runner import watch_leg2
+from ergo.arb_runner import LegNotReady, watch_leg2
 
 
 def run(coro):
@@ -115,3 +115,19 @@ class _Explorer:
 def test_leg2_status_from_node(node, explorer, expected):
     from ergo.arb_runner import _leg2_status
     assert run(_leg2_status(node, "tx2", "leg1box", explorer)) == expected
+
+
+def test_not_ready_rebuild_waits_without_using_up_rebuilds():
+    # an oracle update is pending for a few rounds: rebuilding then would only be dropped again
+    s = Script(["dropped"] * 5 + ["confirmed"])
+    calls = []
+
+    async def waiting_rebuild():
+        calls.append(1)
+        if len(calls) <= 4:
+            raise LegNotReady("oracle update pending")
+        return "tx2-after-oracle"
+
+    status, tx = run(watch_leg2("tx2", s.get_status, waiting_rebuild, timeout=5, interval=0, max_rebuilds=1,
+                                log=lambda m: None))
+    assert status == "confirmed" and tx == "tx2-after-oracle"
