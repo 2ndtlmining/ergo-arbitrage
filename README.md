@@ -184,6 +184,34 @@ DISCORD_SUMMARY_INTERVAL_SECONDS=1800  # Summary heartbeat interval (default 180
 PRICE_STALE_SECONDS=60                 # Max price age before skipping (default 60)
 ```
 
+### Discord messages (on-chain paths)
+
+The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard and the live gate, not the scan streaks above:
+
+- **One message per opportunity.** A path that stays GO (and meets both minimums) for `DISCORD_CONFIRM_SECONDS` posts one embed. While it stays open, that same message is edited at most every `DISCORD_EDIT_SECONDS`, and only when profit moves by more than 0.1 percentage points. Once the path has not qualified for `DISCORD_CLOSE_SECONDS`, the message turns grey and shows how long it lasted, the peak and the last profit, plus the live trade result if there was one. Opens at or above the Tier 1 % ping you.
+- **Health alerts**, each followed by a recovery message:
+  - chain state unreadable for 2 min or more (ping)
+  - a CEX venue down for 5 min or more
+  - an oracle update stuck for 10 min or more
+  - live trading paused (ping)
+  - a failure that continues is re-alerted every 30 min
+- **Daily digest** at `DISCORD_DIGEST_HOUR` (local time), once a day, also after a restart. It shows the past 24 h: episodes per path, potential ERG, trades, outages and the wallet.
+- Discord is sent from a background queue (bounded, with HTTP 429 retry), so a slow or unreachable Discord never delays the 2 s chain poll.
+- The CEX/USE paths still use the streak/cooldown flow described above.
+
+```env
+DISCORD_CONFIRM_SECONDS=10             # Held this long before a message opens
+DISCORD_CLOSE_SECONDS=10               # Gone this long before it closes
+DISCORD_EDIT_SECONDS=30                # At most one edit per this
+DISCORD_HEALTH_CHAIN_SECONDS=120       # Chain unreadable -> alert (ping)
+DISCORD_HEALTH_VENUE_SECONDS=300       # CEX venue down -> alert
+DISCORD_HEALTH_ORACLE_SECONDS=600      # Oracle update pending -> alert
+DISCORD_HEALTH_REPEAT_SECONDS=1800     # Re-alert interval while still failing
+DISCORD_DIGEST_HOUR=8                  # Local hour for the daily digest, -1 = off
+```
+
+**Privacy:** the webhook receives your wallet balances and your Discord user id. Post it to a private channel.
+
 ## Setup
 
 ### Prerequisites
