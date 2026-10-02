@@ -63,6 +63,8 @@ class EpisodeTracker:
         events = []
         for key in set(rows) | set(self.open) | set(self._pending):
             row = rows.get(key)
+            if row is not None and row.status == "stale":
+                continue  # chain unreadable: hold the episode as it is (health alerts cover the outage)
             q = self._qualifies(row)
             ep = self.open.get(key)
             if ep is None:

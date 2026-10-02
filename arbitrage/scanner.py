@@ -1833,10 +1833,13 @@ class ArbitrageScanner:
                 await self.discord.send_scan_summary(opportunities, scan_number=self.scan_count)
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
-        if self.discord_enabled and digest_due(self.tracker, datetime.now(), config.DISCORD_DIGEST_HOUR):
-            self.discord.post(embeds.digest_embed(build_digest(self.tracker, self.health, self._last_wallet,
-                                                               datetime.now())))
-            mark_digest_sent(self.tracker, datetime.now())
+        try:
+            if self.discord_enabled and digest_due(self.tracker, datetime.now(), config.DISCORD_DIGEST_HOUR):
+                self.discord.post(embeds.digest_embed(build_digest(self.tracker, self.health, self._last_wallet,
+                                                                   datetime.now())))
+                mark_digest_sent(self.tracker, datetime.now())
+        except Exception as e:  # the digest must never block a scan or a trade
+            logger.error(f"Daily digest error: {e}", exc_info=True)
 
         await self._execute_trades(wallet, prices)
 
@@ -1870,7 +1873,7 @@ class ArbitrageScanner:
             await self._poll(now)
         finally:
             self._refresh_state(now)
-        self._discord_tick(now)
+            self._discord_tick(now)
         if full and self.view == "json":
             sys.stdout.write(json.dumps(self.state.to_json(), default=str) + "\n")
             sys.stdout.flush()

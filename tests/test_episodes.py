@@ -97,3 +97,13 @@ def test_flicker_every_poll_does_not_storm():
     for i in range(60):  # 2 minutes of GO / not GO alternating every 2 s
         events += t.update(i * 2, row(status="GO" if i % 2 == 0 else "no edge"))
     assert events == []
+
+
+def test_chain_outage_holds_an_open_episode():
+    """Review: 'stale' (chain unreadable) neither closes an open episode nor reopens it afterwards."""
+    t = tracker()
+    t.update(0, row())
+    t.update(10, row())
+    for now in range(12, 50, 2):
+        assert t.update(now, row(status="stale")) == []
+    assert t.update(52, row()) == [] and KEY in t.open

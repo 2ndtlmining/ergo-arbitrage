@@ -113,3 +113,43 @@ def test_monitor_mode_sends_nothing(tmp_path, monkeypatch):
         run(s.poll_once(t))
     assert posts == []
     s.tracker.close()
+
+
+def test_poll_does_not_wait_for_a_hanging_discord(notify, monkeypatch):
+    """Spec: nothing in the poll path awaits Discord (legacy texts included)."""
+    async def hanging_send(content):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(notify.discord, "_send", hanging_send)
+    notify._last_summary_time = 0.0  # the 30 min text summary is due on this full scan
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    run(asyncio.wait_for(notify.poll_once(0), 5))
+
+
+def test_discord_tick_runs_even_when_the_poll_fails(notify, monkeypatch):
+    ticks = []
+
+    async def boom(now):
+        raise RuntimeError("poll failed")
+
+    monkeypatch.setattr(notify, "_poll", boom)
+    monkeypatch.setattr(notify, "_discord_tick", ticks.append)
+    with pytest.raises(RuntimeError):
+        run(notify.poll_once(0))
+    assert ticks == [0]
+
+
+def test_digest_error_does_not_block_trading(notify, monkeypatch):
+    traded = []
+
+    def broken(*a, **k):
+        raise RuntimeError("meta table locked")
+
+    async def execute(*a, **k):
+        traded.append(True)
+
+    monkeypatch.setattr(scanner_module, "digest_due", broken)
+    monkeypatch.setattr(notify, "_execute_trades", execute)
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    run(notify.poll_once(0))
+    assert traded

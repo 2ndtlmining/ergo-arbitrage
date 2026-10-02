@@ -59,6 +59,7 @@ class TestNoTrading:
 class TestDiscordWatch:
     def test_alert_respects_its_own_cooldown(self, monkeypatch):
         d = DiscordNotifier()
+        d.enabled = True
         sent = []
 
         async def fake_send(content):
@@ -66,8 +67,12 @@ class TestDiscordWatch:
             return True
 
         monkeypatch.setattr(d, "_send", fake_send)
-        asyncio.run(d.notify_watch("Kucoin", "gap text"))
-        asyncio.run(d.notify_watch("Kucoin", "gap text"))
+        async def go():
+            await d.notify_watch("Kucoin", "gap text")
+            await d.notify_watch("Kucoin", "gap text")
+            await d.stop()  # texts are queued; deliver them
+
+        asyncio.run(go())
         assert len(sent) == 1
         assert "watch-only" in sent[0].lower()
 

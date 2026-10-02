@@ -29,7 +29,7 @@ class DiscordNotifier:
         self.cooldown_seconds: int = config.DISCORD_COOLDOWN_SECONDS
         self._session: Optional[aiohttp.ClientSession] = None
         self._last_notified: dict[str, float] = {}
-        self._jobs: deque = deque()          # ("post", embed, content, on_id) | ("edit", embed, get_id)
+        self._jobs: deque = deque()          # ("post", embed, content, on_id) | ("edit", embed, get_id) | ("text", content)
         self._worker: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None
         self._busy = False
@@ -127,7 +127,7 @@ class DiscordNotifier:
         if not self.enabled:
             return
         if len(self._jobs) >= QUEUE_MAX:
-            oldest_post = next((j for j in self._jobs if j[0] == "post"), None)
+            oldest_post = next((j for j in self._jobs if j[0] != "edit"), None)
             self._jobs.remove(oldest_post if oldest_post is not None else self._jobs[0])
             logger.warning("Discord queue full: dropped the oldest message")
         self._jobs.append(job)
@@ -155,7 +155,9 @@ class DiscordNotifier:
                 self._busy = False
 
     async def _do(self, job):
-        if job[0] == "post":
+        if job[0] == "text":
+            await self._send(job[1])
+        elif job[0] == "post":
             _, embed, content, on_id = job
             status, body = await self._request("POST", f"{self.webhook_url}?wait=true",
                                                {"content": content, "embeds": [embed]})
@@ -198,6 +200,8 @@ class DiscordNotifier:
 
     async def stop(self, timeout: float = 10):
         """Deliver what is queued (up to `timeout` seconds), then stop the worker."""
+        if self._jobs and (self._worker is None or self._worker.done()):
+            self._start_worker()  # jobs left by a worker that ended with its loop
         if self._worker is None:
             return
         loop = asyncio.get_running_loop()
@@ -214,7 +218,8 @@ class DiscordNotifier:
     async def notify_live(self, text: str, ping: bool = True) -> bool:
         """Live-trading event (trade executed, failure, pause)."""
         prefix = f"{self._ping()} " if ping and self._ping() else ""
-        return await self._send(f"{prefix}**LIVE**: {text}")
+        self._enqueue(("text", f"{prefix}**LIVE**: {text}"))
+        return True
 
     async def notify_watch(self, exchange: str, text: str) -> bool:
         """Watch-only CEX gap alert, at most once per CEX_WATCH_COOLDOWN_SECONDS per exchange."""
@@ -222,10 +227,9 @@ class DiscordNotifier:
         if time.time() - self._last_notified.get(key, 0) < config.CEX_WATCH_COOLDOWN_SECONDS:
             return False
         content = f"**CEX watch-only: {exchange}**\n{text}\nNot executable: {exchange} is not connected (no API keys)."
-        sent = await self._send(content)
-        if sent:
-            self._last_notified[key] = time.time()
-        return sent
+        self._enqueue(("text", content))
+        self._last_notified[key] = time.time()
+        return True
 
     def _format_opportunity(self, opp: ArbitrageOpportunity, scan_number: int = 0, tier: int = 1) -> str:
         """Format an opportunity as a clear action-oriented message."""
@@ -390,7 +394,7 @@ class DiscordNotifier:
         if not self.enabled or not opportunities:
             return
         msg = self._format_scan_summary(opportunities, scan_number)
-        await self._send(msg)
+        self._enqueue(("text", msg))
 
     async def send_wallet_analysis(self, wallet: dict, analysis: dict):
         """Wallet balances and the best options per asset, as one embed."""

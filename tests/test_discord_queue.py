@@ -153,3 +153,45 @@ def test_wallet_analysis_is_one_embed(notifier):
 
     run(go())
     assert len(hook.calls) == 1 and hook.calls[0][2]["embeds"][0]["title"] == "Wallet"
+
+
+def test_text_alerts_are_queued_not_awaited(notifier, monkeypatch):
+    """Review: notify_live/notify_watch/send_scan_summary must not hold the poll while Discord hangs."""
+    sent = []
+
+    async def hanging_send(content):
+        sent.append(content)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(notifier, "_send", hanging_send)
+    monkeypatch.setattr(notifier, "_format_scan_summary", lambda opps, n=0: "summary")
+
+    async def go():
+        await asyncio.wait_for(notifier.notify_live("executed"), 0.5)
+        await asyncio.wait_for(notifier.notify_watch("Kucoin", "gap"), 0.5)
+        await asyncio.wait_for(notifier.send_scan_summary(["opp"], 1), 0.5)
+        await notifier.stop(timeout=0.2)
+
+    run(go())
+    assert sent and "executed" in sent[0]
+
+
+def test_text_alerts_are_delivered_in_order(notifier, monkeypatch):
+    sent = []
+
+    async def fast_send(content):
+        sent.append(content)
+        return True
+
+    monkeypatch.setattr(notifier, "_send", fast_send)
+
+    async def go():
+        notifier.post({"title": "x"})  # an embed job in between keeps FIFO
+        await notifier.notify_live("a", ping=False)
+        await notifier.notify_watch("Kucoin", "b")
+        await notifier.stop()
+
+    notifier._session = FakeHook(Resp(200, {"id": "m"}))
+    run(go())
+    assert [s.split("**")[-1].strip(": ") if "LIVE" in s else "watch" for s in sent] == ["a", "watch"]
+
