@@ -10,7 +10,7 @@ import aiohttp
 
 import config
 from ergo.amounts import erg_spendable, token_total
-from ergo.arb_runner import run_pool_buy_redeem
+from ergo.arb_runner import run_arb
 from ergo.chain import find_box_id, node_box, wallet_context
 from ergo.chain_arb import redeem_policy
 from ergo.pool_swap import MINER_FEE, build_pool_swap_tx
@@ -18,7 +18,7 @@ from ergo.progress import wait_confirmed
 from ergo.sigmausd_tx import build_redeem_tx, register_int
 from ergo.signing import DryRun, check_on_node, guarded_sign
 from ergo.tx_guard import SignPolicy, TxGuardError
-from exchanges.sigmausd import BankState, quote_redeem_sigusd
+from exchanges.sigmausd import BankState, affordable_mint_cents, can_mint_sigusd, quote_redeem_sigusd
 
 Log = Callable[[str], None]
 NODE_TIMEOUT = aiohttp.ClientTimeout(total=30)
@@ -161,7 +161,12 @@ async def quote(ns, sell: str, amount: float, log: Log):
                                      our_tree=wallet[0]["ergoTree"])
         log(f"  Pool (direct, no service fee): {amount:g} ERG -> {info['amount_out'] / 100:.2f} SigUSD "
             f"(impact {info['price_impact_percent']:.2f}%)")
-        log(f"  Bank mint: {'blocked (RR below 400%)' if state.reserve_ratio < 400 else 'allowed'}")
+        cents = affordable_mint_cents(state, amt - MINER_FEE)
+        if cents and can_mint_sigusd(state, cents):
+            log(f"  Bank mint:                     {amount:g} ERG -> {cents / 100:.2f} SigUSD "
+                f"(after 2% + UI + miner fee)")
+        else:
+            log(f"  Bank mint: blocked (RR {state.reserve_ratio:.0f}%, must stay >= 400% after minting)")
     else:
         cents = int(round(amount * 100))
         _, info = build_pool_swap_tx(pool, wallet, SIGUSD, sell_erg=False, amount_in=cents, height=0,
@@ -258,6 +263,6 @@ async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log)
     await _finish(ns, body, send_policy(tree, erg_nano, cents), mode, log)
 
 
-async def arb(ns, erg: float, mode: str, force: bool, log: Log):
-    await run_pool_buy_redeem(ns, int(round(erg * 1e9)), check=mode == "check", execute=mode == "execute",
-                              force=force, log=log)
+async def arb(ns, erg: float, mode: str, force: bool, log: Log, path: str = "redeem"):
+    await run_arb(ns, path, int(round(erg * 1e9)), check=mode == "check", execute=mode == "execute",
+                  force=force, log=log)

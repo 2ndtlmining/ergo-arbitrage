@@ -82,3 +82,37 @@ def test_tx_output_box_from_signed_tx():
     box = tx_output_box(signed, 1)
     assert box == {"boxId": "b1", "value": 5, "ergoTree": "t1", "assets": [{"tokenId": "x", "amount": 3}],
                    "additionalRegisters": {}}
+
+
+class TestMintSellPlan:
+    """Leg 1 mints SigUSD at the bank, leg 2 sells it on the pool."""
+
+    def plan(self, sigusd_per_erg, erg_budget=10 * 10**9):
+        from ergo.chain_arb import plan_bank_mint_pool_sell
+        from tests.test_mint_tx import ORACLE_BOX as MINT_ORACLE, bank_box as mint_bank
+        return plan_bank_mint_pool_sell(pool_box(sigusd_per_erg), mint_bank(), MINT_ORACLE, WALLET, erg_budget,
+                                        height=1_900_000, our_tree=OUR_TREE, ui_fee_tree=UI_TREE)
+
+    def test_leg2_spends_leg1_payout(self):
+        p = self.plan(0.30)
+        assert p["leg1_output_index"] == 2
+        assert p["leg2_tx"]["inputs"][1]["boxId"] == LEG1_OUTPUT_PLACEHOLDER
+        assert {a["tokenId"]: a["amount"] for a in p["leg1_output_box"]["assets"]}[SIGUSD] == p["sigusd_cents"]
+
+    def test_profit_is_pool_erg_minus_mint_cost_minus_fees(self):
+        p = self.plan(0.30)
+        expected = p["leg2_info"]["amount_out"] - p["leg2_info"]["miner_fee"] - p["leg1_info"]["cost_nanoerg"]
+        assert p["profit_nanoerg"] == expected
+
+    def test_sigusd_premium_on_pool_profits(self):
+        # bank mints at ~0.3226 USD/ERG minus 2.2%; pool buys SigUSD at 0.30 per ERG -> ~5% premium
+        assert self.plan(0.30)["profit_percent"] > 1
+
+    def test_sigusd_discount_on_pool_loses(self):
+        assert self.plan(0.35)["profit_nanoerg"] < 0
+
+    def test_both_legs_pass_guard(self):
+        from tests.test_mint_tx import bank_box as mint_bank
+        p = self.plan(0.30)
+        verify_unsigned_tx(p["leg1_tx"], [mint_bank()] + p["leg1_info"]["user_boxes"], {OUR_TREE}, p["leg1_policy"])
+        verify_unsigned_tx(p["leg2_tx"], [pool_box(0.30), p["leg1_output_box"]], {OUR_TREE}, p["leg2_policy"])

@@ -7,7 +7,7 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py swap   --sell sigusd --amount all         --execute
     python arb.py redeem --sigusd all                       --execute
     python arb.py send   --to 9f... --erg 1.5 [--sigusd 2]  --execute
-    python arb.py arb    --erg 10                           [--check | --execute] [--force]
+    python arb.py arb    --erg 10 [--path redeem|mint]      [--check | --execute] [--force]
 """
 import argparse
 import asyncio
@@ -55,8 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--sigusd", type=float, default=0.0)
     _mode_flags(se)
 
-    a = sub.add_parser("arb", help="two-leg arbitrage: pool buy -> bank redeem")
-    a.add_argument("--erg", type=float, required=True)
+    a = sub.add_parser("arb", help="two-leg arbitrage: pool buy -> bank redeem, or bank mint -> pool sell")
+    a.add_argument("--erg", type=float, required=True, help="ERG for leg 1 (the mint budget for --path mint)")
+    a.add_argument("--path", choices=["redeem", "mint"], default="redeem",
+                   help="redeem: pool buy -> bank redeem (default); mint: bank mint -> pool sell")
     a.add_argument("--force", action="store_true", help="execute even below MIN_PROFIT_PERCENT (testing)")
     _mode_flags(a)
     return parser
@@ -87,7 +89,7 @@ async def run(args):
                 return
             await actions.send(ns, args.to, args.erg, args.sigusd, mode, log)
         elif args.command == "arb":
-            await actions.arb(ns, args.erg, mode, args.force, log)
+            await actions.arb(ns, args.erg, mode, args.force, log, path=args.path)
 
 
 def main(argv=None):

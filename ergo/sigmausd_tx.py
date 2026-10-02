@@ -93,3 +93,80 @@ def build_redeem_tx(bank_box: dict, oracle_box: dict, wallet_boxes: list[dict], 
         "user_receives": user_receives, "miner_fee": MINER_FEE, "user_boxes": user_boxes,
     }
     return tx, info
+
+
+def build_mint_tx(bank_box: dict, oracle_box: dict, wallet_boxes: list[dict], cents: int,
+                  height: int, our_tree: str, ui_fee_tree: str) -> tuple[dict, dict]:
+    """Unsigned TX minting `cents` SigUSD (bank.es exchange branch, scCircDelta > 0).
+
+    Raises ValueError if the post-mint reserve ratio would be below 400%.
+    """
+    from exchanges.sigmausd import can_mint_sigusd
+
+    sigusd_circ = register_int(bank_box, "R4")
+    sigrsv_circ = register_int(bank_box, "R5")
+    state = BankState(int(bank_box["value"]), sigusd_circ, register_int(oracle_box, "R4"))
+    if cents <= 0:
+        raise ValueError("mint amount must be positive")
+    if not can_mint_sigusd(state, cents):
+        raise ValueError(f"mint blocked: reserve ratio after minting would be below 400% "
+                         f"(now {state.reserve_ratio:.0f}%)")
+
+    br_delta_expected = state.nominal_price() * cents
+    fee = abs(br_delta_expected * PROTOCOL_FEE_PERCENT // 100)
+    bc_delta = br_delta_expected + fee  # ERG into the bank
+    ui_fee = ui_fee_nanoerg(bc_delta)
+
+    user_boxes = select_boxes(wallet_boxes, None, 0,
+                              min_erg=bc_delta + ui_fee + MINER_FEE + RECEIPT_BOX_VALUE + RECEIPT_BOX_VALUE)
+    user_erg = sum(int(b["value"]) for b in user_boxes)
+    user_assets = sum_assets(user_boxes)
+    user_assets[config.SIGUSD_TOKEN_ID] = user_assets.get(config.SIGUSD_TOKEN_ID, 0) + cents
+
+    bank_assets = []
+    for a in bank_box["assets"]:
+        amount = int(a["amount"]) - (cents if a["tokenId"] == config.SIGUSD_TOKEN_ID else 0)
+        bank_assets.append({"tokenId": a["tokenId"], "amount": amount})
+
+    outputs = [
+        {   # 0: bank box, ERG in, SigUSD out
+            "value": int(bank_box["value"]) + bc_delta,
+            "ergoTree": bank_box["ergoTree"],
+            "assets": bank_assets,
+            "additionalRegisters": {"R4": encode_slong(sigusd_circ + cents), "R5": encode_slong(sigrsv_circ)},
+            "creationHeight": height,
+        },
+        {   # 1: receipt box (scCircDelta, bcReserveDelta)
+            "value": RECEIPT_BOX_VALUE,
+            "ergoTree": our_tree,
+            "assets": [],
+            "additionalRegisters": {"R4": encode_slong(cents), "R5": encode_slong(bc_delta)},
+            "creationHeight": height,
+        },
+        {   # 2: minted SigUSD + change
+            "value": user_erg - bc_delta - ui_fee - MINER_FEE - RECEIPT_BOX_VALUE,
+            "ergoTree": our_tree,
+            "assets": [{"tokenId": t, "amount": a} for t, a in user_assets.items() if a > 0],
+            "additionalRegisters": {},
+            "creationHeight": height,
+        },
+        {   # 3: UI fee
+            "value": ui_fee, "ergoTree": ui_fee_tree, "assets": [], "additionalRegisters": {},
+            "creationHeight": height,
+        },
+        {   # 4: miner fee
+            "value": MINER_FEE, "ergoTree": MINER_FEE_TREE, "assets": [], "additionalRegisters": {},
+            "creationHeight": height,
+        },
+    ]
+    tx = {
+        "inputs": [{"boxId": bank_box["boxId"], "extension": {}}]
+                  + [{"boxId": b["boxId"], "extension": {}} for b in user_boxes],
+        "dataInputs": [{"boxId": oracle_box["boxId"]}],
+        "outputs": outputs,
+    }
+    info = {
+        "state": state, "cents": cents, "bc_delta": bc_delta, "protocol_fee": fee, "ui_fee": ui_fee,
+        "miner_fee": MINER_FEE, "cost_nanoerg": bc_delta + ui_fee + MINER_FEE, "user_boxes": user_boxes,
+    }
+    return tx, info

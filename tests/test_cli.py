@@ -68,6 +68,14 @@ class TestBalance:
         assert "RR 330%" in text and "mint blocked" in text
 
 
+def test_arb_path_option():
+    p = build_parser()
+    assert p.parse_args(["arb", "--erg", "10"]).path == "redeem"
+    assert p.parse_args(["arb", "--erg", "10", "--path", "mint", "--check"]).path == "mint"
+    with pytest.raises(SystemExit):
+        p.parse_args(["arb", "--erg", "10", "--path", "sideways"])
+
+
 def test_balance_lines_flag_stale_entries():
     lines = balance_lines(confirmed={"erg": 20.7119, "sigusd": 0}, unconfirmed={"erg": 20.7119, "sigusd": 0},
                           oracle_usd_per_erg=0.3274, pool_sigusd_per_erg=0.31, reserve_ratio=333.0,

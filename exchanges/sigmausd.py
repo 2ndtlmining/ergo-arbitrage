@@ -97,11 +97,12 @@ def can_mint_sigusd(state: BankState, cents: int) -> bool:
     """True if minting `cents` SigUSD keeps the post-mint RR >= 400%."""
     if cents <= 0 or state.rate <= 0:
         return False
+    # bank.es: reserveRatioPercentOut = bcReserveOut * 100 / (scCircOut * rate)
     bank_out = state.bank_erg_nano + _mint_bc_delta(state, cents)
-    liabilities_out = min(bank_out, (state.sigusd_circ_cents + cents) * state.rate)
-    if liabilities_out <= 0:
+    needed_out = (state.sigusd_circ_cents + cents) * state.rate
+    if needed_out <= 0:
         return True
-    return bank_out * 100 // liabilities_out >= MIN_RESERVE_RATIO
+    return bank_out * 100 // needed_out >= MIN_RESERVE_RATIO
 
 
 def _max_true(lo: int, hi: int, pred) -> int:

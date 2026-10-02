@@ -8,7 +8,9 @@ in the same block. If leg 2 fails, the wallet simply holds leg 1's output
 """
 import config
 from ergo.pool_swap import build_pool_swap_tx
-from ergo.sigmausd_tx import build_redeem_tx
+from ergo.sigmausd_tx import build_mint_tx, build_redeem_tx
+from exchanges.sigmausd import BankState, affordable_mint_cents
+from ergo.sigmausd_tx import register_int
 from ergo.tx_guard import SignPolicy
 
 LEG1_OUTPUT_PLACEHOLDER = "<leg1-output>"  # box id is only known once leg 1 is signed
@@ -68,9 +70,52 @@ def plan_pool_buy_redeem(pool_box: dict, bank_box: dict, oracle_box: dict, walle
         "leg1_tx": leg1_tx, "leg1_info": leg1_info,
         "leg1_policy": SignPolicy(max_erg_spent=erg_in + leg1_info["miner_fee"],
                                   min_received={config.SIGUSD_TOKEN_ID: cents}, max_service_fee=0),
-        "leg1_output_box": leg1_output,
+        "leg1_output_box": leg1_output, "leg1_output_index": 1,
         "leg2_tx": leg2_tx, "leg2_info": leg2_info, "leg2_policy": leg2_policy,
         "sigusd_cents": cents,
         "profit_nanoerg": profit,
         "profit_percent": profit / erg_in * 100 if erg_in else 0.0,
+    }
+
+
+def build_pool_sell_leg(pool_box: dict, leg1_output: dict, cents: int, height: int,
+                        our_tree: str) -> tuple[dict, dict, SignPolicy]:
+    """Leg 2 of the mint path: sell `cents` SigUSD from leg 1's output on the pool."""
+    tx, info = build_pool_swap_tx(pool_box, [leg1_output], config.SIGUSD_TOKEN_ID, sell_erg=False,
+                                  amount_in=cents, height=height, our_tree=our_tree)
+    policy = SignPolicy(max_erg_spent=0, max_token_spent={config.SIGUSD_TOKEN_ID: cents},
+                        min_erg_received=info["amount_out"] - info["miner_fee"], max_service_fee=0)
+    return tx, info, policy
+
+
+def plan_bank_mint_pool_sell(pool_box: dict, bank_box: dict, oracle_box: dict, wallet_boxes: list[dict],
+                             erg_budget: int, *, height: int, our_tree: str, ui_fee_tree: str) -> dict:
+    """Plan: mint as much SigUSD as `erg_budget` nanoERG buys at the bank, then sell it on the pool.
+
+    Profit = ERG from the pool - leg 2 miner fee - mint cost (bank + UI fee + leg 1 miner fee).
+    """
+    state = BankState(int(bank_box["value"]), register_int(bank_box, "R4"), register_int(oracle_box, "R4"))
+    cents = affordable_mint_cents(state, erg_budget)
+    if cents <= 0:
+        raise ValueError("budget too small to mint any SigUSD")
+    leg1_tx, leg1_info = build_mint_tx(bank_box, oracle_box, wallet_boxes, cents, height=height,
+                                       our_tree=our_tree, ui_fee_tree=ui_fee_tree)
+    sim = dict(leg1_tx["outputs"][2])
+    sim.pop("creationHeight", None)
+    leg1_output = {"boxId": LEG1_OUTPUT_PLACEHOLDER, **sim}
+
+    leg2_tx, leg2_info, leg2_policy = build_pool_sell_leg(pool_box, leg1_output, cents, height, our_tree)
+    cost = leg1_info["cost_nanoerg"]
+    profit = leg2_info["amount_out"] - leg2_info["miner_fee"] - cost
+    return {
+        "leg1_tx": leg1_tx, "leg1_info": leg1_info,
+        "leg1_policy": SignPolicy(max_erg_spent=cost, min_received={config.SIGUSD_TOKEN_ID: cents},
+                                  max_service_fee=leg1_info["ui_fee"],
+                                  service_fee_trees=frozenset({ui_fee_tree})),
+        "leg1_output_box": leg1_output, "leg1_output_index": 2,
+        "leg2_tx": leg2_tx, "leg2_info": leg2_info, "leg2_policy": leg2_policy,
+        "sigusd_cents": cents,
+        "erg_in": cost,
+        "profit_nanoerg": profit,
+        "profit_percent": profit / cost * 100,
     }
