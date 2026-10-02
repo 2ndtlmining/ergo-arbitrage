@@ -267,8 +267,18 @@ python execute_bank_redeem.py --sigusd 1.0 --execute  # sign and submit
 python execute_swap_sigusd_to_erg.py --execute
 ```
 
+`execute_pool_swap.py` swaps directly against the ErgoDEX pool box, with no Crux service
+fee (~0.76 ERG saved per swap). `--check` signs the TX and has your node validate it,
+including the pool contract, without broadcasting:
+
+```bash
+python execute_pool_swap.py --sell erg --amount 1 --check
+python execute_pool_swap.py --sell sigusd --amount 0.5 --execute
+```
+
 | Script | Direction | Status | TX Proof |
 |--------|-----------|--------|----------|
+| `execute_pool_swap.py` | ERG <-> SigUSD (direct pool spend, no Crux fee) | NEW: dry run / `--check` first | - |
 | `execute_swap_use.py` | ERG -> USE (Crux mint) | TESTED LIVE | Confirmed on-chain |
 | `execute_swap_use_to_erg.py` | USE -> ERG (Crux LP) | TESTED LIVE | TX `bf544106...` |
 | `execute_swap_erg_to_use_lp.py` | ERG -> USE (Crux LP) | TESTED LIVE | TX `e2582256...` |
