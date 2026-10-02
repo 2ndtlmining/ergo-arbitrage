@@ -100,6 +100,11 @@ class DiscordNotifier:
             logger.error(f"Discord webhook error: {e}")
             return False
 
+    async def notify_live(self, text: str, ping: bool = True) -> bool:
+        """Live-trading event (trade executed, failure, pause)."""
+        prefix = f"{self._ping()} " if ping and self._ping() else ""
+        return await self._send(f"{prefix}**LIVE**: {text}")
+
     async def notify_watch(self, exchange: str, text: str) -> bool:
         """Watch-only CEX gap alert, at most once per CEX_WATCH_COOLDOWN_SECONDS per exchange."""
         key = f"watch:{exchange}"

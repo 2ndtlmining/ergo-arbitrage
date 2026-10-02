@@ -252,6 +252,26 @@ ergo_arbitrage/
 └── execute_*.py            # Standalone swap execution scripts (tested live)
 ```
 
+### Live mode (`python main.py --live`)
+
+Live mode executes **pool buy -> bank redeem** (the same code as `execute_arb.py --execute`)
+at the best size found by the optimizer, only when every check passes:
+
+| Check | Setting (default) |
+|---|---|
+| Profitable at its best size | `MIN_PROFIT_PERCENT` (0.5) |
+| ...for N scans in a row | `LIVE_CONFIRM_SCANS` (3) |
+| Size capped | `MAX_TRADE_SIZE_ERG`, wallet minus `LIVE_ERG_RESERVE` (1) |
+| Node synced and wallet unlocked | checked before each trade |
+| Kill switch file absent | `LIVE_STOP_FILE` (`STOP`) |
+| Wallet value drawdown since start | `LIVE_MAX_DRAWDOWN_ERG` (5) |
+| Time since last trade | `LIVE_TRADE_COOLDOWN_SECONDS` (300) |
+| Trades today | `LIVE_MAX_TRADES_PER_DAY` (10) |
+
+Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 failure or a
+TX-guard refusal pauses live trading until restart and is sent to Discord with the redeem
+command to finish.
+
 ### Execution Scripts
 
 Every script builds the transaction, checks it with the TX guard (`ergo/tx_guard.py`) and

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import time
 from datetime import datetime
@@ -24,6 +25,7 @@ from exchanges.sigmausd import (
 )
 from exchanges.ergo_node import ErgoNodeClient
 from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
+from ergo.arb_runner import run_pool_buy_redeem
 from arbitrage.optimizer import maximize
 from arbitrage.calculator import (
     ArbitrageCalculator,
@@ -37,6 +39,8 @@ from notifications.discord import DiscordNotifier
 from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
+
+LIVE_PATH = "Spectrum buy->Bank redeem"  # the only path --live can execute (ergo/arb_runner.py)
 
 # Minimum balance per asset before the wallet analysis is worth showing
 WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "use": (0.01, "USE", ".3f")}
@@ -77,6 +81,12 @@ class ArbitrageScanner:
         self._stop = asyncio.Event()
         self.node_health: dict = {}
         self.last_optima: dict[str, ArbitrageOpportunity] = {}
+        # --live state
+        self._live_streak: dict[str, int] = {}
+        self._live_paused: Optional[str] = None
+        self._last_trade_time = 0.0
+        self._trades_today: tuple[str, int] = ("", 0)
+        self._live_start_value: Optional[float] = None
         self._kucoin_usdt_fee: float = 1.0
 
     @property
@@ -1021,30 +1031,101 @@ class ArbitrageScanner:
             streak_info = ", ".join(f"{k}: {v}" for k, v in active_streaks.items())
             logger.info(f"Streaks: {streak_info}")
 
-    async def _execute_trades(self, opportunities: list[ArbitrageOpportunity]):
-        """Execute trades for profitable opportunities (--live mode only)."""
+    def _update_live_streak(self):
+        """Consecutive scans in which the executable path is profitable at its best size."""
+        opt = self.last_optima.get(LIVE_PATH)
+        ok = bool(opt and not opt.blocked and opt.profit_erg > 0
+                  and opt.profit_percent >= config.MIN_PROFIT_PERCENT)
+        self._live_streak[LIVE_PATH] = self._live_streak.get(LIVE_PATH, 0) + 1 if ok else 0
+
+    @staticmethod
+    def _wallet_value_erg(wallet: dict, prices: dict) -> float:
+        oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+        sigusd_erg = wallet.get("sigusd", 0) / oracle if oracle else 0.0
+        return wallet.get("erg", 0) + sigusd_erg
+
+    def _live_size(self, opt: Optional[ArbitrageOpportunity], wallet: dict) -> float:
+        best = opt.input_erg if opt else 0.0
+        return max(0.0, min(best, config.MAX_TRADE_SIZE_ERG, wallet.get("erg", 0) - config.LIVE_ERG_RESERVE))
+
+    def _trades_today_count(self) -> int:
+        today = datetime.now().strftime("%Y-%m-%d")
+        return self._trades_today[1] if self._trades_today[0] == today else 0
+
+    async def _live_blockers(self, wallet: dict, prices: dict) -> list[str]:
+        """Every reason live trading would not execute right now (empty list = ready)."""
+        blockers = []
+        opt = self.last_optima.get(LIVE_PATH)
+        if not opt or opt.blocked or opt.profit_erg <= 0 or opt.profit_percent < config.MIN_PROFIT_PERCENT:
+            best = f"{opt.profit_percent:+.2f}% at {opt.input_erg:g} ERG" if opt else "no data"
+            blockers.append(f"no profit >= {config.MIN_PROFIT_PERCENT}% (best {best})")
+        streak = self._live_streak.get(LIVE_PATH, 0)
+        if streak < config.LIVE_CONFIRM_SCANS:
+            blockers.append(f"profitable {streak}/{config.LIVE_CONFIRM_SCANS} scans in a row")
+        if os.path.exists(config.LIVE_STOP_FILE):
+            blockers.append(f"STOP file present ({config.LIVE_STOP_FILE})")
+        if self._live_paused:
+            blockers.append(f"paused after: {self._live_paused} (restart to resume)")
+        value = self._wallet_value_erg(wallet, prices)
+        if self._live_start_value is None:
+            self._live_start_value = value
+        elif self._live_start_value - value > config.LIVE_MAX_DRAWDOWN_ERG:
+            blockers.append(f"drawdown {self._live_start_value - value:.2f} ERG > LIVE_MAX_DRAWDOWN_ERG "
+                            f"{config.LIVE_MAX_DRAWDOWN_ERG:g}")
+        wait = config.LIVE_TRADE_COOLDOWN_SECONDS - (time.time() - self._last_trade_time)
+        if self._last_trade_time and wait > 0:
+            blockers.append(f"cooldown {wait:.0f}s")
+        if self._trades_today_count() >= config.LIVE_MAX_TRADES_PER_DAY:
+            blockers.append(f"max {config.LIVE_MAX_TRADES_PER_DAY} trades per day reached")
+        size = self._live_size(opt, wallet)
+        if size < config.MIN_TRADE_SIZE_ERG:
+            blockers.append(f"wallet too small: {wallet.get('erg', 0):.2f} ERG minus {config.LIVE_ERG_RESERVE:g} reserve")
+        health = await self.ergo_node.get_health()
+        if not health.get("ok_to_trade"):
+            blockers.append(f"node not ready (synced={health.get('synced')}, unlocked={health.get('unlocked')})")
+        return blockers
+
+    async def _execute_trades(self, wallet: dict, prices: dict):
+        """--live: run pool buy -> bank redeem at the best size when every check passes."""
         if not self.trading_enabled:
             return
-
-        profitable = [o for o in opportunities if o.is_profitable and not o.blocked and o.risk_adjusted_profitable]
-        if not profitable:
+        blockers = await self._live_blockers(wallet, prices)
+        if blockers:
+            console.print(f"  [dim]LIVE: not trading - {'; '.join(blockers)}[/dim]")
             return
 
-        best = max(profitable, key=lambda x: x.profit_percent)
-        path_name = best.path_key
+        opt = self.last_optima[LIVE_PATH]
+        size = self._live_size(opt, wallet)
+        console.print(Panel(f"[bold red]LIVE: executing {LIVE_PATH} with {size:g} ERG "
+                            f"(planned {opt.profit_percent:+.2f}%)[/bold red]", border_style="red"))
+        trade_id = self.tracker.start_trade(None, size, size + opt.profit_erg * size / opt.input_erg,
+                                            opt.profit_erg * size / opt.input_erg)
+        result = await run_pool_buy_redeem(self.ergo_node.session, int(round(size * 1e9)),
+                                           execute=True, log=lambda m: console.print(m))
+        self._last_trade_time = time.time()
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._trades_today = (today, self._trades_today_count() + 1)
 
-        # TODO: Wire up actual execution per path
-        logger.warning(
-            f"LIVE MODE: Would execute {path_name} with {best.input_erg:.0f} ERG "
-            f"(+{best.profit_percent:.2f}%) - NOT YET IMPLEMENTED"
-        )
-        console.print(Panel(
-            f"[bold yellow]LIVE MODE: Trade execution not yet implemented\n"
-            f"Path: {path_name}\n"
-            f"Size: {best.input_erg:.0f} ERG | Profit: +{best.profit_erg:.4f} ERG[/bold yellow]",
-            title="Trade Execution (pending implementation)",
-            border_style="yellow",
-        ))
+        profit = result.profit_nanoerg / 1e9
+        if result.status == "executed":
+            self.tracker.complete_trade(trade_id, actual_output=size + profit, fee_paid_erg=0.0022,
+                                        tx_ids=[result.tx1, result.tx2], notes="expected (pre-confirmation)")
+            msg = (f"executed {size:g} ERG pool buy -> bank redeem, expected {profit:+.4f} ERG "
+                   f"({result.profit_percent:+.2f}%). Leg 1 {result.tx1}, leg 2 {result.tx2}")
+        elif result.status == "leg2_failed":
+            self._live_paused = f"leg 2 failed ({result.message})"
+            self.tracker.fail_trade(trade_id, result.message, notes=f"leg 1 {result.tx1}; holding SigUSD")
+            msg = (f"LEG 2 FAILED after leg 1 ({result.tx1}): {result.message}. Holding "
+                   f"{result.sigusd_cents / 100:.2f} SigUSD. Live trading paused. Finish with: "
+                   f"{result.recover_command}")
+        else:
+            if result.status == "refused":
+                self._live_paused = f"TX guard refused ({result.message})"
+            self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes="nothing spent")
+            msg = f"did not execute ({result.status}): {result.message or 'see console'}. Nothing was spent."
+        logger.warning(f"LIVE {msg}")
+        if self.discord_enabled:
+            await self.discord.notify_live(msg, ping=result.status != "not_profitable")
 
     async def _fetch_wallet_balances(self) -> dict:
         """Fetch current wallet balances."""
@@ -1527,6 +1608,7 @@ class ArbitrageScanner:
         self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
+        self._update_live_streak()
         self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
         self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities, prices)
@@ -1558,7 +1640,7 @@ class ArbitrageScanner:
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
 
-        await self._execute_trades(opportunities)
+        await self._execute_trades(wallet, prices)
 
         profitable_count = sum(1 for o in opportunities if o.is_profitable and not o.blocked)
         self.tracker.update_daily_summary(profitable_count)

@@ -143,6 +143,14 @@ DISCORD_WALLET_COOLDOWN_SECONDS = int(os.getenv("DISCORD_WALLET_COOLDOWN_SECONDS
 DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
+# --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
+LIVE_CONFIRM_SCANS = int(os.getenv("LIVE_CONFIRM_SCANS", "3"))            # profitable N scans in a row
+LIVE_TRADE_COOLDOWN_SECONDS = int(os.getenv("LIVE_TRADE_COOLDOWN_SECONDS", "300"))
+LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
+LIVE_MAX_DRAWDOWN_ERG = float(os.getenv("LIVE_MAX_DRAWDOWN_ERG", "5"))     # stop if wallet value falls this much
+LIVE_ERG_RESERVE = float(os.getenv("LIVE_ERG_RESERVE", "1"))               # ERG always kept in the wallet
+LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "STOP")                      # kill switch: no trades while it exists
+
 # Tracker: non-profitable scan rows older than this are deleted at startup
 SCAN_RESULTS_RETENTION_DAYS = int(os.getenv("SCAN_RESULTS_RETENTION_DAYS", "14"))
 
