@@ -21,6 +21,7 @@ load_dotenv()
 import config
 from ergo.chain import find_box_id, node_box, wallet_context
 from ergo.pool_swap import build_pool_swap_tx
+from ergo.progress import wait_confirmed
 from ergo.signing import DryRun, check_on_node, guarded_sign
 from ergo.tx_guard import SignPolicy, TxGuardError
 
@@ -101,6 +102,7 @@ async def main(sell: str, amount: float, execute: bool, check: bool):
                 return
         tx_id = signed.get("id", "?")
         print(f"  Submitted: https://explorer.ergoplatform.com/en/transactions/{tx_id}")
+        await wait_confirmed(ns, tx_id, log=print)
 
 
 if __name__ == "__main__":

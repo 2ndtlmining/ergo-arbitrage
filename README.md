@@ -252,6 +252,22 @@ ergo_arbitrage/
 └── execute_*.py            # Standalone swap execution scripts (tested live)
 ```
 
+### Wallet tool (`python arb.py ...`)
+
+One command for everyday actions. Every action explains each step, is a **dry run by
+default**, `--check` signs and has your node validate it without broadcasting, and
+`--execute` sends it and then reports block by block until it confirms.
+
+```bash
+python arb.py balance                                   # ERG, SigUSD, value, pending, bank RR, SigUSD peg
+python arb.py quote  --sell sigusd --amount 10          # pool vs bank, which is better
+python arb.py swap   --sell erg    --amount 5           # direct pool swap, no service fee
+python arb.py swap   --sell sigusd --amount all --execute
+python arb.py redeem --sigusd all --execute             # SigUSD -> ERG at the bank
+python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the guard only allows that payee and amount
+python arb.py arb    --erg 10 --check                   # two-leg pool buy -> bank redeem
+```
+
 ### Live mode (`python main.py --live`)
 
 Live mode executes **pool buy -> bank redeem** (the same code as `execute_arb.py --execute`)

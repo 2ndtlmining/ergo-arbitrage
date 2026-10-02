@@ -54,6 +54,7 @@ SERVICE_FEE_ERGO_TREES = {
 # Ergo network fees
 ERGO_TX_FEE = 0.0011  # ERG
 ERGO_MIN_BOX_VALUE = 0.001  # ERG
+ERG_MIN_BOX_NANO = 1_000_000  # nanoERG kept in a change box that holds tokens
 
 # SigmaUSD Bank fees
 SIGMAUSD_PROTOCOL_FEE = 0.02  # 2% (stays in bank reserve)
