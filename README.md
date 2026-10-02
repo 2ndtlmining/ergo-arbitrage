@@ -21,7 +21,7 @@ The app continuously scans prices from multiple sources and calculates whether a
 
 The app connects to your Ergo node to:
 - Check wallet balances (ERG, SigUSD, USE tokens)
-- Sign and submit transactions (Phase 2 - execution)
+- Sign and submit transactions (live mode and the wallet tool)
 - Interact with smart contracts for DEX swaps and bank operations
 
 ## Modes
@@ -31,6 +31,17 @@ python main.py            # monitor: live dashboard, no notifications, no trades
 python main.py --notify   # + Discord alerts
 python main.py --live     # + auto-execute (see "Live mode" below)
 ```
+
+| | monitor (default) | `--notify` | `--live` |
+|---|---|---|---|
+| Dashboard, chain watcher (pool, bank, oracle every 2 s), SQLite log | ✓ | ✓ | ✓ |
+| Discord: opportunities, health alerts, daily digest | | ✓ | ✓ |
+| **Signs and sends transactions from your node wallet** | | | ✓ |
+
+`--notify` is the safe way to run the bot all the time: it watches and tells you, and never spends
+anything. `--live` does the same, and when a path passes every safety check (see **Live mode**) it
+executes the trade with your ERG. Start live mode with a small `--max-trade-erg` the first time
+(see **First live run**).
 
 The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+C quits):
 
@@ -216,17 +227,54 @@ DISCORD_DIGEST_HOUR=8                  # Local hour for the daily digest, -1 = o
 
 ### Prerequisites
 
-- Python 3.11+
-- An Ergo node with wallet (can be on a local VM)
-- NonKYC and/or Kucoin exchange accounts with API keys
-- (Optional) Discord webhook URL for notifications
+- Python 3.11+ (CI tests 3.11 and 3.12)
+- An Ergo node with a wallet (can be on a local VM), and its API key
+- (Optional) a Discord webhook URL for notifications
+- (Optional) NonKYC / Kucoin API keys. The bot is on-chain only by default (`ENABLE_CEX=false`);
+  the CEX prices are shown watch-only and need no keys.
 
 ### Installation
 
+Use a virtual environment (venv). Recent Ubuntu/Debian versions refuse a system-wide
+`pip install`, and a venv keeps the bot's packages separate from everything else. You create it
+once.
+
+**Linux** (on Ubuntu the command is `python3`; inside the venv it is plain `python`):
+
 ```bash
 cd ergo-arbitrage
+sudo apt install python3-venv        # only if the next line says venv is missing
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**Windows** (PowerShell):
+
+```powershell
+cd ergo-arbitrage
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+In every new terminal, activate the venv again (`source .venv/bin/activate`) before running the
+bot, or skip activation and call the venv's Python directly: `.venv/bin/python main.py --notify`
+(Windows: `.venv\Scripts\python main.py --notify`). A shell alias saves typing:
+
+```bash
+alias arb='cd ~/ergo-arbitrage && .venv/bin/python main.py'   # in ~/.bashrc, then: arb --notify
+```
+
+### Updating
+
+```bash
+# stop the bot first (Ctrl+C), then:
+git pull
+pip install -r requirements.txt      # inside the venv; only needed when requirements.txt changed
+```
+
+The tracker database (`arbitrage_tracker.db`) is not in git and is upgraded in place on start.
 
 ### Configuration
 
@@ -268,41 +316,48 @@ python main.py --notify     # + Discord
 python main.py --live       # + auto-execute
 python main.py --once --plain   # one scan, classic output
 
-# Run tests
-python -m pytest tests/ -v
+# Run tests (unit only; add -m live for the tests that call your node and public APIs)
+python -m pytest -q
 ```
 
 ## Project Structure
 
 ```
 ergo_arbitrage/
-├── .env                    # API keys (gitignored)
-├── .env.example            # Template for .env
-├── config.py               # Settings, fee constants, token IDs
-├── main.py                 # Entry point (monitor/notify/live)
-├── logging_config.py       # Rich console + file logging
-├── FLOWS.md                # Detailed swap flow reference
-├── exchanges/
-│   ├── base.py             # Abstract interfaces (CEXBase, DEXBase, RateLimiter)
-│   ├── nonkyc.py           # NonKYC exchange (REST + HMAC auth)
-│   ├── kucoin.py           # Kucoin exchange (REST + HMAC v2 auth)
-│   ├── spectrum.py         # Spectrum Finance DEX (AMM pools)
-│   ├── sigmausd.py         # SigmaUSD Bank (oracle + reserve ratio)
-│   └── ergo_node.py        # Ergo node wallet client
+├── .env / .env.example     # settings and secrets (.env is gitignored)
+├── config.py               # settings, fee constants, token IDs
+├── main.py                 # bot entry point (monitor / --notify / --live)
+├── arb.py                  # wallet tool: balance, quote, swap, redeem, send, arb
+├── logging_config.py       # rich console + rotating arbitrage.log
+├── FLOWS.md                # detailed swap flow reference
 ├── arbitrage/
-│   ├── scanner.py          # Main scan loop, grid display, streak tracking
-│   └── calculator.py       # Profit math with full fee breakdown
+│   ├── scanner.py          # full scans + 2 s chain poll, live gate, Discord wiring
+│   ├── sizing.py           # exact trade sizing on the real pool/bank/oracle boxes
+│   ├── optimizer.py        # size search helpers
+│   ├── calculator.py       # fee-aware profit math for the full-scan paths
+│   ├── venues.py           # venue status rows (pool, bank, oracle, CEX)
+│   ├── dashboard_state.py  # what the dashboard and --json show
+│   └── dashboard_view.py   # rich dashboard layout
+├── ergo/
+│   ├── chain_state.py      # reads pool, bank and oracle boxes (mempool aware)
+│   ├── chain_arb.py        # two-leg arb transaction building
+│   ├── arb_runner.py       # executes an arb: leg 1, leg 2, recovery
+│   ├── pool_swap.py        # direct ErgoDEX pool swaps
+│   ├── sigmausd_tx.py      # bank mint / redeem transactions
+│   ├── tx_guard.py         # refuses any transaction that pays someone unexpected
+│   └── signing.py, wallet.py, chain.py, codec.py, amounts.py, actions.py, progress.py
+├── exchanges/              # price sources: ergo_node, spectrum, sigmausd, dexy, crux, kucoin, nonkyc
 ├── notifications/
-│   └── discord.py          # Discord webhook (tiers, cooldown, staleness guard)
+│   ├── discord.py          # webhook client, background send queue
+│   ├── embeds.py           # Discord embed layouts
+│   ├── episodes.py         # one message per on-chain opportunity
+│   ├── health.py           # health alerts and recoveries
+│   └── digest.py           # daily digest
 ├── tracker/
-│   └── profit_tracker.py   # SQLite DB: snapshots, opportunities, trades, stats
-├── tests/
-│   ├── conftest.py         # Pytest fixtures
-│   ├── test_calculator.py  # Unit tests for arbitrage math
-│   ├── test_pool_math.py   # Unit tests for AMM swap calculations
-│   ├── test_api_live.py    # Live API integration tests
-│   └── test_dex_node.py    # Node interaction tests
-└── execute_*.py            # Standalone swap execution scripts (tested live)
+│   └── profit_tracker.py   # SQLite: snapshots, opportunities, episodes, trades, stats
+├── tests/                  # pytest (unit by default; -m live for node/API tests)
+├── execute_*.py            # standalone swap scripts (dry run unless --execute)
+└── archive/                # retired scripts, kept for reference
 ```
 
 ### Wallet tool (`python arb.py ...`)
@@ -365,6 +420,23 @@ Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 
 TX-guard refusal pauses live trading until restart and is sent to Discord with the redeem
 command to finish.
 
+### First live run
+
+1. **Wallet unlocked.** Live mode signs with your node wallet. Unlock it in the node panel
+   (`http://YOUR_NODE_IP:9053/panel`) or with `POST /wallet/unlock` (body
+   `{"pass": "<wallet password>"}`, header `api_key`). The dashboard shows `wallet ●` when it is
+   unlocked, and live mode will not trade while it is locked.
+2. **Check the pieces without spending.** `python arb.py balance` shows what the bot will trade
+   with. `python arb.py arb --check` builds both legs at the best size, and your node validates
+   them without broadcasting.
+3. **Start small and watch.** `python main.py --live --max-trade-erg 5`. A trade only happens when
+   a path shows **GO** for `LIVE_CONFIRM_POLLS` polls; until then the Live panel lists why it is not
+   trading. Every trade, success or failure, is sent to Discord with a ping.
+4. **Kill switch.** Create a file named `STOP` in the bot folder (`touch STOP`, or
+   `New-Item STOP` on Windows) and no new trade starts; delete it to resume. Ctrl+C stops the bot.
+5. **If leg 2 fails**, you hold SigUSD and live trading pauses. The Discord message and the Live
+   panel give the exact command to finish (`python arb.py redeem --sigusd ... --execute`).
+
 ### Execution Scripts
 
 Every script builds the transaction, checks it with the TX guard (`ergo/tx_guard.py`) and
@@ -410,6 +482,9 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 - **opportunities** - Profitable opportunities with full fee breakdown
 - **trades** - Executed trades with timing, actual profit, and tx IDs
 - **daily_summary** - Aggregated daily stats
+- **opportunity_episodes** - Continuous runs of a profitable path, from the 15 s full scans
+- **chain_episodes** - The on-chain opportunities sent to Discord (opened, closed, peak, trade)
+- **meta** - Small key/value state, e.g. the date the last daily digest was sent
 
 ## Key Token IDs (Ergo Mainnet)
 
@@ -459,7 +534,7 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
 | Path | Route | Status | Blocker |
 |------|-------|--------|---------|
 | **E** | Crux mint USE -> Crux LP sell | BOTH LEGS WORK | Free mint availability |
-| **B** | Spectrum buy SigUSD -> Bank redeem | Bank redeem WORKS, Spectrum buy quote-only | Need live test Spectrum buy |
+| **B** | Pool buy SigUSD -> Bank redeem | Executed by `--live` (direct pool swap, then bank redeem) | First live trade pending
 | **C** | Mew buy SigUSD -> Crux sell | Both legs tested separately | High round-trip fees (~1.7 ERG) |
 | **A** | Bank mint SigUSD -> Spectrum sell | Neither leg executable | RR < 400% blocks mint |
 | **G** | CEX <> DEX cross-venue | Monitor only | SigUSD depeg, no exec code |
@@ -467,54 +542,24 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
 
 ---
 
-## Completed Features
+## Status and Roadmap
 
-- [x] Price monitoring across 6 venues (NonKYC, Kucoin, Spectrum, SigmaUSD Bank, Crux, Oracle)
-- [x] Arbitrage scanner with compact grid display (paths x trade sizes)
-- [x] Full fee accounting in all profit calculations
-- [x] Wallet-based analysis (what can you do with current holdings)
-- [x] Kucoin integration with rate limiting (25 req/s)
-- [x] NonKYC integration with rate limiting (10 req/s)
-- [x] ERG -> SigUSD swap via Mew Finance batcher (tested live)
-- [x] ERG -> USE mint via Crux Finance API (tested live)
-- [x] ERG -> USE swap via Crux LP (tested live)
-- [x] SigUSD -> ERG swap via Crux/Spectrum (tested live)
-- [x] USE -> ERG swap via Crux LP (tested live)
-- [x] SigUSD -> ERG bank redeem via direct EIP-15 contract TX (tested live)
-- [x] Stuck swap order recovery (via `inputsRaw` + `/utxo/byIdBinary`)
-- [x] SQLite tracking (price snapshots, opportunities, trades, daily stats)
-- [x] Discord notifications with anti-spam (streak confirmation, tier system, cooldowns)
-- [x] Wallet analysis to Discord (rate limited)
-- [x] Periodic summary heartbeat to Discord
-- [x] Price staleness guard (skip stale notifications)
+**Working today**
+- On-chain arbitrage between the ErgoDEX SigUSD/ERG pool and the SigmaUSD bank (pool buy -> bank
+  redeem, and bank mint -> pool sell while the reserve ratio allows minting), executed by `--live`
+  with direct pool swaps (no service fee), exact sizing and the TX guard
+- Chain watcher: pool, bank and oracle read from your node every 2 s, mempool aware
+- One-screen dashboard, plus `--plain` and `--json` views
+- Wallet tool `arb.py` (balance, quote, swap, redeem, send, arb), dry run by default
+- Discord: one message per opportunity, health alerts, daily digest, wallet analysis
+- SQLite tracking of prices, opportunities, episodes and trades
+- CEX prices (Kucoin, NonKYC), watch-only
 
----
+**Next**
+- First supervised `--live` trade with a small `--max-trade-erg`
+- Alert when the bank mint opens again (reserve ratio back above 400%): issue #39
 
-## Future Improvements
-
-### High Priority
-
-- [ ] **Wire `--live` mode execution**: Scanner currently has a placeholder. Need to call the tested execute_* scripts when scanner detects a confirmed, profitable opportunity.
-- [ ] **Live test Spectrum swap scripts**: `execute_swap_erg_to_sigusd_spectrum.py` and `execute_swap_sigusd_to_erg_spectrum.py` are quote-tested only. Need a small live test to confirm they work end-to-end.
-- [ ] **Build `exchanges/crux_finance.py` module**: Wrap `/dex/quote`, `/dex/swap`, `/dexy/build_mint_tx`, `/dexy/mint_status` into a proper exchange adapter instead of inline API calls in scanner.
-- [ ] **Build `exchanges/mew_finance.py` module**: Dynamic contract template discovery, correct box value calculation, swap order submission/monitoring, failed order recovery.
-- [x] ~~Fix hardcoded node URLs in execute_* scripts~~ - All scripts now read from `.env` via `os.getenv()`.
-
-### Medium Priority
-
-- [ ] **CEX trade execution**: Build NonKYC and Kucoin buy/sell execution (price monitoring already works, just need order placement).
-- [ ] **ERG withdrawal from CEX**: Automate withdrawal to node wallet after CEX trade.
-- [ ] **Make trade sizes configurable**: Currently hardcoded `[1, 5, 10, 25, 50, 100]` in scanner. Should be in config.
-- [ ] **Transaction monitoring**: After submitting a swap, poll for confirmation and report success/failure.
-- [ ] **Dry-run mode**: Simulate with real prices but no actual trades (for testing thresholds).
-- [ ] **Test SigUSD -> ERG via Mew Finance** (reverse swap, never tested).
-- [ ] **Initialize `_nonkyc_usdt_fee` / `_kucoin_usdt_fee` in `__init__`**: Currently set in `connect_all()`, which means accessing before connection uses `getattr` fallback.
-
-### Low Priority
-
-- [ ] **WebSocket price streaming**: NonKYC supports `wss://ws.nonkyc.io` for real-time prices instead of polling.
-- [ ] **Pool reserve queries**: For accurate slippage calculation based on actual pool depth.
-- [ ] **Dynamic contract fetching**: Mew Finance contracts change over time; auto-discover from recent batcher TXs.
-- [ ] **Integration tests**: End-to-end test of scanner lifecycle with mock data. Regression tests for Discord notification filtering (streak, tier, cooldown).
-- [ ] **Improve Path E calculation**: Currently assumes oracle price equals pool sell rate. Should use actual Crux LP quote for the sell leg.
-- [ ] **Add `analysis.get()` safety in `discord.py`**: `send_wallet_analysis` accesses `analysis[asset_key]` directly - could KeyError if analysis dict is incomplete.
+**Later** (details in the GitHub issues)
+- CEX paths: fix the profit math (#2, #3), then order placement and withdrawals
+- More price sources: Gate.io and MEXC (#40), MachinaFi (#12)
+- Faster scans (#8), a web dashboard with history charts (#16), a venue/leg architecture (#13)
