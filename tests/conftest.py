@@ -18,6 +18,8 @@ TEST_DEFAULTS = {
     "ENABLE_CEX": False,
     "ENABLE_USE": False,
     "POOL_SWAP_ROUTE": "direct",
+    "CEX_WATCH": False,
+    "CEX_WATCH_ALERT_PERCENT": 3.0,
 }
 
 

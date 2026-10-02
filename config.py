@@ -91,6 +91,11 @@ KUCOIN_ERG_WITHDRAW_FEE = 0.73  # ERG (confirmed via /api/v1/currencies/ERG)
 ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "yes")
 # USE paths are off by default: the USE LP was drained (Oct 2026) and a token migration is expected.
 ENABLE_USE = os.getenv("ENABLE_USE", "false").strip().lower() in ("1", "true", "yes")
+# Watch-only CEX prices (public endpoints, no API keys): show the gap to the on-chain pool
+# and alert when it is worth connecting an exchange. Never trades.
+CEX_WATCH = os.getenv("CEX_WATCH", "true").strip().lower() in ("1", "true", "yes")
+CEX_WATCH_ALERT_PERCENT = float(os.getenv("CEX_WATCH_ALERT_PERCENT", "3.0"))
+CEX_WATCH_COOLDOWN_SECONDS = int(os.getenv("CEX_WATCH_COOLDOWN_SECONDS", "3600"))
 
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))

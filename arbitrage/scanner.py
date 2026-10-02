@@ -53,7 +53,8 @@ def trade_sizes_for(max_trade_erg: float) -> list[float]:
 
 class ArbitrageScanner:
     def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db",
-                 enable_cex: Optional[bool] = None, enable_use: Optional[bool] = None):
+                 enable_cex: Optional[bool] = None, enable_use: Optional[bool] = None,
+                 cex_watch: Optional[bool] = None):
         """
         mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
         """
@@ -61,6 +62,8 @@ class ArbitrageScanner:
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
+        # Watch-only CEX prices; redundant when CEX trading paths are enabled
+        self.cex_watch = (config.CEX_WATCH if cex_watch is None else cex_watch) and not self.enable_cex
         self.nonkyc = NonKYCExchange()
         self.kucoin = KucoinExchange()
         self.spectrum = SpectrumDEX()
@@ -94,7 +97,7 @@ class ArbitrageScanner:
 
     async def connect_all(self):
         venues = [self.spectrum.connect(), self.sigmausd.connect(), self.ergo_node.connect()]
-        if self.enable_cex:
+        if self.enable_cex or self.cex_watch:
             venues += [self.nonkyc.connect(), self.kucoin.connect()]
         await asyncio.gather(*venues)
         self._crux_session = aiohttp.ClientSession()
@@ -131,7 +134,7 @@ class ArbitrageScanner:
             await self._crux_session.close()
             self._crux_session = None
         venues = [self.spectrum.disconnect()]
-        if self.enable_cex:
+        if self.enable_cex or self.cex_watch:
             venues += [self.nonkyc.disconnect(), self.kucoin.disconnect()]
         await asyncio.gather(
             *venues,
@@ -221,6 +224,14 @@ class ArbitrageScanner:
             self._price_timestamps["bank"] = now
         if use_lp is not None:
             self._price_timestamps["use"] = now
+
+        if self.cex_watch:
+            watch = await asyncio.gather(
+                self.kucoin.get_price("ERG/USDT"), self.nonkyc.get_price("ERG/USDT"), return_exceptions=True
+            )
+            results["cex_watch"] = {
+                name: q for name, q in zip(("Kucoin", "NonKYC"), watch) if q and not isinstance(q, Exception)
+            }
 
         nonkyc_ob = kucoin_ob = None
         if self.enable_cex:
@@ -658,6 +669,35 @@ class ArbitrageScanner:
                 ))
 
         return opportunities
+
+    def _cex_watch_gaps(self, prices: dict) -> list[dict]:
+        """Gap between each watched CEX and the on-chain pool price (1 SigUSD ~ $1)."""
+        pool = prices.get("spectrum_erg_sigusd")
+        gaps = []
+        if not pool:
+            return gaps
+        withdraw = {"Kucoin": config.KUCOIN_ERG_WITHDRAW_FEE, "NonKYC": config.NONKYC_ERG_WITHDRAW_FEE}
+        for name, q in (prices.get("cex_watch") or {}).items():
+            buy_cex = (pool - q.ask) / q.ask * 100 if q.ask else 0   # ERG cheaper on the CEX
+            sell_cex = (q.bid - pool) / pool * 100 if pool else 0    # ERG dearer on the CEX
+            if buy_cex >= sell_cex:
+                gap, how = buy_cex, f"ERG cheaper on {name} (ask ${q.ask:.4f}) than the on-chain pool ({pool:.4f} SigUSD)"
+            else:
+                gap, how = sell_cex, f"ERG dearer on {name} (bid ${q.bid:.4f}) than the on-chain pool ({pool:.4f} SigUSD)"
+            gaps.append({
+                "exchange": name,
+                "gap_percent": gap,
+                "alert": gap >= config.CEX_WATCH_ALERT_PERCENT,
+                "text": (f"{how}: {gap:+.2f}%. watch-only, assumes 1 SigUSD ~ $1, ignores the "
+                         f"{withdraw.get(name, 0)} ERG withdrawal fee and trading fees"),
+            })
+        return gaps
+
+    def _display_cex_watch(self, prices: dict):
+        for g in self._cex_watch_gaps(prices):
+            style = "bold yellow" if g["alert"] else "dim"
+            hint = " -> worth connecting?" if g["alert"] else ""
+            console.print(f"  [{style}]WATCH {g['exchange']}: {g['text']}{hint}[/{style}]")
 
     @staticmethod
     def _sigusd_premium_percent(prices: dict) -> Optional[float]:
@@ -1449,12 +1489,18 @@ class ArbitrageScanner:
         self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
         self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities, prices)
+        if self.cex_watch:
+            self._display_cex_watch(prices)
 
         # Wallet-based analysis
         wallet = await self._fetch_wallet_balances()
         self._display_wallet_opportunities(wallet, opportunities, prices)
 
         await self._notify_discord(opportunities)
+        if self.discord_enabled and self.cex_watch:
+            for g in self._cex_watch_gaps(prices):
+                if g["alert"]:
+                    await self.discord.notify_watch(g["exchange"], g["text"])
 
         # Send wallet analysis to Discord (rate limited)
         if self.discord_enabled and self._should_send_wallet_analysis(opportunities):
@@ -1543,7 +1589,8 @@ class ArbitrageScanner:
             f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s\n"
             f"Trade sizes monitored: {self._trade_sizes}\n"
             f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}"
-            f"{'' if self.enable_use else ', USE disabled (ENABLE_USE=false)'}\n"
+            f"{'' if self.enable_use else ', USE disabled (ENABLE_USE=false)'}"
+            f"{', CEX watch-only' if self.cex_watch else ''}\n"
             f"{discord_line}",
             title="Starting Up",
             border_style="red" if self.mode == "live" else "magenta",
