@@ -66,6 +66,19 @@ SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 SPECTRUM_POOL_FEE = 0.005  # 0.5% (995/1000) for SigUSD/ERG pool
 SPECTRUM_EXECUTION_FEE = 0.785  # ERG service fee (via Crux Finance routing)
 
+# How SigUSD pool legs are executed: "direct" = our own pool-box swap (execute_pool_swap.py,
+# miner fee only), "crux" = Crux /dex/swap (adds SPECTRUM_EXECUTION_FEE per leg).
+POOL_SWAP_ROUTE = os.getenv("POOL_SWAP_ROUTE", "direct").strip().lower()
+
+
+def pool_service_fee() -> float:
+    """Service fee per SigUSD pool leg for the configured route."""
+    return SPECTRUM_EXECUTION_FEE if POOL_SWAP_ROUTE == "crux" else 0.0
+
+
+def pool_fee_text() -> str:
+    return f"-{SPECTRUM_EXECUTION_FEE} ERG Crux service fee" if POOL_SWAP_ROUTE == "crux" else "direct pool swap, no service fee"
+
 # NonKYC fees (will be fetched dynamically, these are fallback defaults)
 NONKYC_TRADING_FEE = 0.002  # 0.2% maker/taker (verify via API)
 NONKYC_ERG_WITHDRAW_FEE = 3.3  # ERG (confirmed via /asset/info)
