@@ -66,10 +66,6 @@ def test_times_out_while_pending():
     assert status == "timeout"
 
 
-def test_leg1_output_gone_stops():
-    s = Script(["leg1_output_spent"])
-    status, _ = run(watch_leg2("tx2", s.get_status, s.rebuild, timeout=5, interval=0, max_rebuilds=3, log=lambda m: None))
-    assert status == "leg1_output_spent" and s.rebuilds == 0
 
 
 class _Resp:
@@ -87,26 +83,35 @@ class _Resp:
 
 
 class _Node:
-    def __init__(self, wallet=None, mempool=False, leg1_unspent=True):
-        self.wallet, self.mempool, self.leg1_unspent = wallet, mempool, leg1_unspent
+    """wallet: wallet tx json or None; leg1_visible: leg 1 output shown by /utxo/withPool (not spent in mempool)."""
+
+    def __init__(self, wallet=None, leg1_visible=False):
+        self.wallet, self.leg1_visible = wallet, leg1_visible
 
     def get(self, url, **kw):
         if "/wallet/transactionById" in url:
             return _Resp(200, self.wallet) if self.wallet is not None else _Resp(404)
-        if "/transactions/unconfirmed/byTransactionId/" in url:
-            return _Resp(200 if self.mempool else 404)
         if "/utxo/withPool/byId/leg1box" in url:
-            return _Resp(200 if self.leg1_unspent else 404)
+            return _Resp(200 if self.leg1_visible else 404)
         raise AssertionError(url)
 
 
-@pytest.mark.parametrize("node,expected", [
-    (_Node(wallet={"numConfirmations": 1}), "confirmed"),
-    (_Node(wallet={"numConfirmations": 0}, mempool=True), "pending"),
-    (_Node(mempool=True), "pending"),
-    (_Node(), "dropped"),
-    (_Node(leg1_unspent=False), "leg1_output_spent"),
+class _Explorer:
+    def __init__(self, confirmed):
+        self.confirmed = confirmed
+
+    def get(self, url, **kw):
+        assert url.endswith("/transactions/tx2")
+        return _Resp(200 if self.confirmed else 404)
+
+
+@pytest.mark.parametrize("node,explorer,expected", [
+    (_Node(wallet={"numConfirmations": 1}), _Explorer(False), "confirmed"),
+    (_Node(), _Explorer(True), "confirmed"),                       # wallet lagging, explorer has it
+    (_Node(wallet={"numConfirmations": 0}), _Explorer(False), "pending"),  # leg 1 output hidden: spent in mempool
+    (_Node(), _Explorer(False), "pending"),
+    (_Node(leg1_visible=True), _Explorer(False), "dropped"),       # leg 1 output back: leg 2 left the mempool
 ])
-def test_leg2_status_from_node(node, expected):
+def test_leg2_status_from_node(node, explorer, expected):
     from ergo.arb_runner import _leg2_status
-    assert run(_leg2_status(node, "tx2", "leg1box")) == expected
+    assert run(_leg2_status(node, "tx2", "leg1box", explorer)) == expected

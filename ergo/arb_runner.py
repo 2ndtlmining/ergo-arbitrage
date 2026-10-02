@@ -35,16 +35,16 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
                      max_rebuilds: int, log: Callable[[str], None]) -> tuple[str, str]:
     """Follow leg 2 until confirmed; rebuild it when it drops out of the mempool.
 
-    get_status(tx_id) -> "confirmed" | "pending" | "dropped" | "leg1_output_spent"
+    get_status(tx_id) -> "confirmed" | "pending" | "dropped"
     rebuild() -> new tx id (built on fresh bank/oracle boxes); may raise.
-    Returns (status, tx_id): confirmed | gave_up | timeout | leg1_output_spent.
+    Returns (status, tx_id): confirmed | gave_up | timeout.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     rebuilds = 0
     while True:
         status = await get_status(tx_id)
-        if status in ("confirmed", "leg1_output_spent"):
+        if status == "confirmed":
             return status, tx_id
         if status == "dropped":
             if rebuilds >= max_rebuilds:
@@ -62,18 +62,26 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
         await asyncio.sleep(interval)
 
 
-async def _leg2_status(ns, tx_id: str, leg1_box_id: str) -> str:
+async def _leg2_status(ns, tx_id: str, leg1_box_id: str, explorer=None) -> str:
+    """confirmed | pending | dropped, for leg 2 spending leg 1's output `leg1_box_id`.
+
+    /utxo/withPool hides boxes spent by mempool transactions, so leg 1's output
+    being visible again means leg 2 left the mempool (dropped); hidden means it
+    is still pending (or confirmed, which the wallet or explorer then shows).
+    """
     node = config.ERGO_NODE_URL
     async with ns.get(f"{node}/wallet/transactionById?id={tx_id}", timeout=TIMEOUT) as r:
         if r.status == 200 and ((await r.json()).get("numConfirmations") or 0) >= 1:
             return "confirmed"
-    async with ns.get(f"{node}/transactions/unconfirmed/byTransactionId/{tx_id}", timeout=TIMEOUT) as r:
-        if r.status == 200:
-            return "pending"
+    if explorer is not None:
+        try:
+            async with explorer.get(f"{config.ERGO_EXPLORER_API_URL}/transactions/{tx_id}", timeout=TIMEOUT) as r:
+                if r.status == 200:
+                    return "confirmed"
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            pass
     async with ns.get(f"{node}/utxo/withPool/byId/{leg1_box_id}", timeout=TIMEOUT) as r:
-        if r.status != 200:
-            return "leg1_output_spent"
-    return "dropped"
+        return "dropped" if r.status == 200 else "pending"
 
 
 async def _fetch_boxes(ns, nfts) -> list[dict]:
@@ -188,19 +196,15 @@ async def run_pool_buy_redeem(ns, erg_in: int, *, check: bool = False, execute: 
         result.status = "executed"
     else:
         log(f"  Watching leg 2 until confirmed (up to {config.LEG2_WATCH_TIMEOUT_SECONDS // 60} min)...")
-        status, result.tx2 = await watch_leg2(
-            result.tx2, lambda t: _leg2_status(ns, t, leg1_out["boxId"]), build_and_submit_leg2,
-            timeout=config.LEG2_WATCH_TIMEOUT_SECONDS, interval=config.LEG2_WATCH_INTERVAL_SECONDS,
-            max_rebuilds=config.LEG2_MAX_REBUILDS, log=log)
-        if status == "confirmed":
-            log(f"  Leg 2 CONFIRMED: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
-            result.status = "executed"
-        elif status == "leg1_output_spent":
-            # Usually leg 2 confirming between checks; the wallet may lag a block behind
-            log("  Leg 1's output is spent; leg 2 most likely confirmed. Check the explorer link above.")
-            result.status = "executed"
-        else:
+        async with aiohttp.ClientSession() as explorer:
+            status, result.tx2 = await watch_leg2(
+                result.tx2, lambda t: _leg2_status(ns, t, leg1_out["boxId"], explorer), build_and_submit_leg2,
+                timeout=config.LEG2_WATCH_TIMEOUT_SECONDS, interval=config.LEG2_WATCH_INTERVAL_SECONDS,
+                max_rebuilds=config.LEG2_MAX_REBUILDS, log=log)
+        if status != "confirmed":
             return fail(f"leg 2 not confirmed ({status})")
+        log(f"  Leg 2 CONFIRMED: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
+        result.status = "executed"
 
     result.profit_nanoerg = last_info["user_receives"] - last_info["miner_fee"] - erg_in - i1["miner_fee"]
     result.profit_percent = result.profit_nanoerg / erg_in * 100
