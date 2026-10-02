@@ -1183,9 +1183,16 @@ class ArbitrageScanner:
 
     async def _global_blockers(self, wallet: dict, prices: dict) -> list[str]:
         """Reasons no path would trade right now (kill switch, pause, limits, node)."""
+        blockers = []
+        if not wallet.get("ok", True):
+            blockers.append("wallet balance unreadable")
+        elif self._live_start_value is None:
+            oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+            if oracle or not wallet.get("sigusd"):  # held SigUSD needs a price to be valued
+                self._live_start_value = self._wallet_value_erg(wallet, prices)
         if self._live_start_value is None:
-            self._live_start_value = self._wallet_value_erg(wallet, prices)
-        blockers = self._sync_global_blockers(wallet, prices)
+            blockers.append("no drawdown baseline yet (wallet or oracle price unreadable)")
+        blockers += self._sync_global_blockers(wallet, prices)
         health = await self.ergo_node.get_health()
         self._health_blocker = None
         if not health.get("ok_to_trade"):
@@ -1255,38 +1262,32 @@ class ArbitrageScanner:
             logger.error(f"LIVE runner error: {e}", exc_info=True)
             result = ArbResult("error", f"{e.__class__.__name__}: {e}", path=path)
         size = result.erg_in / 1e9
-        if result.erg_in:
-            self.tracker.set_trade_input(trade_id, size, size + result.profit_nanoerg / 1e9,
-                                         result.profit_nanoerg / 1e9)
+        profit = result.profit_nanoerg / 1e9
+        # The guards first: cooldown, daily count and pause must hold even if the bookkeeping below fails
         self._last_trade_time = time.time()
         today = datetime.now().strftime("%Y-%m-%d")
         self._trades_today = (today, self._trades_today_count() + 1)
+        pause = {"leg2_failed": f"leg 2 failed ({result.message})",
+                 "error": f"runner error ({result.message})",
+                 "refused": f"TX guard refused ({result.message})"}.get(result.status)
+        if pause:
+            self._live_paused = pause
+        self._record_trade(trade_id, result, path, size, profit)
 
-        profit = result.profit_nanoerg / 1e9
         if result.status == "executed":
-            self.tracker.complete_trade(trade_id, actual_output=size + profit, fee_paid_erg=0.0022,
-                                        tx_ids=[result.tx1, result.tx2], notes=f"{path}; expected (pre-confirmation)")
             msg = (f"executed {key} with {size:g} ERG, expected {profit:+.4f} ERG "
                    f"({result.profit_percent:+.2f}%). Leg 1 {result.tx1}, leg 2 {result.tx2}")
         elif result.status == "leg2_failed":
-            self._live_paused = f"leg 2 failed ({result.message})"
-            self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; leg 1 {result.tx1}; holding SigUSD")
             msg = (f"LEG 2 FAILED after leg 1 ({result.tx1}): {result.message}. Holding "
                    f"{result.sigusd_cents / 100:.2f} SigUSD. Live trading paused. Finish with: "
                    f"{result.recover_command}")
         elif result.status == "leg1_dropped":
-            self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; leg 1 dropped, nothing spent")
             msg = f"did not complete {key}: {result.message}. Nothing was spent."
         elif result.status == "error":
-            self._live_paused = f"runner error ({result.message})"
-            self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; unexpected error, leg 1 may be on chain")
             msg = (f"UNEXPECTED ERROR while executing {key}: {result.message}. Leg 1 may already be on chain: "
                    f"check `python arb.py balance` (redeem any SigUSD with `python arb.py redeem --sigusd all "
                    f"--execute`). Live trading paused.")
         else:
-            if result.status == "refused":
-                self._live_paused = f"TX guard refused ({result.message})"
-            self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes=f"{path}; nothing spent")
             msg = f"did not execute {key} ({result.status}): {result.message or 'see console'}. Nothing was spent."
         self.episodes.note_trade(key, f"{result.status}: {profit:+.4f} ERG" if result.status == "executed"
                                  else f"{result.status}: {result.message or ''}")
@@ -1295,11 +1296,33 @@ class ArbitrageScanner:
         if self.discord_enabled:
             await self.discord.notify_live(msg, ping=result.status != "not_profitable")
 
+    def _record_trade(self, trade_id: int, result, path: str, size: float, profit: float):
+        """Tracker rows for a finished trade attempt. Never raises: a locked database must not hide
+        the result from the live gate (the cooldown, count and pause are already set)."""
+        try:
+            if result.erg_in:
+                self.tracker.set_trade_input(trade_id, size, size + profit, profit)
+            if result.status == "executed":
+                self.tracker.complete_trade(trade_id, actual_output=size + profit, fee_paid_erg=0.0022,
+                                            tx_ids=[result.tx1, result.tx2],
+                                            notes=f"{path}; expected (pre-confirmation)")
+            elif result.status == "leg2_failed":
+                self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; leg 1 {result.tx1}; holding SigUSD")
+            elif result.status == "leg1_dropped":
+                self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; leg 1 dropped, nothing spent")
+            elif result.status == "error":
+                self.tracker.fail_trade(trade_id, result.message,
+                                        notes=f"{path}; unexpected error, leg 1 may be on chain")
+            else:
+                self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes=f"{path}; nothing spent")
+        except Exception as e:
+            logger.error(f"LIVE trade bookkeeping failed (the trade result stands): {e}", exc_info=True)
+
     async def _fetch_wallet_balances(self) -> dict:
         """Fetch current wallet balances."""
         balances = await self.ergo_node.get_wallet_balances()
         if not balances:
-            return {"erg": 0, "sigusd": 0, "use": 0}
+            return {"erg": 0, "sigusd": 0, "use": 0, "ok": False}  # unreadable: never a drawdown baseline
         tokens = balances.get("tokens", {})
         sigusd_raw = tokens.get(config.SIGUSD_TOKEN_ID, {}).get("amount", 0)
         use_raw = tokens.get(config.USE_TOKEN_ID, {}).get("amount", 0)
@@ -1307,6 +1330,7 @@ class ArbitrageScanner:
             "erg": balances.get("erg", 0),
             "sigusd": sigusd_raw / 100,  # 2 decimals
             "use": use_raw / 1000,  # 3 decimals
+            "ok": True,
         }
 
     def _build_wallet_analysis(self, wallet: dict, prices: dict):
@@ -1882,7 +1906,7 @@ class ArbitrageScanner:
             oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
             s.wallet = dict(wallet, value_erg=value, value_usd=value * oracle if value and oracle else None)
         s.trades_today = self._trades_today_count()
-        if self._live_start_value is not None and wallet is not None and prices:
+        if self._live_start_value is not None and wallet is not None and wallet.get("ok", True) and prices:
             s.drawdown = max(0.0, self._live_start_value - self._wallet_value_erg(wallet, prices))
         if not self.trading_enabled:
             s.set_live("off", [f"{self.mode} mode: no trading"])

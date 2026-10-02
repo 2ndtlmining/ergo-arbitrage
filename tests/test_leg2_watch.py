@@ -11,19 +11,24 @@ def run(coro):
 
 
 class Script:
-    """get_status returns the scripted statuses in order; rebuild returns new tx ids."""
+    """get_status returns the scripted statuses in order for the newest leg 2; an older (replaced)
+    id stays "pending" (the watcher also checks those in case one confirms). rebuild returns new ids."""
 
     def __init__(self, statuses):
         self.statuses = list(statuses)
         self.checked, self.rebuilds = [], 0
+        self.current = "tx2"
 
     async def get_status(self, tx_id):
         self.checked.append(tx_id)
+        if tx_id != self.current:
+            return "pending"
         return self.statuses.pop(0)
 
     async def rebuild(self):
         self.rebuilds += 1
-        return f"tx2-r{self.rebuilds}"
+        self.current = f"tx2-r{self.rebuilds}"
+        return self.current
 
 
 def test_confirmed_without_rebuild():
@@ -37,7 +42,7 @@ def test_dropped_leg2_is_rebuilt_and_tracked():
     s = Script(["pending", "dropped", "pending", "confirmed"])
     status, tx = run(watch_leg2("tx2", s.get_status, s.rebuild, timeout=5, interval=0, max_rebuilds=3, log=lambda m: None))
     assert status == "confirmed" and tx == "tx2-r1" and s.rebuilds == 1
-    assert s.checked[-1] == "tx2-r1"
+    assert "tx2-r1" in s.checked
 
 
 def test_gives_up_after_max_rebuilds():
@@ -54,6 +59,7 @@ def test_rebuild_failure_is_retried_next_round():
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("bank box moved again")
+        s.current = "tx2-ok"
         return "tx2-ok"
 
     status, tx = run(watch_leg2("tx2", s.get_status, flaky_rebuild, timeout=5, interval=0, max_rebuilds=3, log=lambda m: None))
@@ -61,9 +67,10 @@ def test_rebuild_failure_is_retried_next_round():
 
 
 def test_times_out_while_pending():
+    """Still in the mempool at the deadline: reported as pending (it may yet confirm), not as a drop."""
     s = Script(["pending"] * 10**4)
     status, _ = run(watch_leg2("tx2", s.get_status, s.rebuild, timeout=0.05, interval=0.01, max_rebuilds=3, log=lambda m: None))
-    assert status == "timeout"
+    assert status == "pending"
 
 
 
@@ -126,6 +133,7 @@ def test_not_ready_rebuild_waits_without_using_up_rebuilds():
         calls.append(1)
         if len(calls) <= 4:
             raise LegNotReady("oracle update pending")
+        s.current = "tx2-after-oracle"
         return "tx2-after-oracle"
 
     status, tx = run(watch_leg2("tx2", s.get_status, waiting_rebuild, timeout=5, interval=0, max_rebuilds=1,
