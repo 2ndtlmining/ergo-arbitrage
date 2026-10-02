@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import datetime
 from typing import Optional
 
@@ -8,8 +9,13 @@ import aiohttp
 
 import config
 from arbitrage.calculator import ArbitrageOpportunity
+from notifications import embeds
 
 logger = logging.getLogger("ergo_arb.discord")
+
+QUEUE_MAX = 100
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
+RETRY_CAP_S = 30.0
 
 
 class DiscordNotifier:
@@ -23,6 +29,12 @@ class DiscordNotifier:
         self.cooldown_seconds: int = config.DISCORD_COOLDOWN_SECONDS
         self._session: Optional[aiohttp.ClientSession] = None
         self._last_notified: dict[str, float] = {}
+        self._jobs: deque = deque()          # ("post", embed, content, on_id) | ("edit", embed, get_id)
+        self._worker: Optional[asyncio.Task] = None
+        self._wake: Optional[asyncio.Event] = None
+        self._busy = False
+        self._bucket_until = 0.0             # loop time before which the next request must wait
+        self._sleep = asyncio.sleep
 
     def _ping(self) -> str:
         if self.user_id:
@@ -54,6 +66,7 @@ class DiscordNotifier:
             logger.info("Discord notifier connected")
 
     async def disconnect(self):
+        await self.stop()
         if self._session:
             await self._session.close()
             self._session = None
@@ -99,6 +112,104 @@ class DiscordNotifier:
         except Exception as e:
             logger.error(f"Discord webhook error: {e}")
             return False
+
+    # --- queued embeds: never awaited from the scan/poll path -------------------------------
+
+    def post(self, embed: dict, content: str = "", on_id=None):
+        """Queue a new message; on_id(message_id) is called once Discord returns it."""
+        self._enqueue(("post", embed, content, on_id))
+
+    def edit(self, get_id, embed: dict):
+        """Queue an edit of the message whose id get_id() returns when the job runs."""
+        self._enqueue(("edit", embed, get_id))
+
+    def _enqueue(self, job):
+        if not self.enabled:
+            return
+        if len(self._jobs) >= QUEUE_MAX:
+            oldest_post = next((j for j in self._jobs if j[0] == "post"), None)
+            self._jobs.remove(oldest_post if oldest_post is not None else self._jobs[0])
+            logger.warning("Discord queue full: dropped the oldest message")
+        self._jobs.append(job)
+        self._start_worker()
+
+    def _start_worker(self):
+        if self._worker is None or self._worker.done():
+            self._wake = asyncio.Event()
+            self._worker = asyncio.get_running_loop().create_task(self._run_worker())
+        self._wake.set()
+
+    async def _run_worker(self):
+        while True:
+            if not self._jobs:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            job = self._jobs.popleft()
+            self._busy = True
+            try:
+                await self._do(job)
+            except Exception as e:  # a notifier problem must never reach the scanner
+                logger.error(f"Discord delivery error: {e}")
+            finally:
+                self._busy = False
+
+    async def _do(self, job):
+        if job[0] == "post":
+            _, embed, content, on_id = job
+            status, body = await self._request("POST", f"{self.webhook_url}?wait=true",
+                                               {"content": content, "embeds": [embed]})
+            if status == 200 and body and body.get("id") and on_id:
+                on_id(str(body["id"]))
+        else:
+            _, embed, get_id = job
+            message_id = get_id()
+            if not message_id:
+                logger.warning("Discord edit dropped: the original message was not posted")
+                return
+            await self._request("PATCH", f"{self.webhook_url}/messages/{message_id}", {"embeds": [embed]})
+
+    async def _request(self, method: str, url: str, payload: dict) -> tuple[int, Optional[dict]]:
+        """One HTTP call to the webhook; on 429 waits retry_after (<= 30 s) and retries once."""
+        if self._session is None:
+            await self.connect()
+        loop = asyncio.get_running_loop()
+        status, body = 0, None
+        for attempt in (0, 1):
+            wait = self._bucket_until - loop.time()
+            if wait > 0:
+                await self._sleep(wait)
+            async with self._session.request(method, url, json=payload, timeout=REQUEST_TIMEOUT) as r:
+                status = r.status
+                headers = r.headers or {}
+                if headers.get("X-RateLimit-Remaining") == "0":
+                    reset = min(float(headers.get("X-RateLimit-Reset-After") or 1), RETRY_CAP_S)
+                    self._bucket_until = loop.time() + reset
+                if status == 429 and attempt == 0:
+                    data = await r.json(content_type=None) or {}
+                    retry = data.get("retry_after") or headers.get("Retry-After") or 5
+                    await self._sleep(min(float(retry), RETRY_CAP_S))
+                    continue
+                body = await r.json(content_type=None) if status == 200 else None
+                if status not in (200, 204):
+                    logger.warning(f"Discord {method} returned HTTP {status}")
+                return status, body
+        return status, body
+
+    async def stop(self, timeout: float = 10):
+        """Deliver what is queued (up to `timeout` seconds), then stop the worker."""
+        if self._worker is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (self._jobs or self._busy) and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        self._worker.cancel()
+        try:
+            await self._worker
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._worker = None
 
     async def notify_live(self, text: str, ping: bool = True) -> bool:
         """Live-trading event (trade executed, failure, pause)."""
@@ -281,117 +392,12 @@ class DiscordNotifier:
         msg = self._format_scan_summary(opportunities, scan_number)
         await self._send(msg)
 
-    async def send_startup_message(self, mode: str = "notify"):
-        """Send a message when the scanner starts up."""
-        if not self.enabled:
-            return
-
-        mode_display = {
-            "notify": "NOTIFICATION ONLY",
-            "live": "LIVE TRADING",
-            "monitor": "MONITOR ONLY",
-        }.get(mode, mode.upper())
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ping = self._ping()
-        header = f"{ping} " if ping else ""
-
-        msg = f"{header}**Ergo Arbitrage Monitor Started**\n"
-        msg += "```\n"
-        msg += f"  Mode:          {mode_display}\n"
-        msg += f"  Started:       {now}\n"
-        msg += f"  Min Profit:    {config.DISCORD_MIN_PROFIT_PERCENT}% AND {config.DISCORD_MIN_PROFIT_ERG} ERG\n"
-        msg += f"  Tier 1 Ping:   >= {config.DISCORD_TIER1_PROFIT_PERCENT}% (no SigUSD=USDT)\n"
-        msg += f"  Confirm:       {config.DISCORD_CONFIRM_SCANS} scans ({config.DISCORD_CONFIRM_SCANS * config.SCAN_INTERVAL_SECONDS}s)\n"
-        msg += f"  Max Trade:     {config.MAX_TRADE_SIZE_ERG} ERG\n"
-        msg += f"  Scan Interval: {config.SCAN_INTERVAL_SECONDS}s\n"
-        msg += f"  Cooldown:      {self.cooldown_seconds}s\n"
-        msg += f"  Wallet:        every {config.DISCORD_WALLET_COOLDOWN_SECONDS}s\n"
-        msg += f"  Summary:       every {config.DISCORD_SUMMARY_INTERVAL_SECONDS}s\n"
-        msg += "```"
-
-        success = await self._send(msg)
-        if success:
-            logger.info("Discord startup message sent")
-
     async def send_wallet_analysis(self, wallet: dict, analysis: dict):
-        """Send wallet balance and per-asset analysis to Discord.
+        """Wallet balances and the best options per asset, as one embed."""
+        self.post(embeds.wallet_embed(wallet, analysis))
 
-        Sends one message per asset to stay under Discord's 2000 char limit.
-        """
-        if not self.enabled:
-            return
-
-        erg = wallet.get("erg", 0)
-        sigusd = wallet.get("sigusd", 0)
-        use = wallet.get("use", 0)
-
-        # Header message with balances
-        header = f"**Wallet Analysis**\n```\n  ERG: {erg:.4f}  |  SigUSD: {sigusd:.2f}  |  USE: {use:.3f}\n```"
-        await self._send(header)
-
-        for asset_key, label in [("erg", "ERG"), ("sigusd", "SigUSD"), ("use", "USE")]:
-            info = analysis[asset_key]
-            balance = info["balance"]
-            options = info["options"]
-
-            if (asset_key == "erg" and balance < 2) or (asset_key == "sigusd" and balance < 0.5) or (asset_key == "use" and balance < 0.01):
-                continue  # skip empty assets
-
-            if not options:
-                continue
-
-            available = [o for o in options if not o["blocked"] and o.get("blocked_reason") != "exit to USDT"]
-            blocked = [o for o in options if o["blocked"]]
-            profitable = [o for o in available if o["profit_pct"] > 0.5]
-
-            lines = []
-            if profitable:
-                best = max(profitable, key=lambda x: x["profit_pct"])
-                lines.append(f"**{label}: {len(profitable)} profitable. Best: {best['name']} ({best['profit_pct']:+.1f}%)**")
-            elif available:
-                best = max(available, key=lambda x: x["profit_pct"])
-                lines.append(f"**{label}: Not profitable. Best: {best['name']} ({best['profit_pct']:+.1f}%)**")
-            else:
-                reasons = ", ".join(o["blocked_reason"] for o in blocked if o["blocked_reason"])
-                lines.append(f"**{label}: All blocked ({reasons})**")
-
-            lines.append("```")
-
-            # Show top 3 options with steps
-            for o in sorted(available, key=lambda x: x["profit_pct"], reverse=True)[:3]:
-                marker = ">>" if o["profit_pct"] > 0.5 else "--"
-                lines.append(f"  {marker} {o['name']} ({o['profit_pct']:+.1f}%):")
-                for step in o["steps"]:
-                    lines.append(f"     {step}")
-                lines.append(f"     -> {o['profit_desc']}")
-                lines.append("")
-
-            for o in blocked:
-                lines.append(f"  -- {o['name']}: {o['blocked_reason']}")
-
-            lines.append("```")
-
-            msg = "\n".join(lines)
-            # Safety: truncate if still too long
-            if len(msg) > 1950:
-                msg = msg[:1940] + "\n...\n```"
-            await self._send(msg)
-            await asyncio.sleep(0.5)  # avoid rate limit between messages
+    async def send_startup_message(self, mode: str = "notify"):
+        self.post(embeds.startup_embed(mode), content=self._ping())
 
     async def send_summary_message(self, stats: dict):
-        """Send a session summary when the scanner shuts down."""
-        if not self.enabled:
-            return
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        msg = "**Ergo Arbitrage Monitor Stopped**\n"
-        msg += "```\n"
-        msg += f"  Stopped:       {now}\n"
-        msg += f"  Duration:      {stats.get('session_duration', 'N/A')}\n"
-        msg += f"  Opportunities: {stats.get('opportunities_seen', 0)}\n"
-        msg += f"  Potential:     {stats.get('total_potential_profit_erg', 0):.4f} ERG\n"
-        msg += "```"
-
-        await self._send(msg)
+        self.post(embeds.shutdown_embed(stats))
