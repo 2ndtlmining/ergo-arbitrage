@@ -73,6 +73,13 @@ async def guarded_sign(ns, node_url: str, unsigned_tx: dict, policy: SignPolicy,
     if not execute:
         raise DryRun("TX verified but not signed (dry run). Re-run with --execute to sign and submit.")
 
+    status = await _get_json(ns, f"{node_url}/wallet/status")
+    if not status or not status.get("isUnlocked"):
+        raise TxGuardError(
+            "node wallet is locked, so it cannot sign. Unlock it with POST /wallet/unlock "
+            "(body {\"pass\": \"<wallet password>\"}) and re-run."
+        )
+
     sign_request = {
         "tx": {
             "inputs": [{"boxId": i["boxId"], "extension": i.get("extension", {})} for i in inputs],
