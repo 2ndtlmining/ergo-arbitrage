@@ -39,3 +39,12 @@ TEST_DEFAULTS = {
 def default_config(monkeypatch):
     for name, value in TEST_DEFAULTS.items():
         monkeypatch.setattr(config, name, value)
+
+
+@pytest.fixture(autouse=True)
+def fresh_box_id_cache():
+    """ergo/chain_state.py caches confirmed box ids per NFT; tests start without it."""
+    from ergo import chain_state
+    chain_state._BOX_IDS.clear()
+    yield
+    chain_state._BOX_IDS.clear()

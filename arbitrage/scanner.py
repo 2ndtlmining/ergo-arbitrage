@@ -1195,6 +1195,9 @@ class ArbitrageScanner:
             msg = (f"LEG 2 FAILED after leg 1 ({result.tx1}): {result.message}. Holding "
                    f"{result.sigusd_cents / 100:.2f} SigUSD. Live trading paused. Finish with: "
                    f"{result.recover_command}")
+        elif result.status == "leg1_dropped":
+            self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; leg 1 dropped, nothing spent")
+            msg = f"did not complete {key}: {result.message}. Nothing was spent."
         elif result.status == "error":
             self._live_paused = f"runner error ({result.message})"
             self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; unexpected error, leg 1 may be on chain")
@@ -1687,13 +1690,19 @@ class ArbitrageScanner:
         console.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
 
         prices = await self.fetch_all_prices()
-        self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
+        outage = self._chain_error is not None
+        if outage:  # prices below are the last good state: show them, but do not log or alert on them
+            console.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
+                          f"state; nothing is logged, alerted or traded until the node can be read[/bold yellow]")
+        else:
+            self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
         self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
         self._update_live_streak()
-        self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
-        self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
+        if not outage:
+            self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
+            self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities, prices)
         if self.cex_watch:
             self._display_cex_watch(prices)
@@ -1702,7 +1711,8 @@ class ArbitrageScanner:
         wallet = await self._fetch_wallet_balances()
         self._display_wallet_opportunities(wallet, opportunities, prices)
 
-        await self._notify_discord(opportunities)
+        if not outage:
+            await self._notify_discord(opportunities)
         if self.discord_enabled and self.cex_watch:
             for g in self._cex_watch_gaps(prices):
                 if g["alert"]:
@@ -1834,6 +1844,8 @@ class ArbitrageScanner:
             border_style="red" if self.mode == "live" else "magenta",
         ))
 
+        for warning in config.deprecated_settings():
+            logger.warning(warning)
         restore = self._install_signal_handlers()
         await self.connect_all()
 

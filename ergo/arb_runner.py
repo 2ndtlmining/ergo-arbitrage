@@ -29,7 +29,8 @@ class LegNotReady(RuntimeError):
 
 @dataclass
 class ArbResult:
-    status: str                # aborted | refused | not_profitable | dry_run | checked | executed | leg1_failed | leg2_failed
+    status: str                # aborted | refused | not_profitable | dry_run | checked | executed | leg1_failed
+                               # | leg1_dropped (leg 2 failed but leg 1 never landed: nothing spent) | leg2_failed | error
     message: str = ""
     erg_in: int = 0
     sigusd_cents: int = 0
@@ -54,28 +55,33 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
     get_status(tx_id) -> "confirmed" | "pending" | "dropped"
     rebuild() -> new tx id (built on fresh bank/oracle boxes); may raise.
     Returns (status, tx_id): confirmed | gave_up | timeout.
+    `tx_id` None: leg 2 was never submitted (its first build was not ready); build it first.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     rebuilds = 0
     while True:
-        status = await get_status(tx_id)
+        status = "dropped" if tx_id is None else await get_status(tx_id)
         if status == "confirmed":
             return status, tx_id
         if status == "dropped":
-            if rebuilds >= max_rebuilds:
+            if tx_id is not None and rebuilds >= max_rebuilds:
                 return "gave_up", tx_id
-            rebuilds += 1
-            log(f"  Leg 2 {tx_id[:12]} dropped from the mempool (bank/oracle box changed?): "
-                f"rebuilding on fresh boxes ({rebuilds}/{max_rebuilds})")
             try:
-                tx_id = await rebuild()
-                log(f"  Leg 2 resubmitted: https://explorer.ergoplatform.com/en/transactions/{tx_id}")
+                new_id = await rebuild()
             except LegNotReady as e:
-                rebuilds -= 1
-                log(f"  Leg 2 rebuild waiting: {e}")
+                log(f"  Leg 2 waiting: {e}")
             except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
-                log(f"  Leg 2 rebuild failed ({e}); retrying next round")
+                if tx_id is not None:
+                    rebuilds += 1
+                log(f"  Leg 2 rebuild failed ({e}); retrying next round ({rebuilds}/{max_rebuilds})")
+            else:
+                if tx_id is not None:
+                    rebuilds += 1
+                    log(f"  Leg 2 {tx_id[:12]} had dropped from the mempool (bank/oracle box changed?): "
+                        f"rebuilt on fresh boxes ({rebuilds}/{max_rebuilds})")
+                tx_id = new_id
+                log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{tx_id}")
         if loop.time() >= deadline:
             return "timeout", tx_id
         await asyncio.sleep(interval)
@@ -101,6 +107,25 @@ async def _leg2_status(ns, tx_id: str, leg1_box_id: str, explorer=None) -> str:
             pass
     async with ns.get(f"{node}/utxo/withPool/byId/{leg1_box_id}", timeout=TIMEOUT) as r:
         return "dropped" if r.status == 200 else "pending"
+
+
+async def leg1_landed(ns, tx1: str, leg1_box_id: str, attempts: int = 3, delay: float = 3.0) -> bool:
+    """False only if leg 1 is provably gone: not confirmed, not in the mempool and its output not
+    visible, on every one of `attempts` checks. Any doubt (node errors included) returns True."""
+    node = config.ERGO_NODE_URL
+    paths = (f"/blockchain/transaction/byId/{tx1}", f"/transactions/unconfirmed/byTransactionId/{tx1}",
+             f"/utxo/withPool/byId/{leg1_box_id}")
+    for attempt in range(attempts):
+        for path in paths:
+            try:
+                async with ns.get(f"{node}{path}", timeout=TIMEOUT) as r:
+                    if r.status == 200:
+                        return True
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                return True
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
+    return False
 
 
 async def _fetch_latest(ns, nfts) -> list[tuple[dict, bool]]:
@@ -276,8 +301,12 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
         last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])
         return tx_id
 
-    def fail(message: str) -> ArbResult:
+    async def fail(message: str) -> ArbResult:
         log(f"  Leg 2 FAILED: {message}")
+        if not await leg1_landed(ns, result.tx1, leg1_out["boxId"]):
+            log("  Leg 1 was dropped as well (not confirmed, not in the mempool): nothing was spent.")
+            result.status, result.message = "leg1_dropped", f"{message}; leg 1 dropped too, nothing spent"
+            return result
         log(f"  You now hold {cents / 100:.2f} SigUSD from leg 1. Finish with:")
         log(f"    {result.recover_command}")
         result.status, result.message = "leg2_failed", message
@@ -286,9 +315,13 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
     try:
         await wait_for_box(ns, leg1_out["boxId"], timeout=60)
         result.tx2 = await build_and_submit_leg2()
+        log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
+    except LegNotReady as e:
+        if not wait_leg2:
+            return await fail(str(e))
+        log(f"  Leg 2 waiting: {e}")  # the watcher below builds it once ready
     except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
-        return fail(str(e) or e.__class__.__name__)
-    log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
+        return await fail(str(e) or e.__class__.__name__)
 
     if not wait_leg2:
         result.status = "executed"
@@ -300,7 +333,7 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
                 timeout=config.LEG2_WATCH_TIMEOUT_SECONDS, interval=config.LEG2_WATCH_INTERVAL_SECONDS,
                 max_rebuilds=config.LEG2_MAX_REBUILDS, log=log)
         if status != "confirmed":
-            return fail(f"leg 2 not confirmed ({status})")
+            return await fail(f"leg 2 not confirmed ({status})")
         log(f"  Leg 2 CONFIRMED: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
         result.status = "executed"
 

@@ -29,7 +29,19 @@ class FakeSession:
         self.calls.append(url)
         for suffix, result in self.routes.items():
             if url.endswith(suffix):
+                if isinstance(result, Seq):
+                    result = result.next()
                 if isinstance(result, BaseException):
                     raise result
                 return _Resp(*result)
         return _Resp(404, {"error": 404})
+
+
+class Seq:
+    """A route answering with each (status, body) in turn; the last one repeats."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+
+    def next(self):
+        return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]

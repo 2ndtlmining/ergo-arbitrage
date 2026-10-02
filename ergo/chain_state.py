@@ -25,6 +25,7 @@ from exchanges.spectrum import parse_n2t_pool_box
 
 CHAIN_TIMEOUT = aiohttp.ClientTimeout(total=5)
 PENDING_OK = frozenset({config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT})  # spent as inputs
+_BOX_IDS: dict[str, str] = {}  # NFT -> last confirmed box id (saves an index/explorer lookup per poll)
 CONTRACTS = (("pool", config.SPECTRUM_SIGUSD_POOL_NFT), ("bank", config.SIGMAUSD_BANK_NFT),
              ("oracle", config.SIGMAUSD_ORACLE_NFT))
 
@@ -67,8 +68,31 @@ async def latest_box(ns, nft: str, explorer=None) -> tuple[dict, bool]:
     if nft in PENDING_OK:
         if pending:
             return pending[-1], True
-        return await node_box(ns, await find_box_id(nft, ns, explorer)), False
-    return await _confirmed_box(ns, await find_box_id(nft, ns, explorer)), bool(pending)
+        try:
+            return await _confirmed(ns, nft, explorer, node_box), False
+        except RuntimeError:
+            # Spent by a TX that reached the mempool after the pending check: chain onto it.
+            pending = await _pending_outputs(ns, nft)
+            if pending:
+                return pending[-1], True
+            raise
+    # An update arriving between the two calls is reported as not pending; the runner
+    # re-reads (and re-checks) right before it signs anything.
+    return await _confirmed(ns, nft, explorer, _confirmed_box), bool(pending)
+
+
+async def _confirmed(ns, nft: str, explorer, read) -> dict:
+    """Confirmed box for `nft` read with `read(ns, box_id)`, via the cached id when it is still unspent."""
+    cached = _BOX_IDS.get(nft)
+    if cached:
+        try:
+            return await read(ns, cached)
+        except RuntimeError:
+            _BOX_IDS.pop(nft, None)  # spent: look the new one up
+    box_id = await find_box_id(nft, ns, explorer)
+    b = await read(ns, box_id)
+    _BOX_IDS[nft] = box_id
+    return b
 
 
 @dataclass(frozen=True)

@@ -149,6 +149,15 @@ DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECON
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
 # --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
+RENAMED_SETTINGS = {"LIVE_CONFIRM_SCANS": "LIVE_CONFIRM_POLLS"}
+
+
+def deprecated_settings() -> list[str]:
+    """Warnings for settings in the environment that are no longer read."""
+    return [f"{old} is no longer used; set {new} instead (counts ~{CHAIN_POLL_SECONDS:g} s chain polls)"
+            for old, new in RENAMED_SETTINGS.items() if os.getenv(old) is not None]
+
+
 LIVE_CONFIRM_POLLS = int(os.getenv("LIVE_CONFIRM_POLLS", "2"))            # profitable on N chain polls in a row
 LIVE_TRADE_COOLDOWN_SECONDS = int(os.getenv("LIVE_TRADE_COOLDOWN_SECONDS", "300"))
 LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
