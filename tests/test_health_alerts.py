@@ -57,10 +57,10 @@ def test_stuck_oracle_update():
     assert [e.kind for e in m.update(650, state(venues=[venue("Oracle", "live")]))] == ["recovered"]
 
 
-def test_live_pause_alerts_at_once_with_ping():
+def test_live_pause_alerts_at_once():
     m = monitor()
     ev = m.update(5, state(live="paused", detail=["leg 2 failed (oracle moved)"]))
-    assert [(e.subject, e.ping) for e in ev] == [("live", True)] and "leg 2 failed" in ev[0].text
+    assert [(e.subject, e.ping) for e in ev] == [("live", False)] and "leg 2 failed" in ev[0].text
 
 
 def test_outage_log_for_the_digest():
@@ -72,3 +72,19 @@ def test_outage_log_for_the_digest():
     m.update(700, state(venues=[venue("Kucoin", "down")]))
     out = m.outages(now=800, since=0)
     assert ("chain", 250.0, False) in out and ("venue:Kucoin", 500.0, True) in out
+
+
+def test_live_pause_does_not_ping_twice():
+    """The live trade alert (notify_live) already pings for the failure that paused trading."""
+    m = monitor()
+    (e,) = m.update(5, state(live="paused", detail=["leg 2 failed"]))
+    assert e.subject == "live" and e.ping is False
+
+
+def test_old_outages_are_pruned():
+    m = monitor()
+    m.update(0, state("x"))
+    m.update(130, state("x"))
+    m.update(250, state())
+    m.update(250 + 49 * 3600, state())
+    assert m._log == []

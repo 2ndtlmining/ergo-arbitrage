@@ -6,6 +6,7 @@ from typing import Optional
 
 from notifications.embeds import duration
 
+LOG_KEEP_S = 48 * 3600  # outages that ended longer ago are dropped (the digest covers 24 h)
 CHAIN_VENUES = {"ErgoDEX pool", "SigmaUSD bank", "Oracle"}  # covered by the "chain" subject
 
 
@@ -38,11 +39,13 @@ class HealthMonitor:
                 failing["oracle"] = (self.oracle_s, False,
                                      f"Oracle update pending for over {duration(self.oracle_s)} (stuck?)")
         if state.live == "paused":
-            failing["live"] = (0.0, True, f"Live trading paused: {'; '.join(state.live_detail) or 'see console'}")
+            # no ping: the live trade alert (notify_live) already pinged for the failure that paused it
+            failing["live"] = (0.0, False, f"Live trading paused: {'; '.join(state.live_detail) or 'see console'}")
         return failing
 
     def update(self, now: float, state) -> list[HealthEvent]:
         events = []
+        self._log = [e for e in self._log if e[2] is None or now - e[2] < LOG_KEEP_S]
         failing = self._failing(state)
         for subject, (threshold, ping, text) in failing.items():
             first = self._since.setdefault(subject, now)

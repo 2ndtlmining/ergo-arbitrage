@@ -195,3 +195,41 @@ def test_text_alerts_are_delivered_in_order(notifier, monkeypatch):
     run(go())
     assert [s.split("**")[-1].strip(": ") if "LIVE" in s else "watch" for s in sent] == ["a", "watch"]
 
+
+
+class HtmlResp(Resp):
+    """A Cloudflare-style 429: HTML body, so .json() fails; only the Retry-After header helps."""
+
+    async def json(self, content_type=None):
+        raise ValueError("not json")
+
+
+def test_non_json_429_waits_on_the_header_and_retries(notifier):
+    hook = FakeHook(HtmlResp(429, "<html>", {"Retry-After": "4"}), Resp(200, {"id": "m1"}))
+    notifier._session = hook
+    status, body = run(notifier._request("POST", HOOK, {}))
+    assert status == 200 and notifier.slept == [4.0] and len(hook.calls) == 2
+
+
+def test_thread_webhook_keeps_its_query_string(notifier, monkeypatch):
+    notifier.webhook_url = HOOK + "?thread_id=9"
+    hook = FakeHook(Resp(200, {"id": "m1"}))
+    notifier._session = hook
+    got = {}
+
+    async def go():
+        notifier.post({"title": "a"}, on_id=lambda mid: got.setdefault("id", mid))
+        notifier.edit(lambda: got.get("id"), {"title": "b"})
+        await notifier.stop()
+
+    run(go())
+    assert hook.calls[0][1] == HOOK + "?thread_id=9&wait=true"
+    assert hook.calls[1][1] == HOOK + "/messages/m1?thread_id=9"
+
+
+def test_post_outside_an_event_loop_is_kept_for_later(notifier):
+    hook = FakeHook(Resp(200, {"id": "m1"}))
+    notifier._session = hook
+    notifier.post({"title": "early"})  # no running loop: must not raise
+    run(notifier.stop())
+    assert [c[2]["embeds"][0]["title"] for c in hook.calls] == ["early"]

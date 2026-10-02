@@ -33,10 +33,11 @@ def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: 
     d.trades = {"count": len(trades),
                 "net_erg": sum((t.get("actual_profit_erg") or 0.0) for t in trades if t.get("status") == "completed"),
                 "failed": sum(1 for t in trades if t.get("status") == "failed")}
-    wall_now = time.time()
-    since_wall = max(wall_now - hours * 3600, health.started_at)
-    d.outages = health.outages(now=wall_now, since=since_wall) if health else []
-    d.outage_since = f"since {datetime.fromtimestamp(since_wall):%Y-%m-%d %H:%M}"
+    if health is not None:
+        wall_now = time.time()
+        since_wall = max(wall_now - hours * 3600, health.started_at)
+        d.outages = health.outages(now=wall_now, since=since_wall)
+        d.outage_since = f"since {datetime.fromtimestamp(since_wall):%Y-%m-%d %H:%M}"
     return d
 
 

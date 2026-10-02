@@ -73,6 +73,19 @@ def episode_embed(ep, status: str, height: int = 0, data_age_s: Optional[float] 
     return embed(title, GREEN if is_open else GREY, fields, description=description, footer=footer)
 
 
+def stale_episode_embed(row: dict) -> dict:
+    """Grey 'closed' version of a message left open by a bot that stopped without closing it."""
+    try:
+        lasted = duration((datetime.fromisoformat(row["closed_at"])
+                           - datetime.fromisoformat(row["opened_at"])).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        lasted = "?"
+    fields = [field("Peak", f"{row.get('peak_profit_percent') or 0:+.2f}% ({row.get('peak_profit_erg') or 0:+.4f} ERG)"),
+              field("Seen for", lasted)]
+    return embed(f"Closed · {row.get('path', '?')} · bot restarted", GREY, fields,
+                 description="Closed: bot restarted (the last update before it stopped is shown)")
+
+
 def health_embed(event) -> dict:
     if event.kind == "recovered":
         return embed(f"✅ {event.text}", GREEN)
@@ -81,8 +94,8 @@ def health_embed(event) -> dict:
 
 def wallet_embed(wallet: dict, analysis: dict) -> dict:
     wallet, analysis = wallet or {}, analysis or {}
-    description = (f"{wallet.get('erg', 0):.4f} ERG · {wallet.get('sigusd', 0):.2f} SigUSD · "
-                   f"{wallet.get('use', 0):.3f} USE")
+    description = (f"{wallet.get('erg') or 0:.4f} ERG · {wallet.get('sigusd') or 0:.2f} SigUSD · "
+                   f"{wallet.get('use') or 0:.3f} USE")
     fields = []
     for key, label in (("erg", "ERG"), ("sigusd", "SigUSD"), ("use", "USE")):
         info = analysis.get(key) or {}
@@ -90,10 +103,10 @@ def wallet_embed(wallet: dict, analysis: dict) -> dict:
         if not options:
             continue
         lines = []
-        for o in sorted(options, key=lambda o: o.get("profit_pct", 0), reverse=True)[:3]:
-            lines.append(f"{'>>' if o.get('profit_pct', 0) > 0.5 else '--'} {o.get('name', '?')} "
-                         f"({o.get('profit_pct', 0):+.1f}%)")
-        fields.append(field(f"{label} ({info.get('balance', 0):g})", "\n".join(lines), inline=False))
+        for o in sorted(options, key=lambda o: o.get("profit_pct") or 0, reverse=True)[:3]:
+            pct = o.get("profit_pct") or 0
+            lines.append(f"{'>>' if pct > 0.5 else '--'} {o.get('name', '?')} ({pct:+.1f}%)")
+        fields.append(field(f"{label} ({info.get('balance') or 0:g})", "\n".join(lines), inline=False))
     return embed("Wallet", BLUE, fields, description=description)
 
 
