@@ -120,6 +120,7 @@ SIZE_PROFIT_CAPTURE = float(os.getenv("SIZE_PROFIT_CAPTURE", "0.95"))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
+CHAIN_POLL_SECONDS = float(os.getenv("CHAIN_POLL_SECONDS", "2"))  # node poll for pool/bank/oracle changes
 
 # Buffer for state changing between quote and inclusion, applied to legs whose
 # price impact is computed from real reserves (AMM pool).
@@ -148,7 +149,7 @@ DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECON
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
 
 # --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
-LIVE_CONFIRM_SCANS = int(os.getenv("LIVE_CONFIRM_SCANS", "3"))            # profitable N scans in a row
+LIVE_CONFIRM_POLLS = int(os.getenv("LIVE_CONFIRM_POLLS", "2"))            # profitable on N chain polls in a row
 LIVE_TRADE_COOLDOWN_SECONDS = int(os.getenv("LIVE_TRADE_COOLDOWN_SECONDS", "300"))
 LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
 LIVE_MAX_DRAWDOWN_ERG = float(os.getenv("LIVE_MAX_DRAWDOWN_ERG", "5"))     # stop if wallet value falls this much
