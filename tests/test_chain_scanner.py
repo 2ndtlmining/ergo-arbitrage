@@ -102,3 +102,60 @@ def test_pending_pool_box_does_not_block(scanner, monkeypatch):
     prices = asyncio.run(scanner.fetch_all_prices())
     blockers = asyncio.run(scanner._global_blockers(WALLET, prices))
     assert not any("pending" in b or "chain" in b for b in blockers)
+
+
+def test_first_tick_is_a_full_scan_then_fast_polls(scanner, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    monkeypatch.setattr(config, "LIVE_CONFIRM_POLLS", 99)  # no trading in this test
+    full = []
+    real = scanner.scan_once
+
+    async def counting():
+        full.append(1)
+        await real()
+
+    monkeypatch.setattr(scanner, "scan_once", counting)
+    for now in (0, 2, 4, 6, 15, 17):
+        asyncio.run(scanner.poll_once(now))
+    assert len(full) == 2  # t=0 and t=15
+
+
+def test_trades_after_two_polls_not_one(scanner, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    asyncio.run(scanner.poll_once(0))
+    assert scanner.calls == []
+    asyncio.run(scanner.poll_once(2))
+    assert scanner.calls == ["redeem"]
+
+
+def test_change_line_printed_once_per_state(scanner, monkeypatch):
+    from logging_config import console
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap("a"), snap("a"), snap("b")))
+    monkeypatch.setattr(config, "LIVE_CONFIRM_POLLS", 99)  # no trading in this test
+    asyncio.run(scanner.poll_once(0))
+    with console.capture() as cap:
+        asyncio.run(scanner.poll_once(2))   # same state: silent
+    assert "CHAIN" not in cap.get()
+    with console.capture() as cap:
+        asyncio.run(scanner.poll_once(4))   # pool box changed
+    out = cap.get()
+    assert "CHAIN" in out and "pool" in out and "1885700" in out.replace(",", "")
+
+
+def test_timeout_mid_run_blocks_trading_and_loop_survives(scanner, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap(), asyncio.TimeoutError()))
+    asyncio.run(scanner.poll_once(0))          # streak 1
+    asyncio.run(scanner.poll_once(2))          # read fails: no trade, streak reset
+    asyncio.run(scanner.poll_once(4))          # still failing
+    assert scanner.calls == []
+    assert scanner._live_streak.get(KEY, 0) == 0
+
+
+def test_pending_oracle_update_delays_the_trade(scanner, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot",
+                        Reader(snap(pending={"oracle"}), snap(pending={"oracle"}), snap()))
+    asyncio.run(scanner.poll_once(0))
+    asyncio.run(scanner.poll_once(2))
+    assert scanner.calls == []                 # profitable twice, but the oracle is about to change
+    asyncio.run(scanner.poll_once(4))
+    assert scanner.calls == ["redeem"]
