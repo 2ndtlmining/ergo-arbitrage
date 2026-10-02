@@ -334,13 +334,13 @@ class DiscordNotifier:
                 best_per_path[path_key] = opp
 
         sorted_paths = sorted(best_per_path.values(), key=lambda x: x.profit_percent, reverse=True)
-        profitable_count = sum(1 for o in sorted_paths if o.is_profitable)
+        profitable_count = sum(1 for o in sorted_paths if o.is_profitable and not o.blocked)
 
         lines = []
         lines.append(f"**Scan #{scan_number}** - {now}  |  {profitable_count} profitable paths")
         lines.append("```")
-        lines.append(f"  {'Path':<28s} {'Size':>5s} {'Profit':>8s} {'ERG':>9s} {'USD':>7s} {'St':>5s}")
-        lines.append(f"  {'-'*28} {'-'*5} {'-'*8} {'-'*9} {'-'*7} {'-'*5}")
+        lines.append(f"  {'Path':<28s} {'Size':>5s} {'Profit':>8s} {'ERG':>9s} {'USD':>7s} {'St':>7s}")
+        lines.append(f"  {'-'*28} {'-'*5} {'-'*8} {'-'*9} {'-'*7} {'-'*7}")
 
         for opp in sorted_paths:
             path_key = self._get_path_key(opp)
@@ -349,14 +349,19 @@ class DiscordNotifier:
             pct = f"{opp.profit_percent:+.2f}%"
             erg = f"{opp.profit_erg:+.4f}"
             usd = f"${opp.profit_usd:.2f}"
-            if opp.is_profitable and opp.risk_adjusted_profitable:
+            if opp.blocked:
+                st = "BLOCKED"            # the figure is what it would earn if the step were allowed
+            elif opp.is_profitable and opp.risk_adjusted_profitable:
                 st = "GO"
             elif opp.is_profitable:
                 st = "RISKY"
             else:
                 st = "-"
-            lines.append(f"  {pname:<28s} {size:>5s} {pct:>8s} {erg:>9s} {usd:>7s} {st:>5s}")
+            lines.append(f"  {pname:<28s} {size:>5s} {pct:>8s} {erg:>9s} {usd:>7s} {st:>7s}")
 
+        for opp in sorted_paths:
+            if opp.blocked and opp.blocked_reason:
+                lines.append(f"  BLOCKED {self._get_path_key(opp)}: {opp.blocked_reason}")
         lines.append("```")
         return "\n".join(lines)
 

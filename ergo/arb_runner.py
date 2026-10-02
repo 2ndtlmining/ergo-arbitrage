@@ -54,16 +54,31 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
 
     get_status(tx_id) -> "confirmed" | "pending" | "dropped"
     rebuild() -> new tx id (built on fresh bank/oracle boxes); may raise.
-    Returns (status, tx_id): confirmed | gave_up | timeout.
+    Returns (status, tx_id): confirmed | gave_up | pending (still in the mempool at the deadline) | timeout.
     `tx_id` None: leg 2 was never submitted (its first build was not ready); build it first.
+    Every submitted id is followed: an earlier one that confirms after a rebuild counts. A node error
+    while checking counts as "pending" (the deadline still applies).
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     rebuilds = 0
+    ids: list[str] = [tx_id] if tx_id is not None else []
+
+    async def checked(tid: str) -> str:
+        try:
+            return await get_status(tid)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError) as e:
+            log(f"  Leg 2 status check failed ({e.__class__.__name__}); still watching")
+            return "pending"
+
     while True:
-        status = "dropped" if tx_id is None else await get_status(tx_id)
+        tx_id = ids[-1] if ids else None
+        status = "dropped" if tx_id is None else await checked(tx_id)
         if status == "confirmed":
             return status, tx_id
+        for older in ids[:-1]:
+            if await checked(older) == "confirmed":
+                return "confirmed", older
         if status == "dropped":
             if tx_id is not None and rebuilds >= max_rebuilds:
                 return "gave_up", tx_id
@@ -80,10 +95,10 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
                     rebuilds += 1
                     log(f"  Leg 2 {tx_id[:12]} had dropped from the mempool (bank/oracle box changed?): "
                         f"rebuilt on fresh boxes ({rebuilds}/{max_rebuilds})")
-                tx_id = new_id
-                log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{tx_id}")
+                ids.append(new_id)
+                log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{new_id}")
         if loop.time() >= deadline:
-            return "timeout", tx_id
+            return ("pending" if status == "pending" else "timeout"), (ids[-1] if ids else None)
         await asyncio.sleep(interval)
 
 
@@ -141,8 +156,8 @@ async def leg1_landed(ns, tx1: str, leg1_box_id: str, attempts: int = 3, delay: 
     """False only if leg 1 is provably gone: not confirmed, not in the mempool and its output not
     visible, on every one of `attempts` checks. Any doubt (node errors included) returns True."""
     node = config.ERGO_NODE_URL
-    paths = (f"/blockchain/transaction/byId/{tx1}", f"/transactions/unconfirmed/byTransactionId/{tx1}",
-             f"/utxo/withPool/byId/{leg1_box_id}")
+    paths = (f"/wallet/transactionById?id={tx1}", f"/blockchain/transaction/byId/{tx1}",
+             f"/transactions/unconfirmed/byTransactionId/{tx1}", f"/utxo/withPool/byId/{leg1_box_id}")
     for attempt in range(attempts):
         for path in paths:
             try:
@@ -254,8 +269,9 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
                 erg_in = choice.size_nanoerg
         plan = planner(pool_box, bank_box, oracle_box, wallet_boxes, erg_in,
                        height=height, our_tree=our_tree, ui_fee_tree=UI_FEE_TREE)
-    except (RuntimeError, ValueError, TxGuardError) as e:
-        log(f"ABORTED: {e}")
+    except (RuntimeError, ValueError, TxGuardError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+        # nothing has been signed yet: a node blip here is an abort, not an "error" that pauses trading
+        log(f"ABORTED: {e or e.__class__.__name__}")
         return ArbResult("aborted", str(e), erg_in or 0, path=path)
 
     erg_in = plan.get("erg_in", erg_in)
@@ -324,9 +340,9 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
         last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])
         return tx_id
 
-    async def fail(message: str) -> ArbResult:
+    async def fail(message: str, leg2_pending: bool = False) -> ArbResult:
         log(f"  Leg 2 FAILED: {message}")
-        if not await leg1_landed(ns, result.tx1, leg1_out["boxId"]):
+        if not leg2_pending and not await leg1_landed(ns, result.tx1, leg1_out["boxId"]):
             log("  Leg 1 was dropped as well (not confirmed, not in the mempool): nothing was spent.")
             result.status, result.message = "leg1_dropped", f"{message}; leg 1 dropped too, nothing spent"
             return result
@@ -355,6 +371,10 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
                 result.tx2, lambda t: _leg2_status(ns, t, leg1_out["boxId"], explorer), build_and_submit_leg2,
                 timeout=config.LEG2_WATCH_TIMEOUT_SECONDS, interval=config.LEG2_WATCH_INTERVAL_SECONDS,
                 max_rebuilds=config.LEG2_MAX_REBUILDS, log=log)
+        if status == "pending":
+            return await fail(f"leg 2 {result.tx2} still pending after {config.LEG2_WATCH_TIMEOUT_SECONDS // 60} min; "
+                              f"it may still confirm, so check the wallet before finishing by hand",
+                              leg2_pending=True)
         if status != "confirmed":
             return await fail(f"leg 2 not confirmed ({status})")
         log(f"  Leg 2 CONFIRMED: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
