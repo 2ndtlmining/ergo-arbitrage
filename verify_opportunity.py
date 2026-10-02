@@ -80,7 +80,7 @@ async def main():
                 print(f"  Spectrum:  1 ERG = {spec_price:.4f} SigUSD (pool price)")
                 print(f"             1 SigUSD = {1/spec_price:.4f} ERG")
             else:
-                print(f"  Spectrum:  ERROR - could not find ERG/SigUSD pool")
+                print("  Spectrum:  ERROR - could not find ERG/SigUSD pool")
                 return
 
         # Bank state - use R4 register like sigmausd.py
@@ -113,7 +113,7 @@ async def main():
                 can_mint = False
                 can_redeem = False
                 rr = 0
-                print(f"  Bank:      ERROR - could not fetch bank state")
+                print("  Bank:      ERROR - could not fetch bank state")
 
         # Wallet
         async with aiohttp.ClientSession(headers=node_headers) as ns:
@@ -158,11 +158,11 @@ async def main():
         print()
         if not can_mint:
             print(f"  *** BLOCKED: RR={rr:.0f}% (needs >400% to mint) ***")
-            print(f"  Showing hypothetical math if minting were available:")
+            print("  Showing hypothetical math if minting were available:")
             print()
 
-        print(f"  Size    Mint SigUSD   Swap->ERG    Profit ERG   Profit %")
-        print(f"  ------- ------------ ------------ ------------ ----------")
+        print("  Size    Mint SigUSD   Swap->ERG    Profit ERG   Profit %")
+        print("  ------- ------------ ------------ ------------ ----------")
         for size in [1, 5, 10, 25, 50, 100]:
             sigusd_minted = size * oracle_price * (1 - bank_fee)
             # Swap SigUSD -> ERG: 1 SigUSD = (1/spec_price) ERG minus pool fee
@@ -183,11 +183,11 @@ async def main():
         print()
         if not can_redeem:
             print(f"  *** BLOCKED: RR={rr:.0f}% (needs <800% to redeem) ***")
-            print(f"  Showing hypothetical math if redeeming were available:")
+            print("  Showing hypothetical math if redeeming were available:")
             print()
 
-        print(f"  Size    Buy SigUSD   Redeem->ERG  Profit ERG   Profit %")
-        print(f"  ------- ------------ ------------ ------------ ----------")
+        print("  Size    Buy SigUSD   Redeem->ERG  Profit ERG   Profit %")
+        print("  ------- ------------ ------------ ------------ ----------")
         for size in [1, 5, 10, 25, 50, 100]:
             # Swap ERG -> SigUSD: spend ERG, get SigUSD at pool rate minus fee
             sigusd_bought = size * spec_price * (1 - spec_fee)
@@ -211,32 +211,32 @@ async def main():
         print()
         if not can_mint and not can_redeem:
             print(f"  BOTH bank operations are blocked (RR={rr:.0f}%)")
-            print(f"  - Mint needs RR > 400%")
-            print(f"  - Redeem needs RR < 800%")
+            print("  - Mint needs RR > 400%")
+            print("  - Redeem needs RR < 800%")
         elif can_mint:
-            print(f"  Bank MINTING is available!")
-            print(f"  Path A would yield significant profit if executed.")
+            print("  Bank MINTING is available!")
+            print("  Path A would yield significant profit if executed.")
         elif can_redeem:
-            print(f"  Bank REDEEMING is available, but Path B loses money")
-            print(f"  because buying SigUSD on Spectrum is expensive (SigUSD premium).")
+            print("  Bank REDEEMING is available, but Path B loses money")
+            print("  because buying SigUSD on Spectrum is expensive (SigUSD premium).")
         print()
 
-        print(f"  EXECUTION READINESS:")
+        print("  EXECUTION READINESS:")
         print(f"  {'-'*50}")
         print(f"  Wallet:             {erg_balance:.4f} ERG")
         print(f"  Node:               OK ({NODE})")
-        print(f"  ERG->SigUSD (Mew):  READY (tested)")
-        print(f"  ERG->USE (Crux):    READY (tested)")
+        print("  ERG->SigUSD (Mew):  READY (tested)")
+        print("  ERG->USE (Crux):    READY (tested)")
         print(f"  SigUSD Bank mint:   {'BLOCKED (RR too low)' if not can_mint else 'AVAILABLE'}")
         print(f"  SigUSD Bank redeem: {'BLOCKED' if not can_redeem else 'AVAILABLE'}")
-        print(f"  Spectrum swap:      CODE NOT YET BUILT")
-        print(f"  Bank TX builder:    CODE NOT YET BUILT")
+        print("  Spectrum swap:      CODE NOT YET BUILT")
+        print("  Bank TX builder:    CODE NOT YET BUILT")
         print()
         if not can_mint:
-            print(f"  --> No actionable opportunity right now.")
-            print(f"      Bank minting blocked. When RR climbs above 400%,")
-            print(f"      Path A could be very profitable (~20% if spread holds).")
-            print(f"      The scanner + Discord notifications will alert you.")
+            print("  --> No actionable opportunity right now.")
+            print("      Bank minting blocked. When RR climbs above 400%,")
+            print("      Path A could be very profitable (~20% if spread holds).")
+            print("      The scanner + Discord notifications will alert you.")
 
 
 if __name__ == "__main__":

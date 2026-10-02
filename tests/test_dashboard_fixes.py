@@ -6,10 +6,9 @@ import logging
 import pytest
 from rich.console import Console
 
-import arbitrage.scanner as scanner_module
 import config
 from tests.test_scanner_views import make  # noqa: F401  (fixture)
-from tests.test_chain_scanner import HEALTHY, KEY, Reader, snap
+from tests.test_chain_scanner import HEALTHY
 
 
 # 1. Node health blockers reach the Live panel (and the log)

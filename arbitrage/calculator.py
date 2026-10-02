@@ -133,7 +133,7 @@ class ArbitrageCalculator:
         price_risk = exec_time * PRICE_RISK_PER_MINUTE
 
         return ArbitrageOpportunity(
-            path=f"ERG -> SigUSD (Bank) -> ERG (DEX)",
+            path="ERG -> SigUSD (Bank) -> ERG (DEX)",
             input_erg=input_erg,
             output_erg=output_erg,
             profit_erg=profit_erg,
@@ -186,7 +186,7 @@ class ArbitrageCalculator:
         price_risk = exec_time * PRICE_RISK_PER_MINUTE
 
         return ArbitrageOpportunity(
-            path=f"ERG -> SigUSD (DEX) -> ERG (Bank)",
+            path="ERG -> SigUSD (DEX) -> ERG (Bank)",
             input_erg=input_erg,
             output_erg=output_erg,
             profit_erg=profit_erg,
@@ -227,7 +227,6 @@ class ArbitrageCalculator:
         usdt_after_transfer = usdt_after_sell - usdt_transfer_fee
 
         # Step 3: Buy ERG with USDT
-        erg_gross = usdt_after_transfer / buy_price_usdt
         buy_fee_usdt = usdt_after_transfer * buy_trading_fee
         erg_bought = (usdt_after_transfer - buy_fee_usdt) / buy_price_usdt
         fees.trading_fee += buy_fee_usdt
@@ -243,7 +242,7 @@ class ArbitrageCalculator:
         price_risk = exec_time * PRICE_RISK_PER_MINUTE
 
         return ArbitrageOpportunity(
-            path=f"Sell ERG -> USDT -> Buy ERG",
+            path="Sell ERG -> USDT -> Buy ERG",
             input_erg=input_erg,
             output_erg=erg_received,
             profit_erg=profit_erg,

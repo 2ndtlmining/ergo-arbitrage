@@ -2,10 +2,8 @@ import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional
 
 from rich.table import Table
-from rich.panel import Panel
 
 from logging_config import console
 

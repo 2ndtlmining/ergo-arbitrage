@@ -2,14 +2,13 @@
 import asyncio
 
 import aiohttp
-import pytest
 
 import arbitrage.scanner as scanner_module
 import config
 from ergo.chain_state import ChainSnapshot
 from tests.test_bank_redeem_tx import BANK_BOX, ORACLE_BOX
 from tests.test_chain_arb import pool_box
-from tests.test_chain_scanner import KEY, WALLET, Reader, scanner, snap  # noqa: F401  (fixture)
+from tests.test_chain_scanner import KEY, Reader, scanner, snap  # noqa: F401  (fixture)
 
 
 # Important 1: any failure to read or price chain state fails closed
