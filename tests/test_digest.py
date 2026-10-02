@@ -39,6 +39,7 @@ def test_open_episode_is_closed_after_a_restart(tmp_path):
     t.close()
     t2 = ProfitTracker(str(tmp_path / "r.db"))
     try:
+        t2.claim_stale_chain_episodes()                      # what the next bot start does
         (row,) = t2.chain_episodes_since("2000-01-01")
         assert row["closed_at"] is not None
     finally:
@@ -105,7 +106,7 @@ def test_restart_keeps_the_message_id_and_last_seen_time(tmp_path):
     t.close()
     t2 = ProfitTracker(str(tmp_path / "s.db"))
     try:
-        (stale,) = t2.stale_chain_episodes
+        (stale,) = t2.claim_stale_chain_episodes()
         assert stale["message_id"] == "m42" and stale["peak_profit_percent"] == 4.0
         (row,) = t2.chain_episodes_since("2000-01-01")
         assert row["closed_at"] == row["last_seen_at"] and row["closed_at"] > row["opened_at"]
@@ -121,3 +122,27 @@ def test_digest_mint_line_from_the_bank_state(tracker):
     d = build_digest(tracker, None, None, datetime.now(), bank=blocked)
     assert d.mint == "✗ needs ERG $0.398 (+24.2%)"
     assert build_digest(tracker, None, None, datetime.now()).mint is None   # bank not read yet
+
+
+
+def test_a_second_process_does_not_close_the_running_bots_episodes(tmp_path):
+    """Review: opening the tracker (e.g. a --once run) must not claim another process's open episodes."""
+    t = ProfitTracker(str(tmp_path / "p.db"))
+    t.open_chain_episode(ep())
+    other = ProfitTracker(str(tmp_path / "p.db"))
+    try:
+        (row,) = t.chain_episodes_since("2000-01-01")
+        assert row["closed_at"] is None
+        (claimed,) = other.claim_stale_chain_episodes()      # only the long-running bot calls this
+        assert claimed["closed_at"] and claimed["path"] == "pool→redeem"
+        assert other.claim_stale_chain_episodes() == []
+    finally:
+        other.close()
+        t.close()
+
+
+def test_touch_keeps_the_last_seen_time(tracker):
+    i = tracker.open_chain_episode(ep())
+    tracker.touch_chain_episode(i)
+    (row,) = tracker.chain_episodes_since("2000-01-01")
+    assert row["last_seen_at"] and row["last_seen_at"] >= row["opened_at"]

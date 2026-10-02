@@ -28,14 +28,6 @@ class ProfitTracker:
         self._open_episodes: dict[str, int] = {}  # path_key -> episode id
         self._session_episode_best: dict[int, float] = {}  # episode id -> best profit
         self._close_stale_episodes()
-        # Episodes a stopped process left open: kept so the scanner can close their Discord message
-        self.stale_chain_episodes = [dict(r) for r in self.conn.execute(
-            "SELECT * FROM chain_episodes WHERE closed_at IS NULL").fetchall()]
-        self.conn.execute("UPDATE chain_episodes SET closed_at = COALESCE(last_seen_at, opened_at) "
-                          "WHERE closed_at IS NULL")
-        self.conn.commit()
-        for row in self.stale_chain_episodes:
-            row["closed_at"] = row.get("last_seen_at") or row["opened_at"]
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -676,6 +668,26 @@ class ProfitTracker:
 
     def set_chain_episode_message(self, episode_id: int, message_id: str):
         self.conn.execute("UPDATE chain_episodes SET message_id = ? WHERE id = ?", (message_id, episode_id))
+        self.conn.commit()
+
+    def claim_stale_chain_episodes(self) -> list[dict]:
+        """Close the episodes a stopped process left open and return them (for their Discord message).
+
+        Only the long-running bot calls this at start; a --once run or another tool opening the same
+        database must not close a running bot's episodes.
+        """
+        rows = [dict(r) for r in self.conn.execute("SELECT * FROM chain_episodes WHERE closed_at IS NULL")]
+        self.conn.execute("UPDATE chain_episodes SET closed_at = COALESCE(last_seen_at, opened_at) "
+                          "WHERE closed_at IS NULL")
+        self.conn.commit()
+        for row in rows:
+            row["closed_at"] = row.get("last_seen_at") or row["opened_at"]
+        return rows
+
+    def touch_chain_episode(self, episode_id: int):
+        """Heartbeat for an open episode, so a crash still records roughly how long it lasted."""
+        self.conn.execute("UPDATE chain_episodes SET last_seen_at = ? WHERE id = ?",
+                          (datetime.now().isoformat(), episode_id))
         self.conn.commit()
 
     def close_chain_episode(self, episode_id: int, ep):

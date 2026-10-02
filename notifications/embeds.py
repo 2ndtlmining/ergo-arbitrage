@@ -99,12 +99,14 @@ def mint_gate_embed(event) -> dict:
                   field("Oracle", f"${event.oracle_price:.4f}/ERG")]
         return embed(f"Bank mint OPEN · RR {event.reserve_ratio:.0f}%", GREEN, fields,
                      description="Bank mint -> pool sell is possible now; --live trades it when profitable.")
-    if event.open_price and event.oracle_price:
-        reopen = (f"ERG ${event.open_price:.3f} "
-                  f"({(event.open_price / event.oracle_price - 1) * 100:+.1f}%)")
+    if event.open_price and event.oracle_price and event.open_price > event.oracle_price:
+        reopen = field("Reopens at", f"ERG ${event.open_price:.3f} "
+                                     f"({(event.open_price / event.oracle_price - 1) * 100:+.1f}%)")
+    elif event.open_price and event.oracle_price:   # RR >= 400% already; the room is what is missing
+        reopen = field("Room", f"room only {event.room_erg:.2f} ERG mintable")
     else:
-        reopen = None
-    fields = [field("RR", f"{event.reserve_ratio:.0f}%"), field("Reopens at", reopen)]
+        reopen = field("Reopens at", None)
+    fields = [field("RR", f"{event.reserve_ratio:.0f}%"), reopen]
     return embed(f"Bank mint closed · open for {duration(event.open_for_s or 0)}", GREY, fields)
 
 

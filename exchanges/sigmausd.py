@@ -150,8 +150,8 @@ def mint_open_price(state: BankState) -> Optional[float]:
 def mint_room_cents(state: BankState) -> int:
     """Most SigUSD cents mintable now with the post-mint RR still >= 400% (0 when blocked).
 
-    can_mint_sigusd is monotone decreasing in cents whenever RR > 102% (a mint adds ERG at ~102%
-    collateral); below that, minting one cent is already blocked, so the search returns 0.
+    can_mint_sigusd is monotone decreasing in cents: each extra cent adds about 1.02 * nominal price
+    of ERG but needs 4 * rate, and the nominal price never exceeds the rate.
     """
     if state.rate <= 0:
         return 0

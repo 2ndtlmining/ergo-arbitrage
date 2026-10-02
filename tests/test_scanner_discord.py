@@ -1,5 +1,6 @@
 """Scanner -> Discord: one message per episode, health alerts, legacy flow only for CEX/USE (spec)."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -178,12 +179,13 @@ def test_message_id_is_saved_with_the_episode(notify, monkeypatch):
 
 
 def test_restart_closes_the_stale_discord_message(notify):
-    notify.tracker.stale_chain_episodes = [
+    stale = [
         {"path": "pool→redeem", "message_id": "m9", "peak_profit_percent": 3.5, "peak_profit_erg": 1.5,
          "opened_at": "2026-10-03T08:00:00", "closed_at": "2026-10-03T08:06:40"},
         {"path": "pool→redeem", "message_id": None, "peak_profit_percent": 1.0, "peak_profit_erg": 0.6,
          "opened_at": "2026-10-03T07:00:00", "closed_at": "2026-10-03T07:00:00"},
     ]
+    notify.tracker.claim_stale_chain_episodes = lambda: stale
     notify._close_stale_discord_messages()
     assert [(mid, e["title"].split(" · ")[0]) for mid, e in notify.edits] == [("m9", "Closed")]
 
@@ -256,5 +258,78 @@ def test_open_mint_message_survives_a_crash(notify, monkeypatch):
     assert mid and mid.startswith("m")
     notify.edits.clear()
     notify._close_stale_discord_messages()                 # what the next start does
-    assert [(m, e["title"]) for m, e in notify.edits] == [(mid, "Bank mint · bot stopped")]
+    assert [(m, e["title"]) for m, e in notify.edits if e["title"].startswith("Bank mint")] == [
+        (mid, "Bank mint · bot stopped")]
     assert not notify.tracker.get_meta("mint_gate_message")
+
+
+
+def test_one_failing_discord_check_does_not_skip_the_others(notify, monkeypatch):
+    seen = []
+
+    def broken(*a, **k):
+        raise RuntimeError("episodes broke")
+
+    monkeypatch.setattr(notify.episodes, "update", broken)
+    monkeypatch.setattr(notify.health, "update", lambda now, state: seen.append("health") or [])
+    monkeypatch.setattr(notify.mint_gate, "update", lambda now, bank: seen.append("mint"))
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    run(notify.poll_once(0))
+    assert seen == ["health", "mint"]
+
+
+def test_open_episodes_get_a_heartbeat(notify, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    for t in (0, 2, 4):
+        run(notify.poll_once(t))
+    (row,) = notify.tracker.chain_episodes_since("2000-01-01")
+    assert row["last_seen_at"] is None                     # no edit yet (profit unchanged)
+    run(notify.poll_once(70))
+    (row,) = notify.tracker.chain_episodes_since("2000-01-01")
+    assert row["last_seen_at"] is not None
+
+
+def test_digest_during_a_chain_outage_has_no_stale_mint_line(notify, monkeypatch):
+    got = []
+    monkeypatch.setattr(scanner_module, "digest_due", lambda *a: True)
+    monkeypatch.setattr(scanner_module, "build_digest",
+                        lambda *a, **k: got.append(k.get("bank")) or SimpleNamespace(
+                            hours=24, paths={}, potential_erg=0.0, trades={"count": 0, "net_erg": 0.0, "failed": 0},
+                            outages=[], outage_since="", wallet=None, mint=None))
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap(), RuntimeError("node down")))
+    run(notify.poll_once(0))
+    run(notify.poll_once(20))
+    assert got[0] is not None and got[-1] is None
+
+
+def digest_posts(s):
+    return [e for e, _ in s.posts if e["title"].startswith("Daily digest")]
+
+
+def test_digest_is_marked_sent_only_once_delivered(notify, monkeypatch):
+    """Review: a digest queued while Discord is down must be retried, not silently lost."""
+    undelivered = []
+    monkeypatch.setattr(notify.discord, "post", lambda embed, content="", on_id=None: undelivered.append(
+        (embed, on_id)))
+    monkeypatch.setattr(scanner_module, "digest_due", lambda tracker, now, hour: tracker.get_meta("digest_date") is None)
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    run(notify.poll_once(0))
+    run(notify.poll_once(20))                                  # still in flight: not queued twice
+    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Daily digest")]
+    assert len(digests) == 1 and notify.tracker.get_meta("digest_date") is None
+    notify._digest_queued_at -= 601                            # the post never came back
+    run(notify.poll_once(40))
+    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Daily digest")]
+    assert len(digests) == 2
+    digests[-1][1]("m9")                                       # Discord returned the message id
+    assert notify.tracker.get_meta("digest_date") is not None
+
+
+def test_once_runs_leave_other_processes_messages_alone(notify, monkeypatch):
+    calls = []
+    monkeypatch.setattr(notify, "_close_stale_discord_messages", lambda: calls.append("stale"))
+    monkeypatch.setattr(notify, "connect_all", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(notify, "disconnect_all", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
+    run(notify.run(once=True))
+    assert calls == []

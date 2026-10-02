@@ -30,7 +30,9 @@ class DiscordNotifier:
         self.cooldown_seconds: int = config.DISCORD_COOLDOWN_SECONDS
         self._session: Optional[aiohttp.ClientSession] = None
         self._last_notified: dict[str, float] = {}
-        self._jobs: deque = deque()          # ("post", embed, content, on_id) | ("edit", embed, get_id) | ("text", content)
+        self._jobs: deque = deque()          # ("post", embed, content, on_id) | ("edit", embed, get_id)
+                                             # | ("text", content, keep): keep=True is never evicted
+        self._drain_until: Optional[float] = None   # loop time stop() gives up at; caps rate-limit waits
         self._worker: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None
         self._busy = False
@@ -128,7 +130,7 @@ class DiscordNotifier:
         if not self.enabled:
             return
         if len(self._jobs) >= QUEUE_MAX:
-            oldest_post = next((j for j in self._jobs if j[0] != "edit"), None)
+            oldest_post = next((j for j in self._jobs if j[0] == "post" or (j[0] == "text" and not j[2])), None)
             self._jobs.remove(oldest_post if oldest_post is not None else self._jobs[0])
             logger.warning("Discord queue full: dropped the oldest message")
         self._jobs.append(job)
@@ -203,8 +205,11 @@ class DiscordNotifier:
                         data = await r.json(content_type=None) or {}
                     except Exception:  # e.g. a Cloudflare HTML page: fall back to the header
                         data = {}
-                    retry = data.get("retry_after") or headers.get("Retry-After") or 5
-                    await self._sleep(min(float(retry), RETRY_CAP_S))
+                    retry = min(float(data.get("retry_after") or headers.get("Retry-After") or 5), RETRY_CAP_S)
+                    if self._drain_until is not None and loop.time() + retry >= self._drain_until:
+                        logger.warning(f"Discord {method} dropped at shutdown: rate limited for {retry:g}s")
+                        return status, None
+                    await self._sleep(retry)
                     continue
                 body = await r.json(content_type=None) if status == 200 else None
                 if status not in (200, 204):
@@ -220,8 +225,12 @@ class DiscordNotifier:
             return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while (self._jobs or self._busy) and loop.time() < deadline:
-            await asyncio.sleep(0.05)
+        self._drain_until = deadline
+        try:
+            while (self._jobs or self._busy) and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+        finally:
+            self._drain_until = None
         self._worker.cancel()
         try:
             await self._worker
@@ -232,7 +241,7 @@ class DiscordNotifier:
     async def notify_live(self, text: str, ping: bool = True) -> bool:
         """Live-trading event (trade executed, failure, pause)."""
         prefix = f"{self._ping()} " if ping and self._ping() else ""
-        self._enqueue(("text", f"{prefix}**LIVE**: {text}"))
+        self._enqueue(("text", f"{prefix}**LIVE**: {text}", True))  # the only ping for a live failure
         return True
 
     async def notify_watch(self, exchange: str, text: str) -> bool:
@@ -241,7 +250,7 @@ class DiscordNotifier:
         if time.time() - self._last_notified.get(key, 0) < config.CEX_WATCH_COOLDOWN_SECONDS:
             return False
         content = f"**CEX watch-only: {exchange}**\n{text}\nNot executable: {exchange} is not connected (no API keys)."
-        self._enqueue(("text", content))
+        self._enqueue(("text", content, False))
         self._last_notified[key] = time.time()
         return True
 
@@ -408,7 +417,7 @@ class DiscordNotifier:
         if not self.enabled or not opportunities:
             return
         msg = self._format_scan_summary(opportunities, scan_number)
-        self._enqueue(("text", msg))
+        self._enqueue(("text", msg, False))
 
     async def send_wallet_analysis(self, wallet: dict, analysis: dict):
         """Wallet balances and the best options per asset, as one embed."""
