@@ -37,6 +37,19 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
 
+TRADE_SIZE_GRID = [1, 5, 10, 25, 50, 100]
+
+# Minimum balance per asset before the wallet analysis is worth showing
+WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "use": (0.01, "USE", ".3f")}
+
+
+def trade_sizes_for(max_trade_erg: float) -> list[float]:
+    """Grid sizes up to the configured max trade size (the cap itself included)."""
+    sizes = [s for s in TRADE_SIZE_GRID if s <= max_trade_erg]
+    if max_trade_erg not in sizes and max_trade_erg < TRADE_SIZE_GRID[-1]:
+        sizes.append(max_trade_erg)
+    return sizes or [max_trade_erg]
+
 
 class ArbitrageScanner:
     def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db",
@@ -58,7 +71,7 @@ class ArbitrageScanner:
         self._crux_session: Optional[aiohttp.ClientSession] = None
         self.scan_count = 0
         self._last_snapshot_id = None
-        self._trade_sizes = [1, 5, 10, 25, 50, 100]
+        self._trade_sizes = trade_sizes_for(config.MAX_TRADE_SIZE_ERG)
 
         # Notification anti-spam state
         self._opportunity_streak: dict[str, int] = {}
@@ -116,10 +129,11 @@ class ArbitrageScanner:
         if self._crux_session:
             await self._crux_session.close()
             self._crux_session = None
+        venues = [self.spectrum.disconnect()]
+        if self.enable_cex:
+            venues += [self.nonkyc.disconnect(), self.kucoin.disconnect()]
         await asyncio.gather(
-            self.nonkyc.disconnect(),
-            self.kucoin.disconnect(),
-            self.spectrum.disconnect(),
+            *venues,
             self.sigmausd.disconnect(),
             self.ergo_node.disconnect(),
             self.discord.disconnect(),
@@ -1306,8 +1320,12 @@ class ArbitrageScanner:
             balance = info["balance"]
             options = info["options"]
 
-            if (asset_key == "erg" and balance < 2) or (asset_key == "sigusd" and balance < 0.5) or (asset_key == "use" and balance < 0.01):
+            minimum, unit, fmt = WALLET_MINIMUMS[asset_key]
+            if balance <= 0:
                 console.print(f"  [dim]{label}: No balance[/dim]")
+                continue
+            if balance < minimum:
+                console.print(f"  [dim]{label}: {balance:{fmt}} (below {minimum:g} {unit} minimum for path analysis)[/dim]")
                 continue
 
             if not options:
