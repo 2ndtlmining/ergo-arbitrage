@@ -73,7 +73,7 @@ def prices_panel(s: DashboardState) -> Panel:
         peg = f"  SigUSD peg {(oracle / spot - 1) * 100:+.1f}%" if spot else ""
         rows.append(f"Oracle  ${oracle:.4f}/ERG{peg}")
     if bank.get("reserve_ratio") is not None:
-        mint = "✓" if bank.get("can_mint_sigusd") else "✗ (<400%)"
+        mint = s.mint_text or ("✓" if bank.get("can_mint_sigusd") else "✗ (<400%)")
         rows.append(f"Bank    RR {bank['reserve_ratio']:.0f}%  redeem ✓  mint {mint}")
     return Panel("\n".join(rows), title="Prices")
 

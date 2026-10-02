@@ -111,3 +111,13 @@ def test_restart_keeps_the_message_id_and_last_seen_time(tmp_path):
         assert row["closed_at"] == row["last_seen_at"] and row["closed_at"] > row["opened_at"]
     finally:
         t2.close()
+
+
+from exchanges.sigmausd import BankState
+
+
+def test_digest_mint_line_from_the_bank_state(tracker):
+    blocked = {"state": BankState(1_006_250 * 10**9, 10_000_000, 3_125_000_000)}
+    d = build_digest(tracker, None, None, datetime.now(), bank=blocked)
+    assert d.mint == "✗ needs ERG $0.398 (+24.2%)"
+    assert build_digest(tracker, None, None, datetime.now()).mint is None   # bank not read yet

@@ -61,3 +61,11 @@ def test_sparkline():
     assert sparkline([]) == ""
     assert sparkline([1.0, 1.0, 1.0]) == "▁▁▁"
     assert sparkline([0.0, 5.0, 10.0]) == "▁▄█"
+
+
+def test_bank_line_uses_the_mint_gate_text():
+    s = full_state()
+    s.mint_text = "✗ needs ERG $0.398 (+24.2%)"
+    assert "mint ✗ needs ERG $0.398 (+24.2%)" in text(render(s))
+    s.mint_text = None
+    assert "mint ✗ (<400%)" in text(render(s))        # unchanged fallback before the first read

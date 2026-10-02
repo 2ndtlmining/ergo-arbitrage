@@ -72,6 +72,7 @@ class DashboardState:
         self.read_ms: Optional[float] = None
         self.chain_error: Optional[str] = None
         self.prices: dict = {}
+        self.mint_text: Optional[str] = None   # mint gate status, e.g. "✗ needs ERG $0.392 (+21.7%)"
         self.venues: list[VenueStatus] = []
         self.paths: dict[str, PathRow] = {}
         self.live = ""

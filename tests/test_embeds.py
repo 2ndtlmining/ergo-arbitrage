@@ -104,3 +104,24 @@ def test_stale_episode_embed_after_a_restart():
     e = embeds.stale_episode_embed(row)
     assert e["color"] == embeds.GREY and e["title"].startswith("Closed · pool→redeem")
     assert "bot restarted" in values(e) and "+3.50%" in values(e) and "6m 40s" in values(e)
+
+
+from notifications.mint_gate import MintGateEvent, MintOpening
+
+
+def test_mint_gate_embeds():
+    opened = embeds.mint_gate_embed(MintGateEvent("opened", 403.2, 85.4, 0.31, 0.3125, MintOpening(0.0), None, True))
+    assert opened["color"] == embeds.GREEN and opened["title"] == "Bank mint OPEN · RR 403%"
+    assert "~85 ERG" in values(opened) and "--live" in values(opened)
+    closed = embeds.mint_gate_embed(MintGateEvent("closed", 398.0, 0.0, 0.3141, 0.3125, MintOpening(0.0), 750.0,
+                                                  False))
+    assert closed["color"] == embeds.GREY and closed["title"] == "Bank mint closed · open for 12m 30s"
+    assert "$0.314" in values(closed) and "+0.5%" in values(closed)
+
+
+def test_digest_embed_shows_the_mint_line_only_when_known():
+    d = SimpleNamespace(hours=24, paths={}, potential_erg=0.0, trades={"count": 0, "net_erg": 0.0, "failed": 0},
+                        outages=[], outage_since="", wallet=None, mint="✗ needs ERG $0.398 (+24.2%)")
+    assert "Bank mint" in values(embeds.digest_embed(d)) and "$0.398" in values(embeds.digest_embed(d))
+    d.mint = None
+    assert "Bank mint" not in values(embeds.digest_embed(d))
