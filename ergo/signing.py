@@ -88,3 +88,10 @@ async def guarded_sign(ns, node_url: str, unsigned_tx: dict, policy: SignPolicy,
         if r.status != 200:
             raise Exception(f"Sign failed: HTTP {r.status} - {body[:500]}")
         return await r.json()
+
+
+async def check_on_node(ns, node_url: str, signed_tx: dict) -> tuple[bool, str]:
+    """Ask the node to fully validate a signed TX (scripts included) without broadcasting it."""
+    async with ns.post(f"{node_url}/transactions/check", json=signed_tx, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        body = await r.text()
+        return r.status == 200, body[:800]

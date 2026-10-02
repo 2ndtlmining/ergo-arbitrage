@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo.signing import DryRun, guarded_sign, wallet_trees
+from ergo.chain import explorer_box_id, node_box, wallet_context
+from ergo.signing import DryRun, guarded_sign
 from ergo.sigmausd_tx import build_redeem_tx
 from ergo.tx_guard import SignPolicy, TxGuardError
 
@@ -27,25 +28,6 @@ UI_FEE_TREE = "0008cd02c5f61c83056a746a19a9e449e3c9596314cc417a2ef496b7567af5585
 CHECK_INTERVAL = 30
 MAX_WAIT = 600
 TIMEOUT = aiohttp.ClientTimeout(total=30)
-
-
-async def explorer_box_id(s, token_id: str) -> str:
-    async with s.get(f"{EXPLORER}/boxes/unspent/byTokenId/{token_id}?limit=1", timeout=TIMEOUT) as r:
-        data = await r.json()
-    items = data.get("items", data) if isinstance(data, dict) else data
-    if not items:
-        raise RuntimeError(f"no unspent box found for token {token_id[:8]}")
-    return items[0]["boxId"]
-
-
-async def node_box(ns, box_id: str) -> dict:
-    """Box as the node sees it (UTXO set + mempool). Fails if the explorer was behind."""
-    async with ns.get(f"{NODE}/utxo/withPool/byId/{box_id}", timeout=TIMEOUT) as r:
-        if r.status != 200:
-            raise RuntimeError(
-                f"box {box_id[:12]} is not unspent on the node (explorer lagging or already spent); retry next block"
-            )
-        return await r.json()
 
 
 async def main(redeem_sigusd: float, execute: bool):
@@ -70,17 +52,8 @@ async def main(redeem_sigusd: float, execute: bool):
             print(f"ABORTED: {e}")
             return
 
-        async with ns.get(f"{NODE}/wallet/boxes/unspent?minConfirmations=0&minInclusionHeight=0", timeout=TIMEOUT) as r:
-            wallet_boxes = [wb["box"] for wb in await r.json()]
-        async with ns.get(f"{NODE}/info", timeout=TIMEOUT) as r:
-            height = (await r.json()).get("fullHeight", 0)
-        async with ns.get(f"{NODE}/wallet/addresses", timeout=TIMEOUT) as r:
-            first_address = (await r.json())[0]
-        async with ns.get(f"{NODE}/utils/addressToRaw/{first_address}", timeout=TIMEOUT) as r:
-            our_tree = "0008cd" + (await r.json())["raw"]
-        trees = await wallet_trees(ns, NODE)
+        wallet_boxes, height, our_tree = await wallet_context(ns)
 
-    wallet_boxes = [b for b in wallet_boxes if b.get("ergoTree") in trees]
     try:
         unsigned_tx, info = build_redeem_tx(
             bank_box, oracle_box, wallet_boxes, cents, height=height, our_tree=our_tree, ui_fee_tree=UI_FEE_TREE

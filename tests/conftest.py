@@ -16,6 +16,7 @@ TEST_DEFAULTS = {
     "EXECUTION_BUFFER": 0.003,
     "MAX_FEE_BUDGET_ERG": 1.0,
     "ENABLE_CEX": False,
+    "ENABLE_USE": False,
 }
 
 

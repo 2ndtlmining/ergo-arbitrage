@@ -43,3 +43,9 @@ def test_skips_non_p2pk_boxes():
 
 def test_sum_assets():
     assert sum_assets([box("a", 1, {TOK: 1, OTHER: 2}), box("b", 1, {TOK: 3})]) == {TOK: 4, OTHER: 2}
+
+
+def test_erg_only_selection_uses_any_p2pk_box():
+    boxes = [box("t", 3_000_000_000, {TOK: 500}), box("plain", 1_000_000_000)]
+    chosen = select_boxes(boxes, token_id=None, token_amount=0, min_erg=3_500_000_000)
+    assert {b["boxId"] for b in chosen} == {"t", "plain"}

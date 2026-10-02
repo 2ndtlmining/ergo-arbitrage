@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import config
-from ergo.signing import DryRun, guarded_sign
+from ergo.signing import DryRun, check_on_node, guarded_sign
 from ergo.tx_guard import SignPolicy, TxGuardError
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "crux_swap_erg_to_sigusd.json").read_text())
@@ -40,6 +40,8 @@ class FakeNode:
     def __init__(self, boxes):
         self.boxes = {b["boxId"]: b for b in boxes}
         self.sign_requests = []
+        self.checked = []
+        self.check_status = 200
 
     def get(self, url, **kw):
         path = url[len(NODE):]
@@ -55,6 +57,9 @@ class FakeNode:
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, url, json=None, **kw):
+        if url == f"{NODE}/transactions/check":
+            self.checked.append(json)
+            return FakeResp(self.check_status, "txid" if self.check_status == 200 else {"detail": "Script reduced to false"})
         assert url == f"{NODE}/wallet/transaction/sign"
         self.sign_requests.append(json)
         return FakeResp(200, {"id": "signed"})
@@ -114,3 +119,16 @@ def test_dry_run_still_reports_guard_failures():
     node = FakeNode(FIXTURE["input_boxes"])
     with pytest.raises(TxGuardError):
         run(guarded_sign(node, NODE, tx, POLICY, execute=False))
+
+
+def test_check_on_node_valid():
+    node = FakeNode([])
+    ok, detail = run(check_on_node(node, NODE, {"id": "signed"}))
+    assert ok and node.checked == [{"id": "signed"}]
+
+
+def test_check_on_node_rejected():
+    node = FakeNode([])
+    node.check_status = 400
+    ok, detail = run(check_on_node(node, NODE, {"id": "signed"}))
+    assert not ok and "Script reduced to false" in detail

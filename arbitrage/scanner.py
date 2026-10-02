@@ -53,13 +53,14 @@ def trade_sizes_for(max_trade_erg: float) -> list[float]:
 
 class ArbitrageScanner:
     def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db",
-                 enable_cex: Optional[bool] = None):
+                 enable_cex: Optional[bool] = None, enable_use: Optional[bool] = None):
         """
         mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
         """
         self.mode = mode
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
+        self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
         self.nonkyc = NonKYCExchange()
         self.kucoin = KucoinExchange()
         self.spectrum = SpectrumDEX()
@@ -175,8 +176,8 @@ class ArbitrageScanner:
             self.kucoin.fetch_erg_usdt_price() if self.enable_cex else _none(),
             self.spectrum.get_pool_state(),
             self.sigmausd.get_full_state(),
-            self._fetch_use_lp(),
-            self._fetch_use_mint_status(),
+            self._fetch_use_lp() if self.enable_use else _none(),
+            self._fetch_use_mint_status() if self.enable_use else _none(),
             return_exceptions=True,
         )
 
@@ -347,8 +348,8 @@ class ArbitrageScanner:
         bank_state: Optional[BankState] = bank.get("state")
 
         # USE (Dexy): LP read on-chain, mint status/state from Crux
-        use_lp = prices.get("use_lp")
-        use_mint = prices.get("use_mint")
+        use_lp = prices.get("use_lp") if self.enable_use else None
+        use_mint = prices.get("use_mint") if self.enable_use else None
         use_mint_ok = mint_available(use_mint)
         use_box_state = mint_box_state(use_mint)
 
@@ -1177,7 +1178,7 @@ class ArbitrageScanner:
 
         # ===================== USE OPTIONS =====================
         # USE -> ERG is the first hop, then ERG unlocks more paths
-        use_lp = prices.get("use_lp")
+        use_lp = prices.get("use_lp") if self.enable_use else None
         if use > 0.01:
             if oracle_price and oracle_price > 0 and use_lp is not None:
                 baseline_usdt = use  # 1 USE ~= $1
@@ -1499,7 +1500,8 @@ class ArbitrageScanner:
             f"Max trade size: {config.MAX_TRADE_SIZE_ERG} ERG\n"
             f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s\n"
             f"Trade sizes monitored: {self._trade_sizes}\n"
-            f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}\n"
+            f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}"
+            f"{'' if self.enable_use else ', USE disabled (ENABLE_USE=false)'}\n"
             f"{discord_line}",
             title="Starting Up",
             border_style="red" if self.mode == "live" else "magenta",
