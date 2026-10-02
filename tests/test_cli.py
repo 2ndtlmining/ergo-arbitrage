@@ -66,3 +66,12 @@ class TestBalance:
         assert "pending" in text.lower() and "-1.0000 ERG" in text  # unconfirmed change shown
         assert "SigUSD on the pool: $1.03" in text
         assert "RR 330%" in text and "mint blocked" in text
+
+
+def test_balance_lines_flag_stale_entries():
+    lines = balance_lines(confirmed={"erg": 20.7119, "sigusd": 0}, unconfirmed={"erg": 20.7119, "sigusd": 0},
+                          oracle_usd_per_erg=0.3274, pool_sigusd_per_erg=0.31, reserve_ratio=333.0,
+                          stale={"erg": 4.8625, "sigusd": 0, "count": 1})
+    text = "\n".join(lines)
+    assert "Pending" not in text
+    assert "Ignored" in text and "4.8625 ERG" in text and "no longer valid" in text

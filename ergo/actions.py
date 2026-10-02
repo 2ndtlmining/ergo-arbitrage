@@ -46,12 +46,17 @@ def send_policy(payee_tree: str, erg_nano: int, cents: int) -> SignPolicy:
 
 
 def balance_lines(confirmed: dict, unconfirmed: dict, oracle_usd_per_erg: Optional[float],
-                  pool_sigusd_per_erg: Optional[float], reserve_ratio: Optional[float]) -> list[str]:
+                  pool_sigusd_per_erg: Optional[float], reserve_ratio: Optional[float],
+                  stale: Optional[dict] = None) -> list[str]:
     erg, sig = confirmed.get("erg", 0.0), confirmed.get("sigusd", 0.0)
     lines = [f"  ERG:     {erg:,.4f} ERG", f"  SigUSD:  {sig:,.2f} SigUSD"]
     d_erg, d_sig = unconfirmed.get("erg", erg) - erg, unconfirmed.get("sigusd", sig) - sig
     if abs(d_erg) > 1e-9 or abs(d_sig) > 1e-9:
         lines.append(f"  Pending (unconfirmed): {d_erg:+,.4f} ERG, {d_sig:+,.2f} SigUSD")
+    if stale and stale.get("count"):
+        lines.append(f"  Ignored: {stale['erg']:,.4f} ERG, {stale['sigusd']:,.2f} SigUSD that your node wallet still "
+                     f"lists from {stale['count']} box(es) of transactions that are no longer valid "
+                     f"(they will never confirm and are not spendable)")
     if oracle_usd_per_erg:
         total_erg = erg + sig / oracle_usd_per_erg
         lines.append(f"  Value:   ~{total_erg:,.4f} ERG / ~${total_erg * oracle_usd_per_erg:,.2f} (oracle "
@@ -117,11 +122,17 @@ async def _finish(ns, tx: dict, policy: SignPolicy, mode: str, log: Log) -> Opti
 async def balance(ns, log: Log):
     log("Reading your wallet and the SigmaUSD/pool state from your node...")
     conf = await _get(ns, "/wallet/balances") or {}
-    unconf = await _get(ns, "/wallet/balances/withUnconfirmed") or conf
+    stale_boxes: list[dict] = []
+    spendable, _, _ = await wallet_context(ns, on_stale=stale_boxes.extend)
 
     def summary(b):
         assets = b.get("assets", {}) or {}
         return {"erg": b.get("balance", 0) / 1e9, "sigusd": assets.get(SIGUSD, 0) / 100}
+
+    def from_boxes(boxes):
+        return {"erg": sum(int(x["value"]) for x in boxes) / 1e9, "sigusd": token_total(boxes, SIGUSD) / 100}
+
+    stale = dict(from_boxes(stale_boxes), count=len(stale_boxes))
 
     oracle = pool_spot = rr = None
     try:
@@ -133,7 +144,7 @@ async def balance(ns, log: Log):
         pool_spot = (y / 100) / (int(pool["value"]) / 1e9)
     except (RuntimeError, StopIteration, KeyError) as e:
         log(f"  (market data unavailable: {e})")
-    for line in balance_lines(summary(conf), summary(unconf), oracle, pool_spot, rr):
+    for line in balance_lines(summary(conf), from_boxes(spendable), oracle, pool_spot, rr, stale):
         log(line)
 
 
