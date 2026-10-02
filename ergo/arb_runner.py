@@ -74,7 +74,7 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
             except LegNotReady as e:
                 rebuilds -= 1
                 log(f"  Leg 2 rebuild waiting: {e}")
-            except (RuntimeError, TimeoutError, TxGuardError, ValueError) as e:
+            except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
                 log(f"  Leg 2 rebuild failed ({e}); retrying next round")
         if loop.time() >= deadline:
             return "timeout", tx_id
@@ -286,8 +286,8 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
     try:
         await wait_for_box(ns, leg1_out["boxId"], timeout=60)
         result.tx2 = await build_and_submit_leg2()
-    except (RuntimeError, TimeoutError, TxGuardError, ValueError) as e:
-        return fail(str(e))
+    except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
+        return fail(str(e) or e.__class__.__name__)
     log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
 
     if not wait_leg2:

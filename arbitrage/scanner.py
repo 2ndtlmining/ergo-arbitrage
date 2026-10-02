@@ -25,7 +25,7 @@ from exchanges.sigmausd import (
 )
 from exchanges.ergo_node import ErgoNodeClient
 from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
-from ergo.arb_runner import run_arb
+from ergo.arb_runner import ArbResult, run_arb
 from ergo.chain_state import ChainSnapshot, prices_from_snapshot, read_snapshot
 from arbitrage.optimizer import maximize
 from arbitrage.sizing import Market, SizeChoice, best_size
@@ -73,6 +73,8 @@ class ArbitrageScanner:
         self.discord = DiscordNotifier()
         self._http: Optional[aiohttp.ClientSession] = None  # shared: Crux API + explorer fallback
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
+        self._chain_prices: Optional[dict] = None           # its price entries
+        self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
         self._chain_error: Optional[str] = None             # set while chain reads fail
         self._last_full_scan = float("-inf")
         self._last_key: Optional[tuple] = None
@@ -182,8 +184,11 @@ class ArbitrageScanner:
         for display, record the error (which blocks trading) and log once per outage."""
         try:
             snap = await read_snapshot(self.ergo_node.session, self._http)
-        except (RuntimeError, ValueError, KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            message = str(e) or e.__class__.__name__
+            prices = prices_from_snapshot(snap)  # a snapshot only counts if it can be priced
+        except Exception as e:  # anything (malformed JSON too) fails closed; CancelledError still propagates
+            message = f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__
+            if isinstance(e, (RuntimeError, asyncio.TimeoutError)):
+                message = str(e) or e.__class__.__name__
             if self._chain_error is None:
                 logger.warning(f"Chain state unavailable: {message}")
             self._chain_error = message
@@ -191,7 +196,7 @@ class ArbitrageScanner:
         if self._chain_error is not None:
             logger.info("Chain state readable again")
         self._chain_error = None
-        self._snapshot = snap
+        self._snapshot, self._chain_prices = snap, prices
         self._price_timestamps["spectrum"] = self._price_timestamps["bank"] = time.time()
         return snap
 
@@ -217,8 +222,9 @@ class ArbitrageScanner:
         if isinstance(kucoin_price, Exception):
             logger.error(f"Kucoin price fetch failed: {kucoin_price}")
             kucoin_price = None
-        if isinstance(snap, BaseException):  # _read_chain catches the expected ones
+        if isinstance(snap, BaseException):  # _read_chain catches everything; fail closed regardless
             logger.error(f"Chain read failed: {snap}")
+            self._chain_error = str(snap) or snap.__class__.__name__
         if isinstance(use_lp, Exception):
             logger.error(f"USE LP fetch failed: {use_lp}")
             use_lp = None
@@ -229,8 +235,7 @@ class ArbitrageScanner:
         results["nonkyc_erg_usdt"] = nonkyc_price
         results["kucoin_erg_usdt"] = kucoin_price
         # Last good node snapshot (a failed read leaves it in place, marked stale by its age)
-        results.update(prices_from_snapshot(self._snapshot) if self._snapshot else
-                       {"spectrum_pool": None, "spectrum_erg_sigusd": None, "bank": {}})
+        results.update(self._chain_prices or {"spectrum_pool": None, "spectrum_erg_sigusd": None, "bank": {}})
         results["use_lp"] = use_lp
         results["use_mint"] = use_mint
 
@@ -1137,17 +1142,24 @@ class ArbitrageScanner:
         """Every reason `key` would not execute right now (empty list = ready)."""
         return self._path_blockers(key, wallet) + await self._global_blockers(wallet, prices)
 
-    async def _execute_trades(self, wallet: dict, prices: dict):
-        """--live: run the most profitable executable path at its best size when every check passes."""
+    async def _execute_trades(self, wallet: dict, prices: dict, quiet: bool = False):
+        """--live: run the most profitable executable path at its best size when every check passes.
+
+        quiet (fast polls): blocker lines are printed only when they differ from the last ones shown.
+        """
         if not self.trading_enabled:
             return
         global_blockers = await self._global_blockers(wallet, prices)
         ready = [k for k in LIVE_PATHS if not self._path_blockers(k, wallet)]
         if global_blockers or not ready:
-            for key in LIVE_PATHS:
-                reasons = self._path_blockers(key, wallet) + global_blockers
-                console.print(f"  [dim]LIVE {LIVE_PATHS[key]}: not trading - {'; '.join(reasons)}[/dim]")
+            lines = tuple(f"LIVE {LIVE_PATHS[key]}: not trading - "
+                          f"{'; '.join(self._path_blockers(key, wallet) + global_blockers)}" for key in LIVE_PATHS)
+            if not (quiet and lines == self._last_blocked):
+                for line in lines:
+                    console.print(f"  [dim]{line}[/dim]")
+            self._last_blocked = lines
             return
+        self._last_blocked = None
 
         key = max(ready, key=lambda k: self.last_sizing[k].profit_erg)
         path = LIVE_PATHS[key]
@@ -1157,8 +1169,12 @@ class ArbitrageScanner:
                             f"re-sizing on fresh boxes (cap {cap:g} ERG)[/bold red]", border_style="red"))
         trade_id = self.tracker.start_trade(None, choice.cost_erg, choice.cost_erg + choice.profit_erg,
                                             choice.profit_erg)
-        result = await run_arb(self.ergo_node.session, path, None, max_erg_in=int(round(cap * 1e9)),
-                               execute=True, log=lambda m: console.print(m))
+        try:
+            result = await run_arb(self.ergo_node.session, path, None, max_erg_in=int(round(cap * 1e9)),
+                                   execute=True, log=lambda m: console.print(m))
+        except Exception as e:  # fail closed: leg 1 may already be on chain
+            logger.error(f"LIVE runner error: {e}", exc_info=True)
+            result = ArbResult("error", f"{e.__class__.__name__}: {e}", path=path)
         size = result.erg_in / 1e9
         if result.erg_in:
             self.tracker.set_trade_input(trade_id, size, size + result.profit_nanoerg / 1e9,
@@ -1179,6 +1195,12 @@ class ArbitrageScanner:
             msg = (f"LEG 2 FAILED after leg 1 ({result.tx1}): {result.message}. Holding "
                    f"{result.sigusd_cents / 100:.2f} SigUSD. Live trading paused. Finish with: "
                    f"{result.recover_command}")
+        elif result.status == "error":
+            self._live_paused = f"runner error ({result.message})"
+            self.tracker.fail_trade(trade_id, result.message, notes=f"{path}; unexpected error, leg 1 may be on chain")
+            msg = (f"UNEXPECTED ERROR while executing {key}: {result.message}. Leg 1 may already be on chain: "
+                   f"check `python arb.py balance` (redeem any SigUSD with `python arb.py redeem --sigusd all "
+                   f"--execute`). Live trading paused.")
         else:
             if result.status == "refused":
                 self._live_paused = f"TX guard refused ({result.message})"
@@ -1734,13 +1756,13 @@ class ArbitrageScanner:
         if snap is None:
             self._update_live_streak()  # resets streaks while the chain is unreadable
             return
-        prices = prices_from_snapshot(snap)
+        prices = self._chain_prices
         self.last_optima = self._optimize_sizes(prices)
         self._update_live_streak()
         self._note_change()
         if self.trading_enabled and any(self._live_streak.get(k, 0) >= config.LIVE_CONFIRM_POLLS
                                         for k in LIVE_PATHS):
-            await self._execute_trades(await self._fetch_wallet_balances(), prices)
+            await self._execute_trades(await self._fetch_wallet_balances(), prices, quiet=True)
 
     def request_stop(self):
         """Ask the main loop to finish the current scan and shut down cleanly."""
