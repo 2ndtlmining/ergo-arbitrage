@@ -659,7 +659,49 @@ class ArbitrageScanner:
 
         return opportunities
 
-    def _display_opportunities(self, opportunities: list[ArbitrageOpportunity]):
+    @staticmethod
+    def _sigusd_premium_percent(prices: dict) -> Optional[float]:
+        """SigUSD price on the pool vs the oracle ($1), in percent."""
+        oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+        spot = prices.get("spectrum_erg_sigusd")
+        if not oracle or not spot:
+            return None
+        return (oracle / spot - 1) * 100
+
+    def _explain(self, opp: ArbitrageOpportunity, prices: dict) -> str:
+        """One line on why a path is (not) profitable at its best size."""
+        min_pct = config.MIN_PROFIT_PERCENT
+        profit = opp.profit_percent
+        short = min_pct - profit
+        size = f"{opp.input_erg:g} ERG"
+        premium = self._sigusd_premium_percent(prices)
+        key = opp.path_key
+
+        if premium is not None and key == "Bank mint->Spectrum sell":
+            cost = premium - profit  # profit ~ premium - costs
+            if profit > min_pct:
+                text = f"clears: SigUSD at {premium:+.2f}% on the pool vs ~{cost:.2f}% costs -> {profit:+.2f}% at {size}"
+            else:
+                text = (f"SigUSD at {premium:+.2f}% vs oracle on the pool; mint+sell costs ~{cost:.2f}% "
+                        f"(bank fees, pool fee + impact, buffer, miner), so it needs > {cost + min_pct:+.2f}%: "
+                        f"short by {short:.2f}% at {size}")
+        elif premium is not None and key == "Spectrum buy->Bank redeem":
+            cost = -premium - profit  # profit ~ discount - costs
+            if profit > min_pct:
+                text = f"clears: SigUSD at {premium:+.2f}% on the pool vs ~{cost:.2f}% costs -> {profit:+.2f}% at {size}"
+            else:
+                text = (f"SigUSD at {premium:+.2f}% vs oracle on the pool; buy+redeem needs a discount of "
+                        f"> {cost + min_pct:.2f}% (costs ~{cost:.2f}%): short by {short:.2f}% at {size}")
+        elif profit > min_pct:
+            text = f"clears: {profit:+.2f}% after fees at {size}"
+        else:
+            text = f"{profit:+.2f}% after fees at {size}, needs > {min_pct:.2f}%: short by {short:.2f}%"
+
+        if opp.blocked and opp.blocked_reason:
+            text += f" [{opp.blocked_reason}]"
+        return text
+
+    def _display_opportunities(self, opportunities: list[ArbitrageOpportunity], prices: Optional[dict] = None):
         """Display opportunities as a full grid: paths x trade sizes."""
         if not opportunities:
             console.print("[dim]No opportunities to display[/dim]")
@@ -760,12 +802,10 @@ class ArbitrageScanner:
 
         console.print(grid)
 
-        # Show blocked reasons
-        blocked = [o for o in best_per_path if o.blocked]
-        if blocked:
-            reasons = set(o.blocked_reason for o in blocked if o.blocked_reason)
-            for reason in reasons:
-                console.print(f"  [bold red]BLOCKED:[/bold red] [dim]{reason}[/dim]")
+        # Why each path is (not) profitable, including blocked reasons
+        for opp in sorted(best_per_path, key=lambda o: -o.profit_percent):
+            style = "green" if opp.is_profitable and not opp.blocked else ("red" if opp.blocked else "dim")
+            console.print(f"  [bold]WHY {opp.path_key}:[/bold] [{style}]{self._explain(opp, prices or {})}[/{style}]")
 
         # Show steps for GO/RISKY paths
         actionable = [o for o in best_per_path if o.is_profitable and not o.blocked]
@@ -1408,7 +1448,7 @@ class ArbitrageScanner:
         opportunities = self._find_opportunities(prices)
         self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
         self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
-        self._display_opportunities(opportunities)
+        self._display_opportunities(opportunities, prices)
 
         # Wallet-based analysis
         wallet = await self._fetch_wallet_balances()
