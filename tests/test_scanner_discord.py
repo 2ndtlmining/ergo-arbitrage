@@ -203,6 +203,7 @@ def mint_posts(s):
 
 def test_mint_open_posts_once_with_a_ping_then_close_edits_it(notify, monkeypatch):
     monkeypatch.setattr(config, "DISCORD_USER_ID", "42")
+    notify.mint_gate.close_s = 0  # close on the 3 confirming polls (the 10 min hold is tested in test_mint_gate)
     notify.discord.user_id = "42"
     monkeypatch.setattr(scanner_module, "read_snapshot", Reader(open_snap(), open_snap(), open_snap(), open_snap(),
                                                                 snap(), snap(), snap()))
@@ -232,3 +233,28 @@ def test_chain_error_does_not_drive_the_mint_gate(notify, monkeypatch):
     for t in (2, 4, 6, 8):
         run(notify.poll_once(t))
     assert mint_posts(notify) == []      # one good read, then errors: never 3 agreeing readings
+
+
+def open_the_gate(notify, monkeypatch):
+    monkeypatch.setattr(scanner_module, "read_snapshot", Reader(open_snap()))
+    for t in (0, 2, 4):
+        run(notify.poll_once(t))
+    assert notify.mint_gate.is_open
+
+
+def test_shutdown_marks_an_open_mint_message_as_stopped(notify, monkeypatch):
+    open_the_gate(notify, monkeypatch)
+    notify._close_episodes_on_shutdown()
+    stopped = [(mid, e) for mid, e in notify.edits if e["title"] == "Bank mint · bot stopped"]
+    posted_at = next(i for i, (e, _) in enumerate(notify.posts) if e["title"].startswith("Bank mint OPEN"))
+    assert stopped and stopped[0][0] == f"m{posted_at + 1}"
+
+
+def test_open_mint_message_survives_a_crash(notify, monkeypatch):
+    open_the_gate(notify, monkeypatch)
+    mid = notify.tracker.get_meta("mint_gate_message")
+    assert mid and mid.startswith("m")
+    notify.edits.clear()
+    notify._close_stale_discord_messages()                 # what the next start does
+    assert [(m, e["title"]) for m, e in notify.edits] == [(mid, "Bank mint · bot stopped")]
+    assert not notify.tracker.get_meta("mint_gate_message")

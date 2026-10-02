@@ -127,3 +127,14 @@ def test_text_for_each_state():
     assert mint_gate_text(bank(NO_ORACLE), 1.0) == "✗"
     assert mint_gate_text(bank(NO_CIRCULATION), 1.0).startswith("✓ room ~")
     assert mint_gate_text(None, 1.0) is None and mint_gate_text({"reserve_ratio": 300}, 1.0) is None
+
+
+def test_close_needs_the_gate_shut_for_close_seconds():
+    """Review: minting the room away and reopening a block later must not post a pair of messages."""
+    w = MintGateWatcher(confirm_polls=1, min_room_erg=1.0, ping_cooldown_s=3600, close_s=600)
+    assert w.update(0, bank(OPEN)).kind == "opened"
+    assert w.update(10, bank(BLOCKED)) is None and w.update(300, bank(BLOCKED)) is None
+    assert w.update(320, bank(OPEN)) is None and w.is_open        # reopened in time: no message at all
+    assert w.update(400, bank(BLOCKED)) is None
+    ev = w.update(1000, bank(BLOCKED))
+    assert ev.kind == "closed" and ev.open_for_s == 1000

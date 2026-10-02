@@ -2,6 +2,8 @@
 
 Open means the bank lets you mint at least `min_room_erg` worth now (post-mint RR >= 400%).
 A transition needs `confirm_polls` agreeing readings in a row; a missing reading changes nothing.
+Closing also needs the gate shut for `close_s`: minting the room away and reopening a block later
+keeps the one open message instead of posting a closed/open pair each time.
 """
 import logging
 from dataclasses import dataclass
@@ -44,12 +46,13 @@ def _reading(bank: Optional[dict]):
 
 
 class MintGateWatcher:
-    def __init__(self, confirm_polls: int, min_room_erg: float, ping_cooldown_s: float):
+    def __init__(self, confirm_polls: int, min_room_erg: float, ping_cooldown_s: float, close_s: float = 0.0):
         self.confirm_polls = max(int(confirm_polls), 1)
-        self.min_room_erg, self.ping_cooldown_s = min_room_erg, ping_cooldown_s
+        self.min_room_erg, self.ping_cooldown_s, self.close_s = min_room_erg, ping_cooldown_s, close_s
         self.is_open = False
         self._streak = 0
-        self._opening: Optional[MintOpening] = None
+        self.opening: Optional[MintOpening] = None      # the current (or last) opening
+        self._closed_since: Optional[float] = None
         self._last_ping: Optional[float] = None
 
     def update(self, now: float, bank: Optional[dict]) -> Optional[MintGateEvent]:
@@ -59,20 +62,24 @@ class MintGateWatcher:
             return None
         rr, room, open_price, oracle = r
         if (room >= self.min_room_erg) == self.is_open:
-            self._streak = 0
+            self._streak, self._closed_since = 0, None
             return None
         self._streak += 1
-        if self._streak < self.confirm_polls:
-            return None
-        self._streak = 0
-        self.is_open = not self.is_open
-        if self.is_open:
-            self._opening = MintOpening(opened_at=now)
+        if not self.is_open:
+            if self._streak < self.confirm_polls:
+                return None
+            self._streak, self.is_open = 0, True
+            self.opening = MintOpening(opened_at=now)
             ping = self._last_ping is None or now - self._last_ping >= self.ping_cooldown_s
             if ping:
                 self._last_ping = now
-            return MintGateEvent("opened", rr, room, open_price, oracle, self._opening, None, ping)
-        opening = self._opening or MintOpening(opened_at=now)
+            return MintGateEvent("opened", rr, room, open_price, oracle, self.opening, None, ping)
+        if self._closed_since is None:
+            self._closed_since = now
+        if self._streak < self.confirm_polls or now - self._closed_since < self.close_s:
+            return None
+        self._streak, self._closed_since, self.is_open = 0, None, False
+        opening = self.opening or MintOpening(opened_at=now)
         return MintGateEvent("closed", rr, room, open_price, oracle, opening, now - opening.opened_at, False)
 
 

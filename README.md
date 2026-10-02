@@ -196,7 +196,7 @@ The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard an
   - live trading paused (ping)
   - a failure that continues is re-alerted every 30 min
 - **Daily digest** at `DISCORD_DIGEST_HOUR` (local time), once a day, also after a restart. It shows the past 24 h: episodes per path, potential ERG, trades, outages and the wallet.
-- **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting closes again. The dashboard Bank line and the daily digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
+- **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting has stayed closed for `MINT_GATE_CLOSE_SECONDS`, so minting the room away and reopening a block later does not post a new pair of messages. If the bot stops while minting is open, the message is marked "bot stopped" (also after a crash, on the next start). The dashboard Bank line and the daily digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
 - Discord is sent from a background queue (bounded, with HTTP 429 retry), so a slow or unreachable Discord never delays the 2 s chain poll.
 - The CEX/USE paths still use the streak/cooldown flow described above.
 
@@ -212,6 +212,7 @@ DISCORD_DIGEST_HOUR=8                  # Local hour for the daily digest, -1 = o
 MINT_GATE_CONFIRM_POLLS=3              # Agreeing polls before a mint open/close alert
 MINT_GATE_MIN_ROOM_ERG=1               # Smaller mint room counts as closed (default MIN_TRADE_SIZE_ERG)
 MINT_GATE_PING_COOLDOWN_SECONDS=3600   # At most one mint-open ping per this
+MINT_GATE_CLOSE_SECONDS=600            # Minting shut this long before the message says closed
 ```
 
 **Privacy:** the webhook receives your wallet balances and your Discord user id. Post it to a private channel.

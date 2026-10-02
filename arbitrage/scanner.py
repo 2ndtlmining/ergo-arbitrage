@@ -51,6 +51,8 @@ from notifications.health import HealthMonitor
 from notifications.mint_gate import MintGateWatcher, mint_gate_text
 from logging_config import console
 
+MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
+
 logger = logging.getLogger("ergo_arb.scanner")
 
 LIVE_PATH = "Spectrum buy->Bank redeem"
@@ -80,7 +82,7 @@ class ArbitrageScanner:
                                     config.DISCORD_HEALTH_ORACLE_SECONDS, config.DISCORD_HEALTH_REPEAT_SECONDS,
                                     started_at=time.time())
         self.mint_gate = MintGateWatcher(config.MINT_GATE_CONFIRM_POLLS, config.MINT_GATE_MIN_ROOM_ERG,
-                                         config.MINT_GATE_PING_COOLDOWN_SECONDS)
+                                         config.MINT_GATE_PING_COOLDOWN_SECONDS, config.MINT_GATE_CLOSE_SECONDS)
         self._last_wallet: Optional[dict] = None
         self._last_prices: dict = {}
         self._now = 0.0
@@ -1094,12 +1096,17 @@ class ArbitrageScanner:
     def _handle_mint_gate(self, event):
         if event.kind == "opened":
             self.discord.post(embeds.mint_gate_embed(event), content=self.discord._ping() if event.ping else "",
-                              on_id=lambda mid, op=event.opening: setattr(op, "message_id", mid))
+                              on_id=lambda mid, op=event.opening: self._mint_message_posted(op, mid))
             self.state.add_event("good", f"Bank mint OPEN: RR {event.reserve_ratio:.0f}%, "
                                          f"room ~{event.room_erg:,.0f} ERG")
         else:
             self.discord.edit(lambda op=event.opening: op.message_id, embeds.mint_gate_embed(event))
+            self.tracker.set_meta(MINT_MESSAGE_KEY, "")
             self.state.add_event("info", f"Bank mint closed again (RR {event.reserve_ratio:.0f}%)")
+
+    def _mint_message_posted(self, opening, message_id: str):
+        opening.message_id = message_id
+        self.tracker.set_meta(MINT_MESSAGE_KEY, message_id)   # so the next start can grey it after a crash
 
     def _episode_posted(self, ep, message_id: str):
         ep.message_id = message_id
@@ -1110,11 +1117,18 @@ class ArbitrageScanner:
         for row in getattr(self.tracker, "stale_chain_episodes", []):
             if row.get("message_id"):
                 self.discord.edit(lambda mid=row["message_id"]: mid, embeds.stale_episode_embed(row))
+        mint_message = self.tracker.get_meta(MINT_MESSAGE_KEY)
+        if mint_message:
+            self.discord.edit(lambda: mint_message, embeds.mint_gate_stopped_embed())
+            self.tracker.set_meta(MINT_MESSAGE_KEY, "")
 
     def _close_episodes_on_shutdown(self):
         try:
             for event in self.episodes.close_all(self._now, "bot stopped"):
                 self._handle_episode(event)
+            if self.mint_gate.is_open and self.mint_gate.opening is not None:
+                self.discord.edit(lambda op=self.mint_gate.opening: op.message_id, embeds.mint_gate_stopped_embed())
+                self.tracker.set_meta(MINT_MESSAGE_KEY, "")
         except Exception as e:  # shutdown must still send the summary and close connections
             logger.error(f"Closing Discord episodes failed: {e}", exc_info=True)
 

@@ -108,6 +108,12 @@ def mint_gate_embed(event) -> dict:
     return embed(f"Bank mint closed · open for {duration(event.open_for_s or 0)}", GREY, fields)
 
 
+def mint_gate_stopped_embed() -> dict:
+    """An open mint message whose bot stopped: nobody is watching the gate any more."""
+    return embed("Bank mint · bot stopped", GREY,
+                 description="The bot stopped while minting was open, so the current state is unknown.")
+
+
 def wallet_embed(wallet: dict, analysis: dict) -> dict:
     wallet, analysis = wallet or {}, analysis or {}
     description = (f"{wallet.get('erg') or 0:.4f} ERG · {wallet.get('sigusd') or 0:.2f} SigUSD · "
