@@ -19,6 +19,9 @@ import aiohttp
 
 import config
 from ergo.chain import find_box_id, node_box
+from ergo.sigmausd_tx import register_int
+from exchanges.sigmausd import BankState, can_mint_sigusd
+from exchanges.spectrum import parse_n2t_pool_box
 
 CHAIN_TIMEOUT = aiohttp.ClientTimeout(total=5)
 PENDING_OK = frozenset({config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT})  # spent as inputs
@@ -97,3 +100,23 @@ async def read_snapshot(ns, explorer=None) -> ChainSnapshot:
     pending = frozenset(name for (name, _), (_, p) in zip(CONTRACTS, found) if p)
     return ChainSnapshot(height, boxes["pool"], boxes["bank"], boxes["oracle"], pending,
                          (time.perf_counter() - start) * 1000)
+
+
+def prices_from_snapshot(snap: ChainSnapshot) -> dict:
+    """The scanner's on-chain price entries, from exactly the boxes in `snap`."""
+    pool = parse_n2t_pool_box(snap.pool, config.SIGUSD_TOKEN_ID, config.SIGUSD_DECIMALS,
+                              fee_num=register_int(snap.pool, "R4"), exchange="ErgoDEX pool (node)")
+    state = BankState(int(snap.bank["value"]), register_int(snap.bank, "R4"), register_int(snap.oracle, "R4"))
+    return {
+        "spectrum_pool": pool,
+        "spectrum_erg_sigusd": pool.price_x_in_y,
+        "bank": {
+            "oracle_erg_usd": state.oracle_usd_per_erg,
+            "bank_erg_reserve": state.bank_erg_nano / 1e9,
+            "sigusd_circulating": state.sigusd_circ_cents / 100,
+            "reserve_ratio": state.reserve_ratio,
+            "can_mint_sigusd": can_mint_sigusd(state, 1),
+            "can_redeem_sigusd": True,
+            "state": state,
+        },
+    }

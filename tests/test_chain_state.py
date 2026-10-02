@@ -117,3 +117,36 @@ def test_pending_oracle_update_keeps_confirmed_box_and_flags_it():
 def test_oracle_without_update_is_confirmed():
     b, pending = run(latest_box(oracle_node(pending=False), ORA))
     assert b["boxId"] == "o-c" and pending is False
+
+
+from arbitrage.sizing import Market, best_size  # noqa: E402
+from ergo.chain_state import prices_from_snapshot  # noqa: E402
+from tests.test_bank_redeem_tx import BANK_BOX, ORACLE_BOX  # noqa: E402
+from tests.test_chain_arb import pool_box  # noqa: E402
+
+
+def real_snapshot(pending=frozenset()):
+    return ChainSnapshot(1, pool_box(0.35, 2_000 * 10**9), BANK_BOX, ORACLE_BOX, pending, 1.0)
+
+
+class TestPricesFromSnapshot:
+    def test_bank_dict_has_the_scanner_keys(self):
+        bank = prices_from_snapshot(real_snapshot())["bank"]
+        assert set(bank) == {"oracle_erg_usd", "bank_erg_reserve", "sigusd_circulating", "reserve_ratio",
+                             "can_mint_sigusd", "can_redeem_sigusd", "state"}
+        assert bank["state"].oracle_r4 == 3_100_000_000
+        assert bank["oracle_erg_usd"] == pytest.approx(1e9 / 3_100_000_000)
+        assert bank["can_mint_sigusd"] is False  # BANK_BOX RR ~322%
+        assert bank["can_redeem_sigusd"] is True
+
+    def test_pool_reads_fee_from_hex_register(self):
+        p = prices_from_snapshot(real_snapshot())
+        assert p["spectrum_pool"].fee_num == 995
+        assert p["spectrum_erg_sigusd"] == pytest.approx(p["spectrum_pool"].price_x_in_y)
+
+    def test_sizing_on_prices_equals_sizing_on_boxes(self):
+        snap = real_snapshot()
+        p = prices_from_snapshot(snap)
+        via_prices = best_size("redeem", Market.from_pool_state(p["spectrum_pool"], p["bank"]["state"]), 100)
+        via_boxes = best_size("redeem", Market.from_boxes(snap.pool, snap.bank, snap.oracle), 100)
+        assert via_prices.size_nanoerg == via_boxes.size_nanoerg
