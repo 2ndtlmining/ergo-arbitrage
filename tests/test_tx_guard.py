@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import config
-from ergo.tx_guard import SignPolicy, TxGuardError, verify_unsigned_tx
+from ergo.tx_guard import MINER_FEE_TREE, SignPolicy, TxGuardError, verify_unsigned_tx
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "crux_swap_erg_to_sigusd.json").read_text())
 WALLET_TREE = FIXTURE["input_boxes"][1]["ergoTree"]
@@ -89,3 +89,52 @@ class TestMinErgReceived:
         tx, boxes = tx_and_inputs()
         with pytest.raises(TxGuardError, match="receives .* nanoERG"):
             verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy(min_erg_received=1))
+
+
+class TestPayees:
+    """Sending to another address: only the named payee, only up to the named amounts."""
+    PAYEE = "0008cd03" + "cd" * 32
+
+    def _send_tx(self, erg=1_000_000_000, tokens=None, extra_output=None):
+        boxes = [{"boxId": "w1", "value": 5_000_000_000, "ergoTree": WALLET_TREE,
+                  "assets": [{"tokenId": SIGUSD, "amount": 500}]}]
+        outs = [
+            {"value": erg, "ergoTree": self.PAYEE, "assets": tokens or []},
+            {"value": 5_000_000_000 - erg - 1_100_000, "ergoTree": WALLET_TREE,
+             "assets": [{"tokenId": SIGUSD, "amount": 500 - sum(t["amount"] for t in (tokens or []))}]},
+            {"value": 1_100_000, "ergoTree": MINER_FEE_TREE, "assets": []},
+        ]
+        if extra_output:
+            outs.append(extra_output)
+        return {"inputs": [{"boxId": "w1"}], "outputs": outs}, boxes
+
+    def test_send_erg_to_payee(self):
+        tx, boxes = self._send_tx()
+        policy = SignPolicy(max_erg_spent=1_001_100_000, payees={self.PAYEE: {"ERG": 1_000_000_000}})
+        report = verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy)
+        assert report.paid == {self.PAYEE: {"ERG": 1_000_000_000}}
+
+    def test_send_tokens_to_payee(self):
+        tx, boxes = self._send_tx(erg=1_000_000, tokens=[{"tokenId": SIGUSD, "amount": 200}])
+        policy = SignPolicy(max_erg_spent=2_100_000, max_token_spent={SIGUSD: 200},
+                            payees={self.PAYEE: {"ERG": 1_000_000, SIGUSD: 200}})
+        verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy)
+
+    def test_payee_over_amount_rejected(self):
+        tx, boxes = self._send_tx(erg=2_000_000_000)
+        policy = SignPolicy(max_erg_spent=3_000_000_000, payees={self.PAYEE: {"ERG": 1_000_000_000}})
+        with pytest.raises(TxGuardError, match="payee"):
+            verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy)
+
+    def test_unlisted_token_to_payee_rejected(self):
+        tx, boxes = self._send_tx(erg=1_000_000, tokens=[{"tokenId": SIGUSD, "amount": 200}])
+        policy = SignPolicy(max_erg_spent=2_100_000, max_token_spent={SIGUSD: 200},
+                            payees={self.PAYEE: {"ERG": 1_000_000}})
+        with pytest.raises(TxGuardError, match="payee"):
+            verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy)
+
+    def test_other_address_still_rejected(self):
+        tx, boxes = self._send_tx(extra_output={"value": 1, "ergoTree": ATTACKER_TREE, "assets": []})
+        policy = SignPolicy(max_erg_spent=1_001_100_001, payees={self.PAYEE: {"ERG": 1_000_000_000}})
+        with pytest.raises(TxGuardError, match="unexpected output"):
+            verify_unsigned_tx(tx, boxes, {WALLET_TREE}, policy)

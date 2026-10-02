@@ -37,6 +37,8 @@ class SignPolicy:
     max_service_fee: int = 1_000_000_000                    # nanoERG to whitelisted service-fee trees
     max_miner_fee: int = 10_000_000                         # 0.01 ERG
     service_fee_trees: frozenset = field(default_factory=lambda: frozenset(config.SERVICE_FEE_ERGO_TREES))
+    # Explicit recipients for a send: ErgoTree -> {"ERG": max nanoERG, token id: max raw amount}
+    payees: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -46,6 +48,7 @@ class GuardReport:
     spent: dict[str, int]
     service_fee: int
     miner_fee: int
+    paid: dict = field(default_factory=dict)  # payee tree -> {"ERG"/token id: amount}
 
 
 def _amount(x) -> int:
@@ -98,6 +101,7 @@ def verify_unsigned_tx(tx: dict, input_boxes: list[dict], wallet_trees: set[str]
 
     wallet_out_erg = miner_fee = service_fee = 0
     wallet_out_tok: dict[str, int] = {}
+    paid: dict[str, dict[str, int]] = {}
     for i, o in enumerate(outputs):
         if i in contract_outputs:
             continue
@@ -106,12 +110,24 @@ def verify_unsigned_tx(tx: dict, input_boxes: list[dict], wallet_trees: set[str]
             wallet_out_erg += _amount(o["value"])
             for t, a in _tokens(o).items():
                 wallet_out_tok[t] = wallet_out_tok.get(t, 0) + a
+        elif tree in policy.payees:
+            got = paid.setdefault(tree, {})
+            got["ERG"] = got.get("ERG", 0) + _amount(o["value"])
+            for t, a in _tokens(o).items():
+                got[t] = got.get(t, 0) + a
         elif tree == MINER_FEE_TREE and not o.get("assets"):
             miner_fee += _amount(o["value"])
         elif tree in policy.service_fee_trees and not o.get("assets"):
             service_fee += _amount(o["value"])
         else:
             raise TxGuardError(f"unexpected output #{i} to {tree[:24]}... ({_amount(o['value'])} nanoERG, {len(o.get('assets', []))} tokens)")
+
+    for tree, got in paid.items():
+        allowed = policy.payees[tree]
+        for asset, amount in got.items():
+            if amount > allowed.get(asset, 0):
+                raise TxGuardError(f"payee {tree[:24]}... would receive {amount} of {asset[:12]}, "
+                                   f"allowed {allowed.get(asset, 0)}")
 
     if miner_fee > policy.max_miner_fee:
         raise TxGuardError(f"miner fee {miner_fee} exceeds {policy.max_miner_fee}")
@@ -142,4 +158,5 @@ def verify_unsigned_tx(tx: dict, input_boxes: list[dict], wallet_trees: set[str]
         if received.get(t, 0) < minimum:
             raise TxGuardError(f"wallet receives {received.get(t, 0)} raw of {t[:12]}, minimum is {minimum}")
 
-    return GuardReport(erg_spent=erg_spent, received=received, spent=spent, service_fee=service_fee, miner_fee=miner_fee)
+    return GuardReport(erg_spent=erg_spent, received=received, spent=spent, service_fee=service_fee,
+                       miner_fee=miner_fee, paid=paid)

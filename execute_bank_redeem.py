@@ -8,7 +8,6 @@ import argparse
 import asyncio
 import io
 import sys
-import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -16,17 +15,15 @@ load_dotenv()
 
 import config
 from ergo.chain import find_box_id, node_box, wallet_context
+from ergo.progress import wait_confirmed
 from ergo.signing import DryRun, guarded_sign
 from ergo.sigmausd_tx import build_redeem_tx
 from ergo.tx_guard import SignPolicy, TxGuardError
 
 NODE = config.ERGO_NODE_URL
-EXPLORER = config.ERGO_EXPLORER_API_URL
 SIGUSD_TOKEN = config.SIGUSD_TOKEN_ID
 UI_FEE_TREE = "0008cd02c5f61c83056a746a19a9e449e3c9596314cc417a2ef496b7567af558518f2bc7"  # 9g2FAxry...
 
-CHECK_INTERVAL = 30
-MAX_WAIT = 600
 TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
@@ -108,19 +105,10 @@ async def main(redeem_sigusd: float, execute: bool):
         print(f"  https://explorer.ergoplatform.com/en/transactions/{tx_id}")
 
     print()
-    print("--- Step 4: Monitoring ---")
-    start_time = time.time()
-    async with aiohttp.ClientSession() as s:
-        while time.time() - start_time < MAX_WAIT:
-            await asyncio.sleep(CHECK_INTERVAL)
-            elapsed = int(time.time() - start_time)
-            async with s.get(f"{EXPLORER}/transactions/{tx_id}", timeout=TIMEOUT) as r:
-                confirmed = r.status == 200 and (await r.json()).get("numConfirmations", 0) > 0
-            if confirmed:
-                print(f"  [{elapsed // 60}m{elapsed % 60:02d}s] CONFIRMED. REDEEM COMPLETE!")
-                return
-            print(f"  [{elapsed // 60}m{elapsed % 60:02d}s] Waiting for confirmation...")
-        print("  TIMEOUT. Check explorer.")
+    print("--- Step 4: Waiting for confirmation ---")
+    async with aiohttp.ClientSession(headers=node_headers) as ns:
+        if await wait_confirmed(ns, tx_id, log=print):
+            print("  REDEEM COMPLETE!")
 
 
 if __name__ == "__main__":
