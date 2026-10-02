@@ -37,18 +37,8 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
 
-TRADE_SIZE_GRID = [1, 5, 10, 25, 50, 100]
-
 # Minimum balance per asset before the wallet analysis is worth showing
 WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "use": (0.01, "USE", ".3f")}
-
-
-def trade_sizes_for(max_trade_erg: float) -> list[float]:
-    """Grid sizes up to the configured max trade size (the cap itself included)."""
-    sizes = [s for s in TRADE_SIZE_GRID if s <= max_trade_erg]
-    if max_trade_erg not in sizes and max_trade_erg < TRADE_SIZE_GRID[-1]:
-        sizes.append(max_trade_erg)
-    return sizes or [max_trade_erg]
 
 
 class ArbitrageScanner:
@@ -75,7 +65,7 @@ class ArbitrageScanner:
         self._crux_session: Optional[aiohttp.ClientSession] = None
         self.scan_count = 0
         self._last_snapshot_id = None
-        self._trade_sizes = trade_sizes_for(config.MAX_TRADE_SIZE_ERG)
+        self._trade_sizes = list(config.TRADE_SIZES)
 
         # Notification anti-spam state
         self._opportunity_streak: dict[str, int] = {}
@@ -777,7 +767,8 @@ class ArbitrageScanner:
         )
         grid.add_column("Path", style="bold", no_wrap=True)
         for size in all_sizes:
-            grid.add_column(f"{size:.0f}", justify="right", min_width=6)
+            star = "*" if size > config.MAX_TRADE_SIZE_ERG else ""
+            grid.add_column(f"{size:.0f}{star}", justify="right", min_width=6)
         grid.add_column("Status", justify="center")
 
         # Sort paths: profitable first (by best %), then unprofitable, then blocked
@@ -837,8 +828,10 @@ class ArbitrageScanner:
             for o in opps:
                 if o.assumption:
                     footnotes.add(o.assumption)
+        if any(size > config.MAX_TRADE_SIZE_ERG for size in all_sizes):
+            footnotes.add(f"sizes above MAX_TRADE_SIZE_ERG={config.MAX_TRADE_SIZE_ERG:g}: analysis only")
         if footnotes:
-            grid.caption = " | ".join(f"* {a}" for a in footnotes)
+            grid.caption = " | ".join(f"* {a}" for a in sorted(footnotes))
 
         console.print(grid)
 

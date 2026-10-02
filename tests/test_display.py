@@ -4,25 +4,38 @@ import asyncio
 import pytest
 
 import config
-from arbitrage.scanner import ArbitrageScanner, trade_sizes_for
+from arbitrage.scanner import ArbitrageScanner
 from logging_config import console
 
 
 class TestTradeSizes:
-    def test_capped_at_max_trade_size(self):
-        assert trade_sizes_for(10) == [1, 5, 10]
+    def test_parse_sizes(self):
+        assert config.parse_sizes("10,100, 200,500,1000") == [10, 100, 200, 500, 1000]
+        assert config.parse_sizes("") == [10, 100, 200, 500, 1000]  # documented default
 
-    def test_cap_between_grid_points_is_included(self):
-        assert trade_sizes_for(30) == [1, 5, 10, 25, 30]
-
-    def test_default_cap_keeps_full_grid(self):
-        assert trade_sizes_for(100) == [1, 5, 10, 25, 50, 100]
-
-    def test_scanner_uses_config_cap(self, tmp_path, monkeypatch):
+    def test_grid_not_capped_by_max_trade_size(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "TRADE_SIZES", [10, 100, 1000])
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 10.0)
         s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
         try:
-            assert s._trade_sizes == [1, 5, 10]
+            assert s._trade_sizes == [10, 100, 1000]
+        finally:
+            s.tracker.close()
+
+    def test_sizes_above_cap_marked_analysis_only(self, tmp_path, monkeypatch):
+        from tests.test_scanner_paths import ORACLE_R4, make_prices
+        from exchanges.sigmausd import BankState
+        monkeypatch.setattr(config, "TRADE_SIZES", [10, 100])
+        monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 10.0)
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
+        try:
+            state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+            prices = make_prices(state, 0.31)
+            with console.capture() as cap:
+                s._display_opportunities(s._find_opportunities(prices), prices)
+            out = cap.get()
+            assert "100*" in out and "10*" not in out
+            assert "above MAX_TRADE_SIZE_ERG" in out
         finally:
             s.tracker.close()
 

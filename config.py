@@ -99,7 +99,19 @@ CEX_WATCH_COOLDOWN_SECONDS = int(os.getenv("CEX_WATCH_COOLDOWN_SECONDS", "3600")
 
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
-MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))
+MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))  # hard cap on anything executed
+
+
+def parse_sizes(text: str) -> list[float]:
+    """Comma-separated ERG sizes; empty means the default grid."""
+    sizes = [float(x) for x in text.split(",") if x.strip()]
+    sizes = sizes or [10, 100, 200, 500, 1000]
+    return [int(x) if x == int(x) else x for x in sorted(set(sizes))]
+
+
+# Trade sizes the scanner analyses (grid columns). Sizes above MAX_TRADE_SIZE_ERG are shown
+# for analysis only and never executed.
+TRADE_SIZES = parse_sizes(os.getenv("TRADE_SIZES", ""))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))

@@ -11,6 +11,7 @@ import config  # noqa: E402
 # Settings a local .env may override; tests run against the documented defaults
 TEST_DEFAULTS = {
     "MAX_TRADE_SIZE_ERG": 100.0,
+    "TRADE_SIZES": [1, 5, 10, 25, 50, 100],
     "MIN_PROFIT_PERCENT": 0.5,
     "SLIPPAGE_TOLERANCE": 0.01,
     "EXECUTION_BUFFER": 0.003,
