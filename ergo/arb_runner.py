@@ -124,6 +124,20 @@ async def _leg2_status(ns, tx_id: str, leg1_box_id: str, explorer=None) -> str:
         return "dropped" if r.status == 200 else "pending"
 
 
+async def submit_leg2(ns, signed: dict, log: Callable[[str], None]) -> str:
+    """Submit leg 2 and return its id. A timeout or dropped connection may hide an accepted submit,
+    so the signed id is followed (the watcher sees it confirm, or rebuilds when leg 1's output is
+    free again). An explicit rejection still raises."""
+    try:
+        return await _submit(ns, signed)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        tx_id = signed.get("id")
+        if not tx_id:
+            raise
+        log(f"  Leg 2 submit outcome unknown ({e.__class__.__name__}); following {tx_id[:12]}")
+        return tx_id
+
+
 def leg2_floor_nanoerg(plan: dict, path: str) -> int:
     """Least ERG leg 2 may return: the planned amount minus SLIPPAGE_TOLERANCE. Below it, holding the
     SigUSD (always redeemable) beats selling it into a moved pool or at a moved oracle."""
@@ -336,7 +350,7 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
     async def build_and_submit_leg2() -> str:
         tx2, info2, policy2, erg_back = await build_leg2(ns, path, leg1_out, cents, height, our_tree, floor)
         signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True, log=log)
-        tx_id = await _submit(ns, signed2)
+        tx_id = await submit_leg2(ns, signed2, log)
         last.update(erg_back=erg_back, miner_fee=info2["miner_fee"])
         return tx_id
 
