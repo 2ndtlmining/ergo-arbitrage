@@ -27,6 +27,7 @@ from exchanges.ergo_node import ErgoNodeClient
 from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
 from ergo.arb_runner import run_arb
 from arbitrage.optimizer import maximize
+from arbitrage.sizing import Market, SizeChoice, best_size
 from arbitrage.calculator import (
     ArbitrageCalculator,
     ArbitrageOpportunity,
@@ -83,6 +84,7 @@ class ArbitrageScanner:
         self._stop = asyncio.Event()
         self.node_health: dict = {}
         self.last_optima: dict[str, ArbitrageOpportunity] = {}
+        self.last_sizing: dict[str, SizeChoice] = {}  # contract-exact best size per LIVE_PATHS key
         # --live state
         self._live_streak: dict[str, int] = {}
         self._live_paused: Optional[str] = None
@@ -424,15 +426,32 @@ class ArbitrageScanner:
         return opp
 
     def _optimize_sizes(self, prices: dict) -> dict[str, ArbitrageOpportunity]:
-        """Best size per on-chain path within [MIN_TRADE_SIZE_ERG, MAX_TRADE_SIZE_ERG] (issue #10)."""
+        """Best size per on-chain path within [MIN_TRADE_SIZE_ERG, MAX_TRADE_SIZE_ERG] (issue #10).
+
+        With the pool's real reserves the size comes from arbitrage/sizing.py (contract-exact,
+        the same numbers the runner's transactions produce) and is kept in last_sizing, which
+        gates --live. Without them only an estimate is shown and nothing is tradable.
+        """
         lo, hi = config.MIN_TRADE_SIZE_ERG, max(config.MAX_TRADE_SIZE_ERG, config.MIN_TRADE_SIZE_ERG)
+        pool = prices.get("spectrum_pool")
+        bank_state = (prices.get("bank") or {}).get("state")
+        market = Market.from_pool_state(pool, bank_state) if pool is not None and bank_state else None
+        self.last_sizing = {}
         optima = {}
-        for path_fn in (self._path_bank_mint, self._path_pool_buy_redeem):
+        for path_fn, path in ((self._path_bank_mint, "mint"), (self._path_pool_buy_redeem, "redeem")):
             if path_fn(prices, lo) is None:
                 continue
-            x, _ = maximize(lambda size: path_fn(prices, size).profit_erg, lo, hi)
-            opp = path_fn(prices, round(x, 2))
+            if market is not None:
+                choice = best_size(path, market, hi)
+                size = choice.size_erg if choice.ok else (choice.max_profit_size_erg or lo)
+            else:
+                choice = None
+                size, _ = maximize(lambda x: path_fn(prices, x).profit_erg, lo, hi)
+                size = round(size, 2)
+            opp = path_fn(prices, size)
             optima[opp.path_key] = opp
+            if choice is not None:
+                self.last_sizing[opp.path_key] = choice
         return optima
 
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
@@ -886,6 +905,11 @@ class ArbitrageScanner:
 
         # Best size per on-chain path (searched, capped by MAX_TRADE_SIZE_ERG)
         for key, opt in self.last_optima.items():
+            choice = self.last_sizing.get(key)
+            if choice is not None:
+                style = "bold green" if choice.ok else "dim"
+                console.print(f"  [{style}]BEST SIZE {key}: {choice.summary()}[/{style}]")
+                continue
             if opt.profit_erg <= 0:
                 console.print(f"  [dim]BEST SIZE {key}: no profitable size up to {config.MAX_TRADE_SIZE_ERG:g} ERG[/dim]")
                 continue
@@ -1036,9 +1060,8 @@ class ArbitrageScanner:
     def _update_live_streak(self):
         """Consecutive scans in which each executable path is profitable at its best size."""
         for key in LIVE_PATHS:
-            opt = self.last_optima.get(key)
-            ok = bool(opt and not opt.blocked and opt.profit_erg > 0
-                      and opt.profit_percent >= config.MIN_PROFIT_PERCENT)
+            choice = self.last_sizing.get(key)
+            ok = bool(choice and choice.ok)
             self._live_streak[key] = self._live_streak.get(key, 0) + 1 if ok else 0
 
     @staticmethod
@@ -1047,9 +1070,10 @@ class ArbitrageScanner:
         sigusd_erg = wallet.get("sigusd", 0) / oracle if oracle else 0.0
         return wallet.get("erg", 0) + sigusd_erg
 
-    def _live_size(self, opt: Optional[ArbitrageOpportunity], wallet: dict) -> float:
-        best = opt.input_erg if opt else 0.0
-        return max(0.0, min(best, config.MAX_TRADE_SIZE_ERG, wallet.get("erg", 0) - config.LIVE_ERG_RESERVE))
+    @staticmethod
+    def _live_cap(wallet: dict) -> float:
+        """ERG a live trade may use; the runner sizes the trade within this on fresh boxes."""
+        return max(0.0, min(config.MAX_TRADE_SIZE_ERG, wallet.get("erg", 0) - config.LIVE_ERG_RESERVE))
 
     def _trades_today_count(self) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -1058,15 +1082,15 @@ class ArbitrageScanner:
     def _path_blockers(self, key: str, wallet: dict) -> list[str]:
         """Reasons this particular path would not trade (profit, confirmations, size)."""
         blockers = []
-        opt = self.last_optima.get(key)
-        if not opt or opt.blocked or opt.profit_erg <= 0 or opt.profit_percent < config.MIN_PROFIT_PERCENT:
-            best = f"{opt.profit_percent:+.2f}% at {opt.input_erg:g} ERG" if opt else "no data"
-            why = f", {opt.blocked_reason}" if opt and opt.blocked and opt.blocked_reason else ""
-            blockers.append(f"no profit >= {config.MIN_PROFIT_PERCENT}% (best {best}{why})")
+        choice = self.last_sizing.get(key)
+        if choice is None:
+            blockers.append("no profit data (pool reserves or bank state missing)")
+        elif not choice.ok:
+            blockers.append(f"no profit >= {config.MIN_PROFIT_PERCENT}% ({choice.reason})")
         streak = self._live_streak.get(key, 0)
         if streak < config.LIVE_CONFIRM_SCANS:
             blockers.append(f"profitable {streak}/{config.LIVE_CONFIRM_SCANS} scans in a row")
-        if self._live_size(opt, wallet) < config.MIN_TRADE_SIZE_ERG:
+        if self._live_cap(wallet) < config.MIN_TRADE_SIZE_ERG:
             blockers.append(f"wallet too small: {wallet.get('erg', 0):.2f} ERG minus {config.LIVE_ERG_RESERVE:g} reserve")
         return blockers
 
@@ -1109,16 +1133,20 @@ class ArbitrageScanner:
                 console.print(f"  [dim]LIVE {LIVE_PATHS[key]}: not trading - {'; '.join(reasons)}[/dim]")
             return
 
-        key = max(ready, key=lambda k: self.last_optima[k].profit_erg)
+        key = max(ready, key=lambda k: self.last_sizing[k].profit_erg)
         path = LIVE_PATHS[key]
-        opt = self.last_optima[key]
-        size = self._live_size(opt, wallet)
-        console.print(Panel(f"[bold red]LIVE: executing {key} with {size:g} ERG "
-                            f"(planned {opt.profit_percent:+.2f}%)[/bold red]", border_style="red"))
-        trade_id = self.tracker.start_trade(None, size, size + opt.profit_erg * size / opt.input_erg,
-                                            opt.profit_erg * size / opt.input_erg)
-        result = await run_arb(self.ergo_node.session, path, int(round(size * 1e9)),
+        choice = self.last_sizing[key]
+        cap = self._live_cap(wallet)
+        console.print(Panel(f"[bold red]LIVE: executing {key}, scan says {choice.summary()}; "
+                            f"re-sizing on fresh boxes (cap {cap:g} ERG)[/bold red]", border_style="red"))
+        trade_id = self.tracker.start_trade(None, choice.cost_erg, choice.cost_erg + choice.profit_erg,
+                                            choice.profit_erg)
+        result = await run_arb(self.ergo_node.session, path, None, max_erg_in=int(round(cap * 1e9)),
                                execute=True, log=lambda m: console.print(m))
+        size = result.erg_in / 1e9
+        if result.erg_in:
+            self.tracker.set_trade_input(trade_id, size, size + result.profit_nanoerg / 1e9,
+                                         result.profit_nanoerg / 1e9)
         self._last_trade_time = time.time()
         today = datetime.now().strftime("%Y-%m-%d")
         self._trades_today = (today, self._trades_today_count() + 1)

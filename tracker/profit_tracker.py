@@ -337,6 +337,14 @@ class ProfitTracker:
         logger.info(f"Trade #{trade_id} started for opportunity #{opportunity_id}")
         return trade_id
 
+    def set_trade_input(self, trade_id: int, input_erg: float, expected_output: float, expected_profit: float):
+        """Record the size and plan the trade actually went out with (it is sized at execution time)."""
+        self.conn.execute(
+            "UPDATE trades SET input_erg = ?, expected_output_erg = ?, expected_profit_erg = ? WHERE id = ?",
+            (input_erg, expected_output, expected_profit, trade_id),
+        )
+        self.conn.commit()
+
     def complete_trade(self, trade_id: int, actual_output: float,
                        fee_paid_erg: float = 0, fee_paid_usd: float = 0,
                        tx_ids: list[str] = None, notes: str = ""):

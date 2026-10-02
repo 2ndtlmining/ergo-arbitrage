@@ -54,11 +54,15 @@ class TestScannerOptimum:
 
     def test_optimum_beats_every_grid_point(self, scanner, monkeypatch):
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
+        monkeypatch.setattr(config, "SIZE_PROFIT_CAPTURE", 1.0)  # pure profit maximising
         prices = discount_prices()
         scanner._find_opportunities(prices)
-        best = scanner.last_optima[self.KEY]
-        grid = [scanner._path_pool_buy_redeem(prices, x).profit_erg for x in range(1, 1001, 7)]
-        assert best.profit_erg >= max(grid) - 1e-6
+        from arbitrage.sizing import Market, profit_nanoerg
+        best = scanner.last_sizing[self.KEY]
+        market = Market.from_pool_state(prices["spectrum_pool"], prices["bank"]["state"])
+        grid = [profit_nanoerg("redeem", market, x * 10**9)[0] / 1e9 for x in range(1, 1001, 7)]
+        assert best.profit_erg >= max(grid) - 1e-9
+        assert scanner.last_optima[self.KEY].input_erg == pytest.approx(best.size_erg)
 
     def test_thin_pool_gives_interior_optimum(self, scanner, monkeypatch):
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
@@ -71,6 +75,14 @@ class TestScannerOptimum:
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 10.0)
         scanner._find_opportunities(discount_prices())
         assert scanner.last_optima[self.KEY].input_erg <= 10.0
+
+    def test_default_capture_keeps_most_profit_on_a_smaller_size(self, scanner, monkeypatch):
+        monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
+        scanner._find_opportunities(discount_prices())
+        choice = scanner.last_sizing[self.KEY]
+        assert choice.ok
+        assert choice.profit_erg >= config.SIZE_PROFIT_CAPTURE * choice.max_profit_erg - 1e-9
+        assert choice.size_erg < choice.max_profit_size_erg
 
     def test_display_shows_best_size(self, scanner, monkeypatch):
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)

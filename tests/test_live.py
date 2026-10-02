@@ -46,12 +46,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_executes_best_size_when_ready(live):
+def test_runner_sizes_the_trade_on_fresh_boxes(live):
     run(live._execute_trades(WALLET, live._prices))
     assert len(live.calls) == 1
     erg_in, kw = live.calls[0]
-    expected = min(live.last_optima[KEY].input_erg, WALLET["erg"] - config.LIVE_ERG_RESERVE)
-    assert erg_in == int(round(expected * 1e9))
+    assert erg_in is None  # the runner re-runs the size search on the boxes it spends
+    assert kw["max_erg_in"] == int(round((WALLET["erg"] - config.LIVE_ERG_RESERVE) * 1e9))
     assert kw["execute"] is True
     row = live.tracker.conn.execute("SELECT status, tx_ids FROM trades").fetchone()
     assert row["status"] == "completed" and "t1" in row["tx_ids"]
@@ -59,7 +59,23 @@ def test_executes_best_size_when_ready(live):
 
 def test_wallet_reserve_caps_size(live):
     run(live._execute_trades({"erg": 5.0, "sigusd": 0, "use": 0}, live._prices))
-    assert live.calls[0][0] == int(round((5.0 - config.LIVE_ERG_RESERVE) * 1e9))
+    assert live.calls[0][1]["max_erg_in"] == int(round((5.0 - config.LIVE_ERG_RESERVE) * 1e9))
+
+
+def test_trade_record_uses_the_size_the_runner_chose(live):
+    live._next_result = ArbResult("executed", erg_in=7 * 10**9, sigusd_cents=100, profit_nanoerg=2 * 10**8,
+                                  profit_percent=2.86, tx1="t1", tx2="t2")
+    run(live._execute_trades(WALLET, live._prices))
+    row = live.tracker.conn.execute("SELECT input_erg, actual_output_erg, actual_profit_erg FROM trades").fetchone()
+    assert row["input_erg"] == pytest.approx(7.0)
+    assert row["actual_output_erg"] == pytest.approx(7.2)
+    assert row["actual_profit_erg"] == pytest.approx(0.2)
+
+
+def test_gate_uses_exact_sizing(live):
+    choice = live.last_sizing[KEY]
+    assert choice.ok and choice.profit_percent >= config.MIN_PROFIT_PERCENT
+    assert live.last_optima[KEY].input_erg == pytest.approx(choice.size_erg)
 
 
 def test_not_in_monitor_mode(tmp_path, monkeypatch):
@@ -166,7 +182,7 @@ def test_mint_path_executed_when_it_is_the_profitable_one(tmp_path, monkeypatch)
 
     async def fake_run(ns, path, erg_in, **kw):
         calls.append(path)
-        return ArbResult("executed", erg_in=erg_in, sigusd_cents=100, profit_nanoerg=10**8, profit_percent=1.0,
+        return ArbResult("executed", erg_in=5 * 10**9, sigusd_cents=100, profit_nanoerg=10**8, profit_percent=1.0,
                          tx1="m1", tx2="m2", path=path)
 
     async def healthy():

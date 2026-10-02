@@ -260,24 +260,37 @@ default**, `--check` signs and has your node validate it without broadcasting, a
 
 ```bash
 python arb.py balance                                   # ERG, SigUSD, value, pending, bank RR, SigUSD peg
-python arb.py quote  --sell sigusd --amount 10          # pool vs bank, which is better
+python arb.py quote                                     # best arb size per path right now (+ break-even)
+python arb.py quote  --sell sigusd --amount 10          # ...and pool vs bank for an amount
 python arb.py swap   --sell erg    --amount 5           # direct pool swap, no service fee
 python arb.py swap   --sell sigusd --amount all --execute
 python arb.py redeem --sigusd all --execute             # SigUSD -> ERG at the bank
 python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the guard only allows that payee and amount
-python arb.py arb    --erg 10 --check                   # two-leg pool buy -> bank redeem
+python arb.py arb    --check                            # two-leg pool buy -> bank redeem at the best size
+python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint -> pool sell
 ```
+
+**Trade size.** `arb.py arb` (without `--erg`, or `--erg best`) and live mode size the trade
+on the exact pool, bank and oracle boxes the transactions will spend (`arbitrage/sizing.py`,
+integer contract math identical to the transaction builders). The search runs over whole
+SigUSD cents, because profit in ERG is a sawtooth: extra ERG buys nothing until the next cent.
+Of all sizes between `MIN_TRADE_SIZE_ERG` and the cap (`MAX_TRADE_SIZE_ERG`, wallet minus
+`LIVE_ERG_RESERVE`) that keep profit at or above `MIN_PROFIT_PERCENT`, it takes the smallest one
+earning `SIZE_PROFIT_CAPTURE` (0.95) of the best profit: near the peak, more size adds little
+profit but all of its risk. Set it to 1.0 to maximise profit outright. The figures are exact,
+with no execution buffer, so `MIN_PROFIT_PERCENT` is the safety margin for the oracle or pool
+moving between leg 1 and leg 2.
 
 ### Live mode (`python main.py --live`)
 
 Live mode executes whichever of **pool buy -> bank redeem** and **bank mint -> pool sell**
 (the same code as `arb.py arb --path redeem|mint --execute`) passes every check with the higher
-profit, at the best size found by the optimizer. Bank mint is only possible while the reserve
+profit, sized again on fresh boxes right before signing (see **Trade size** above). Bank mint is only possible while the reserve
 ratio stays >= 400% after minting:
 
 | Check | Setting (default) |
 |---|---|
-| Profitable at its best size | `MIN_PROFIT_PERCENT` (0.5) |
+| Profitable at its best size | `MIN_PROFIT_PERCENT` (0.5), `SIZE_PROFIT_CAPTURE` (0.95) |
 | ...for N scans in a row | `LIVE_CONFIRM_SCANS` (3) |
 | Size capped | `MAX_TRADE_SIZE_ERG`, wallet minus `LIVE_ERG_RESERVE` (1) |
 | Node synced and wallet unlocked | checked before each trade |

@@ -9,6 +9,7 @@ from typing import Callable, Optional
 import aiohttp
 
 import config
+from arbitrage.sizing import Market, best_size
 from ergo.amounts import erg_spendable, token_total
 from ergo.arb_runner import run_arb
 from ergo.chain import find_box_id, node_box, wallet_context
@@ -148,11 +149,31 @@ async def balance(ns, log: Log):
         log(line)
 
 
-async def quote(ns, sell: str, amount: float, log: Log):
+ARB_PATH_NAMES = {"redeem": "pool buy -> bank redeem", "mint": "bank mint -> pool sell"}
+
+
+def best_size_lines(market: Market, cap_erg: float) -> list[str]:
+    """Best arbitrage size per path on `market` (contract-exact, see arbitrage/sizing.py)."""
+    lines = [f"Best arbitrage size (cap {cap_erg:g} ERG, MIN_PROFIT_PERCENT {config.MIN_PROFIT_PERCENT:g}%, "
+             f"capture {config.SIZE_PROFIT_CAPTURE:.0%} of peak profit):"]
+    for path, name in ARB_PATH_NAMES.items():
+        choice = best_size(path, market, cap_erg)
+        lines.append(f"  {name + ':':<26}{choice.summary()}")
+        if choice.ok:
+            lines.append(f"  {'':<26}run: python arb.py arb --path {path} --check")
+    return lines
+
+
+async def quote(ns, sell: Optional[str], amount: Optional[float], log: Log):
     log("Reading the pool and bank boxes from your node...")
     pool, bank, oracle_box = await _boxes(ns, config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT,
                                           config.SIGMAUSD_ORACLE_NFT)
     state = BankState(int(bank["value"]), register_int(bank, "R4"), register_int(oracle_box, "R4"))
+    for line in best_size_lines(Market.from_boxes(pool, bank, oracle_box), config.MAX_TRADE_SIZE_ERG):
+        log(line)
+    if sell is None:
+        return
+    log("")
     wallet = [{"boxId": "q", "value": 10**15, "ergoTree": "0008cd02" + "00" * 32,
                "assets": [{"tokenId": SIGUSD, "amount": 10**12}]}]
     if sell == "erg":
@@ -263,6 +284,7 @@ async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log)
     await _finish(ns, body, send_policy(tree, erg_nano, cents), mode, log)
 
 
-async def arb(ns, erg: float, mode: str, force: bool, log: Log, path: str = "redeem"):
-    await run_arb(ns, path, int(round(erg * 1e9)), check=mode == "check", execute=mode == "execute",
-                  force=force, log=log)
+async def arb(ns, erg: Optional[float], mode: str, force: bool, log: Log, path: str = "redeem"):
+    """`erg` None: the runner picks the best size on the boxes it is about to spend."""
+    erg_in = None if erg is None else int(round(erg * 1e9))
+    await run_arb(ns, path, erg_in, check=mode == "check", execute=mode == "execute", force=force, log=log)

@@ -83,3 +83,42 @@ def test_balance_lines_flag_stale_entries():
     text = "\n".join(lines)
     assert "Pending" not in text
     assert "Ignored" in text and "4.8625 ERG" in text and "no longer valid" in text
+
+
+def test_arb_size_defaults_to_best():
+    p = build_parser()
+    assert p.parse_args(["arb"]).erg is None
+    assert p.parse_args(["arb", "--erg", "best"]).erg is None
+    assert p.parse_args(["arb", "--erg", "12.5"]).erg == 12.5
+    with pytest.raises(SystemExit):
+        p.parse_args(["arb", "--erg", "-3"])
+
+
+def test_quote_without_amount_is_allowed():
+    args = build_parser().parse_args(["quote"])
+    assert args.sell is None and args.amount is None
+
+
+def test_best_size_lines_cover_both_paths():
+    from arbitrage.sizing import Market
+    from ergo.actions import best_size_lines
+    from tests.test_bank_redeem_tx import BANK_BOX, ORACLE_BOX
+    from tests.test_chain_arb import pool_box
+    text = "\n".join(best_size_lines(Market.from_boxes(pool_box(0.35, 2_000 * 10**9), BANK_BOX, ORACLE_BOX), 100))
+    assert "pool buy -> bank redeem" in text and "break-even" in text
+    assert "bank mint -> pool sell" in text and "400%" in text  # BANK_BOX RR ~322%: mint closed
+
+
+def test_unreachable_node_is_one_line(monkeypatch, capsys):
+    import aiohttp
+    import arb
+
+    async def boom(args):
+        raise aiohttp.ClientConnectionError("semaphore timeout")
+
+    monkeypatch.setattr(arb, "run", boom)
+    with pytest.raises(SystemExit) as e:
+        arb.main(["balance"])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "Cannot reach your Ergo node" in out and "ERGO_NODE_URL" in out and "Traceback" not in out
