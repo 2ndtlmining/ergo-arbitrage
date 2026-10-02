@@ -228,12 +228,12 @@ class TestDEXSwapMath:
                     else:
                         print(f"    Wallet needs >= {trade_size + 0.01:.2f} ERG for test swap")
                 else:
-                    print(f"\n  Node wallet: locked or empty")
+                    print("\n  Node wallet: locked or empty")
             else:
                 print(f"\n  Node at {NODE_URL}: not reachable")
 
-            print(f"\n  NOTE: Actual swap execution is Phase 2 (not yet implemented)")
-            print(f"  This test confirms all data sources are working correctly.")
+            print("\n  NOTE: Actual swap execution is Phase 2 (not yet implemented)")
+            print("  This test confirms all data sources are working correctly.")
 
         finally:
             await asyncio.gather(dex.disconnect(), bank.disconnect(), node.disconnect())

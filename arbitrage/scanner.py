@@ -535,7 +535,6 @@ class ArbitrageScanner:
 
         for trade_size in self._trade_sizes:
             slippage = config.get_recommended_slippage(trade_size)  # legs without known depth (CEX)
-            amm_buffer = config.EXECUTION_BUFFER if prices.get("spectrum_pool") else slippage
 
             # ---- SigUSD Paths ----
 
@@ -1729,7 +1728,6 @@ class ArbitrageScanner:
             # Show each option with steps
             all_available = sorted(available, key=lambda x: x["profit_pct"], reverse=True)
             for o in all_available:
-                is_best = profitable and o["name"] == max(profitable, key=lambda x: x["profit_pct"])["name"]
                 pct = o["profit_pct"]
                 tag = "[bold green]" if pct > 0.5 else "[yellow]" if pct > -1 else "[dim]"
                 end_tag = "[/bold green]" if pct > 0.5 else "[/yellow]" if pct > -1 else "[/dim]"

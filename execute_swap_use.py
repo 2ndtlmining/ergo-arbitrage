@@ -265,7 +265,7 @@ async def main():
         mint_status = await check_mint_availability(s)
         analytics = await check_use_analytics(s)
 
-    print(f"  Mint type:    free_mint")
+    print("  Mint type:    free_mint")
     print(f"  Available:    {mint_status.get('is_available', False)}")
     print(f"  Max mint:     {mint_status.get('max_mint_amount', 0)} USE units")
     print(f"  Fee:          {mint_status.get('fee_amount', 0)/1e9:.6f} ERG (~${mint_status.get('fee_usd', 0):.2f})")
@@ -317,7 +317,6 @@ async def main():
     our_input_total = 0
     our_output_total = 0
     our_use_output = 0
-    our_output_box_ids = []
 
     for inp in inputs:
         if inp.get("ergoTree", "").startswith("0008cd") and pubkey in inp.get("ergoTree", ""):
@@ -388,7 +387,7 @@ async def main():
             print(f"  ERROR submitting: {e}")
             return
 
-    print(f"  SUCCESS! Transaction submitted!")
+    print("  SUCCESS! Transaction submitted!")
     print(f"  TX ID: {submitted_id}")
     print(f"  Explorer: https://explorer.ergoplatform.com/en/transactions/{submitted_id}")
     print()
@@ -439,7 +438,7 @@ async def main():
 
                     # Also check if USE balance changed even before explorer confirms
                     if current_use > initial_use + 0.001:
-                        print(f"  USE balance increased! Swap likely succeeded.")
+                        print("  USE balance increased! Swap likely succeeded.")
                         print(f"  USE gained: +{current_use - initial_use:.3f} USE")
                         break
 

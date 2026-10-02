@@ -6,7 +6,6 @@ import pytest
 
 import arbitrage.scanner as scanner_module
 import config
-import ergo.arb_runner as runner
 from ergo.arb_runner import ArbResult, LegNotReady, leg1_landed, watch_leg2
 from ergo.chain_state import latest_box
 from tests.fake_node import FakeSession, Seq

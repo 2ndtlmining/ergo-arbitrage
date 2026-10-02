@@ -1,5 +1,4 @@
 """Unit tests for arbitrage profit calculator."""
-import pytest
 from arbitrage.calculator import ArbitrageCalculator, FeeBreakdown
 import config
 

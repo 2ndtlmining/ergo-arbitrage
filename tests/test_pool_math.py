@@ -1,5 +1,4 @@
 """Unit tests for AMM pool math (constant product formula)."""
-import pytest
 from exchanges.base import PoolState, OrderBook, OrderBookLevel
 
 

@@ -204,7 +204,7 @@ async def main():
             print(f"  ERROR submitting: {e}")
             return
 
-    print(f"  SUCCESS! Transaction submitted!")
+    print("  SUCCESS! Transaction submitted!")
     print(f"  TX ID: {submitted_id}")
     print(f"  Explorer: https://explorer.ergoplatform.com/en/transactions/{submitted_id}")
     print()
@@ -266,7 +266,7 @@ async def main():
                     print(f"  [{mins}m{secs:02d}s] Waiting... ERG={current_erg:.4f} ({erg_change:+.4f}) USE={current_use:.3f} ({use_change:+.3f})")
 
                     if erg_change > 0.001 and use_change < -0.001:
-                        print(f"  Balance changed! Swap likely succeeded.")
+                        print("  Balance changed! Swap likely succeeded.")
                         break
 
 

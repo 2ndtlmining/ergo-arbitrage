@@ -3,7 +3,6 @@
 Run with: python -m pytest tests/test_api_live.py -v -s
 Use -k to run specific tests: python -m pytest tests/test_api_live.py -k "nonkyc" -v -s
 """
-import asyncio
 import pytest
 import config
 
