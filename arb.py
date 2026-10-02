@@ -2,12 +2,12 @@
 without broadcasting; --execute sends and follows the transaction until it confirms.
 
     python arb.py balance
-    python arb.py quote  --sell sigusd --amount 10
+    python arb.py quote  [--sell sigusd --amount 10]        (always shows the best arb sizes)
     python arb.py swap   --sell erg    --amount 5          [--check | --execute]
     python arb.py swap   --sell sigusd --amount all         --execute
     python arb.py redeem --sigusd all                       --execute
     python arb.py send   --to 9f... --erg 1.5 [--sigusd 2]  --execute
-    python arb.py arb    --erg 10 [--path redeem|mint]      [--check | --execute] [--force]
+    python arb.py arb    [--erg best|10] [--path redeem|mint] [--check | --execute] [--force]
 """
 import argparse
 import asyncio
@@ -23,6 +23,16 @@ from ergo import actions
 from ergo.amounts import parse_amount
 
 
+def parse_size(text: str):
+    """Leg 1 size in ERG, or "best" (None): the runner picks it on the boxes it spends."""
+    if str(text).strip().lower() == "best":
+        return None
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("size must be positive (or 'best')")
+    return value
+
+
 def _mode_flags(p: argparse.ArgumentParser):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--check", action="store_true", help="sign and validate on your node, do not broadcast")
@@ -36,9 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("balance", help="wallet balances, value, pending changes, bank/pool state")
 
-    q = sub.add_parser("quote", help="compare the pool and the bank for an amount (no transaction)")
-    q.add_argument("--sell", choices=["erg", "sigusd"], required=True)
-    q.add_argument("--amount", type=float, required=True)
+    q = sub.add_parser("quote", help="best arbitrage sizes now, and pool vs bank for an amount (no transaction)")
+    q.add_argument("--sell", choices=["erg", "sigusd"])
+    q.add_argument("--amount", type=float)
 
     s = sub.add_parser("swap", help="swap ERG <-> SigUSD directly against the pool (no service fee)")
     s.add_argument("--sell", choices=["erg", "sigusd"], required=True)
@@ -56,7 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     _mode_flags(se)
 
     a = sub.add_parser("arb", help="two-leg arbitrage: pool buy -> bank redeem, or bank mint -> pool sell")
-    a.add_argument("--erg", type=float, required=True, help="ERG for leg 1 (the mint budget for --path mint)")
+    a.add_argument("--erg", type=parse_size, default=None,
+                   help="ERG for leg 1 (the mint budget for --path mint), or 'best' (default): the size "
+                        "with the best profit on the current pool and bank, capped by wallet and MAX_TRADE_SIZE_ERG")
     a.add_argument("--path", choices=["redeem", "mint"], default="redeem",
                    help="redeem: pool buy -> bank redeem (default); mint: bank mint -> pool sell")
     a.add_argument("--force", action="store_true", help="execute even below MIN_PROFIT_PERCENT (testing)")
@@ -78,6 +90,9 @@ async def run(args):
         if args.command == "balance":
             await actions.balance(ns, log)
         elif args.command == "quote":
+            if (args.sell is None) != (args.amount is None):
+                log("quote: give both --sell and --amount, or neither.")
+                return
             await actions.quote(ns, args.sell, args.amount, log)
         elif args.command == "swap":
             await actions.swap(ns, args.sell, args.amount, mode, log)
@@ -95,7 +110,12 @@ async def run(args):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    asyncio.run(run(args))
+    try:
+        asyncio.run(run(args))
+    except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+        print(f"Cannot reach your Ergo node at {config.ERGO_NODE_URL} ({e.__class__.__name__}: {e}). "
+              f"Is it running? Check ERGO_NODE_URL in .env.", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -114,6 +114,9 @@ def parse_sizes(text: str) -> list[float]:
 # for analysis only and never executed.
 TRADE_SIZES = parse_sizes(os.getenv("TRADE_SIZES", ""))
 MIN_TRADE_SIZE_ERG = float(os.getenv("MIN_TRADE_SIZE_ERG", "1"))  # lower bound of the best-size search
+# Trade the smallest size that still earns this share of the best possible profit: near the
+# peak, extra size adds little profit but all of its risk. 1.0 = maximise profit outright.
+SIZE_PROFIT_CAPTURE = float(os.getenv("SIZE_PROFIT_CAPTURE", "0.95"))
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))

@@ -6,6 +6,7 @@ from typing import Callable, Optional
 import aiohttp
 
 import config
+from arbitrage.sizing import Market, SizeChoice, best_size
 from ergo.chain import find_box_id, node_box, wait_for_box, wallet_context
 from ergo.chain_arb import (
     build_pool_sell_leg,
@@ -128,13 +129,26 @@ PATHS = {
 }
 
 
-async def run_arb(ns, path: str, erg_in: int, *, check: bool = False, execute: bool = False,
-                  force: bool = False, wait_leg2: bool = True,
+def choose_size(path: str, pool_box: dict, bank_box: dict, oracle_box: dict, wallet_boxes: list[dict],
+                max_erg_in: Optional[int] = None) -> SizeChoice:
+    """Best size on exactly these boxes, capped by MAX_TRADE_SIZE_ERG, the wallet minus
+    LIVE_ERG_RESERVE, and `max_erg_in` (nanoERG) if given."""
+    caps = [config.MAX_TRADE_SIZE_ERG,
+            sum(int(b["value"]) for b in wallet_boxes) / 1e9 - config.LIVE_ERG_RESERVE]
+    if max_erg_in is not None:
+        caps.append(max_erg_in / 1e9)
+    return best_size(path, Market.from_boxes(pool_box, bank_box, oracle_box), max(min(caps), 0.0))
+
+
+async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, execute: bool = False,
+                  force: bool = False, wait_leg2: bool = True, max_erg_in: Optional[int] = None,
                   log: Callable[[str], None] = print) -> ArbResult:
     """Plan, verify and (optionally) execute one two-leg arbitrage.
 
     path "redeem": leg 1 pool buy (ERG -> SigUSD), leg 2 bank redeem.
     path "mint":   leg 1 bank mint (ERG -> SigUSD), leg 2 pool sell. `erg_in` is the mint budget.
+    erg_in None:   pick the best size (arbitrage/sizing.py) on the boxes this trade spends,
+                   capped by `max_erg_in`, the wallet and MAX_TRADE_SIZE_ERG.
     """
     _, planner, describe = PATHS[path]
     node = config.ERGO_NODE_URL
@@ -143,11 +157,22 @@ async def run_arb(ns, path: str, erg_in: int, *, check: bool = False, execute: b
             ns, (config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
         wallet_boxes, height, our_tree = await wallet_context(ns)
         trees = await wallet_trees(ns, node)
+        if erg_in is None:
+            choice = choose_size(path, pool_box, bank_box, oracle_box, wallet_boxes, max_erg_in)
+            log(f"  Best size ({path}, cap {choice.cap_erg:.2f} ERG): {choice.summary()}")
+            if not choice.ok:
+                if not force:
+                    log("  Nothing worth trading right now.")
+                    return ArbResult("not_profitable", choice.reason, path=path)
+                erg_in = int(config.MIN_TRADE_SIZE_ERG * 1e9)
+                log(f"  --force: using MIN_TRADE_SIZE_ERG ({config.MIN_TRADE_SIZE_ERG:g} ERG)")
+            else:
+                erg_in = choice.size_nanoerg
         plan = planner(pool_box, bank_box, oracle_box, wallet_boxes, erg_in,
                        height=height, our_tree=our_tree, ui_fee_tree=UI_FEE_TREE)
     except (RuntimeError, ValueError, TxGuardError) as e:
         log(f"ABORTED: {e}")
-        return ArbResult("aborted", str(e), erg_in, path=path)
+        return ArbResult("aborted", str(e), erg_in or 0, path=path)
 
     erg_in = plan.get("erg_in", erg_in)
     cents = plan["sigusd_cents"]
