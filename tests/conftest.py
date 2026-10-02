@@ -11,6 +11,8 @@ import config  # noqa: E402
 # Settings a local .env may override; tests run against the documented defaults
 TEST_DEFAULTS = {
     "MAX_TRADE_SIZE_ERG": 100.0,
+    "TRADE_SIZES": [1, 5, 10, 25, 50, 100],
+    "MIN_TRADE_SIZE_ERG": 1.0,
     "MIN_PROFIT_PERCENT": 0.5,
     "SLIPPAGE_TOLERANCE": 0.01,
     "EXECUTION_BUFFER": 0.003,
@@ -19,6 +21,12 @@ TEST_DEFAULTS = {
     "ENABLE_USE": False,
     "POOL_SWAP_ROUTE": "direct",
     "CEX_WATCH": False,
+    "DISCORD_ENABLED": False,
+    "LIVE_CONFIRM_SCANS": 3,
+    "LIVE_TRADE_COOLDOWN_SECONDS": 300,
+    "LIVE_MAX_TRADES_PER_DAY": 10,
+    "LIVE_MAX_DRAWDOWN_ERG": 5.0,
+    "LIVE_ERG_RESERVE": 1.0,
     "CEX_WATCH_ALERT_PERCENT": 3.0,
 }
 

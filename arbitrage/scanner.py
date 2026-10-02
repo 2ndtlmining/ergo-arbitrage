@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import time
 from datetime import datetime
@@ -24,6 +25,8 @@ from exchanges.sigmausd import (
 )
 from exchanges.ergo_node import ErgoNodeClient
 from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
+from ergo.arb_runner import run_pool_buy_redeem
+from arbitrage.optimizer import maximize
 from arbitrage.calculator import (
     ArbitrageCalculator,
     ArbitrageOpportunity,
@@ -37,18 +40,10 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
 
-TRADE_SIZE_GRID = [1, 5, 10, 25, 50, 100]
+LIVE_PATH = "Spectrum buy->Bank redeem"  # the only path --live can execute (ergo/arb_runner.py)
 
 # Minimum balance per asset before the wallet analysis is worth showing
 WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "use": (0.01, "USE", ".3f")}
-
-
-def trade_sizes_for(max_trade_erg: float) -> list[float]:
-    """Grid sizes up to the configured max trade size (the cap itself included)."""
-    sizes = [s for s in TRADE_SIZE_GRID if s <= max_trade_erg]
-    if max_trade_erg not in sizes and max_trade_erg < TRADE_SIZE_GRID[-1]:
-        sizes.append(max_trade_erg)
-    return sizes or [max_trade_erg]
 
 
 class ArbitrageScanner:
@@ -75,7 +70,7 @@ class ArbitrageScanner:
         self._crux_session: Optional[aiohttp.ClientSession] = None
         self.scan_count = 0
         self._last_snapshot_id = None
-        self._trade_sizes = trade_sizes_for(config.MAX_TRADE_SIZE_ERG)
+        self._trade_sizes = list(config.TRADE_SIZES)
 
         # Notification anti-spam state
         self._opportunity_streak: dict[str, int] = {}
@@ -85,6 +80,13 @@ class ArbitrageScanner:
         self._nonkyc_usdt_fee: float = 0.0
         self._stop = asyncio.Event()
         self.node_health: dict = {}
+        self.last_optima: dict[str, ArbitrageOpportunity] = {}
+        # --live state
+        self._live_streak: dict[str, int] = {}
+        self._live_paused: Optional[str] = None
+        self._last_trade_time = 0.0
+        self._trades_today: tuple[str, int] = ("", 0)
+        self._live_start_value: Optional[float] = None
         self._kucoin_usdt_fee: float = 1.0
 
     @property
@@ -345,9 +347,96 @@ class ArbitrageScanner:
         cents = int(sigusd * 100)
         return cents, quote_redeem_sigusd(state, cents) / 1e9
 
+    def _amm_buffer(self, prices: dict, trade_size: float) -> float:
+        return config.EXECUTION_BUFFER if prices.get("spectrum_pool") else config.get_recommended_slippage(trade_size)
+
+    def _path_bank_mint(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
+        """Path 1: ERG -> SigUSD (bank mint) -> ERG (pool sell). Always computed, marked blocked."""
+        bank = prices.get("bank", {})
+        bank_state: Optional[BankState] = bank.get("state")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        if not (bank_state and spectrum_price and spectrum_price > 0):
+            return None
+        oracle_price = bank.get("oracle_erg_usd") or bank_state.oracle_usd_per_erg
+        reserve_ratio = bank.get("reserve_ratio")
+        rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
+
+        mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
+        sigusd_from_bank = mint_cents / 100
+        bank_rate_after_fees = sigusd_from_bank / trade_size
+        erg_from_dex_after_fee = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
+
+        opp = self.calculator.calc_bank_to_dex(
+            input_erg=trade_size,
+            bank_erg_to_sigusd_rate=bank_rate_after_fees,
+            dex_sigusd_to_erg_output=erg_from_dex_after_fee,
+            dex_execution_fee=config.pool_service_fee(),
+            slippage=self._amm_buffer(prices, trade_size),
+        )
+        opp.path = f"Bank mint->Spectrum sell [{trade_size:g} ERG]"
+        fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+        opp.steps = [
+            f"START: Have {trade_size:g} ERG in wallet",
+            f"Send {trade_size:g} ERG to SigmaUSD Bank to mint SigUSD",
+            f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+            f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+        ]
+        opp.details = {"sigusd_cents": mint_cents}
+        if not mint_ok:
+            opp.blocked = True
+            opp.blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
+            opp.is_profitable = False
+        return opp
+
+    def _path_pool_buy_redeem(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
+        """Path 2: ERG -> SigUSD (pool buy) -> ERG (bank redeem). Executable by execute_arb.py."""
+        bank = prices.get("bank", {})
+        bank_state: Optional[BankState] = bank.get("state")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        if not (bank_state and spectrum_price and spectrum_price > 0):
+            return None
+        oracle_price = bank.get("oracle_erg_usd") or bank_state.oracle_usd_per_erg
+
+        sigusd_from_dex = self._dex_erg_to_sigusd(prices, trade_size)
+        redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
+        bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
+
+        opp = self.calculator.calc_dex_to_bank(
+            input_erg=trade_size,
+            dex_erg_to_sigusd_output=sigusd_from_dex,
+            bank_sigusd_to_erg_rate=bank_redeem_rate,
+            dex_execution_fee=config.pool_service_fee(),
+            slippage=self._amm_buffer(prices, trade_size),
+        )
+        opp.path = f"Spectrum buy->Bank redeem [{trade_size:g} ERG]"
+        fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+        opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
+        opp.steps = [
+            f"START: Have {trade_size:g} ERG in wallet",
+            f"Swap {trade_size:g} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"Receive ~{sigusd_from_dex:.2f} SigUSD",
+            f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+            f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+        ]
+        return opp
+
+    def _optimize_sizes(self, prices: dict) -> dict[str, ArbitrageOpportunity]:
+        """Best size per on-chain path within [MIN_TRADE_SIZE_ERG, MAX_TRADE_SIZE_ERG] (issue #10)."""
+        lo, hi = config.MIN_TRADE_SIZE_ERG, max(config.MAX_TRADE_SIZE_ERG, config.MIN_TRADE_SIZE_ERG)
+        optima = {}
+        for path_fn in (self._path_bank_mint, self._path_pool_buy_redeem):
+            if path_fn(prices, lo) is None:
+                continue
+            x, _ = maximize(lambda size: path_fn(prices, size).profit_erg, lo, hi)
+            opp = path_fn(prices, round(x, 2))
+            optima[opp.path_key] = opp
+        return optima
+
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
-        """Analyze prices and find all arbitrage opportunities."""
+        """Analyze prices and find all arbitrage opportunities (grid sizes); best sizes go to last_optima."""
         opportunities = []
+        self.last_optima = self._optimize_sizes(prices)
 
         nonkyc_price = prices.get("nonkyc_erg_usdt") if self.enable_cex else None
         kucoin_price = prices.get("kucoin_erg_usdt") if self.enable_cex else None
@@ -374,62 +463,10 @@ class ArbitrageScanner:
 
             # ---- SigUSD Paths ----
 
-            # Path 1: Bank mint -> Spectrum (always calculate, mark blocked)
-            if bank_state and spectrum_price and spectrum_price > 0:
-                mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
-                sigusd_from_bank = mint_cents / 100
-                bank_rate_after_fees = sigusd_from_bank / trade_size
-                erg_from_dex_after_fee = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
-
-                opp = self.calculator.calc_bank_to_dex(
-                    input_erg=trade_size,
-                    bank_erg_to_sigusd_rate=bank_rate_after_fees,
-                    dex_sigusd_to_erg_output=erg_from_dex_after_fee,
-                    dex_execution_fee=config.pool_service_fee(),
-                    slippage=amm_buffer,
-                )
-                opp.path = f"Bank mint->Spectrum sell [{trade_size} ERG]"
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                opp.steps = [
-                    f"START: Have {trade_size} ERG in wallet",
-                    f"Send {trade_size} ERG to SigmaUSD Bank to mint SigUSD",
-                    f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-                    f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
-                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
-                ]
-                opp.details = {"sigusd_cents": mint_cents}
-                if not mint_ok:
-                    opp.blocked = True
-                    opp.blocked_reason = (
-                        f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
-                    )
-                    opp.is_profitable = False
-                opportunities.append(opp)
-
-            # Path 2: Spectrum -> Bank redeem (always calculate, mark blocked)
-            if bank_state and spectrum_price and spectrum_price > 0:
-                sigusd_from_dex = self._dex_erg_to_sigusd(prices, trade_size)
-                redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
-                bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
-
-                opp = self.calculator.calc_dex_to_bank(
-                    input_erg=trade_size,
-                    dex_erg_to_sigusd_output=sigusd_from_dex,
-                    bank_sigusd_to_erg_rate=bank_redeem_rate,
-                    dex_execution_fee=config.pool_service_fee(),
-                    slippage=amm_buffer,
-                )
-                opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
-                opp.steps = [
-                    f"START: Have {trade_size} ERG in wallet",
-                    f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
-                    f"Receive ~{sigusd_from_dex:.2f} SigUSD",
-                    f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
-                ]
-                opportunities.append(opp)
+            for path_fn in (self._path_bank_mint, self._path_pool_buy_redeem):
+                opp = path_fn(prices, trade_size)
+                if opp is not None:
+                    opportunities.append(opp)
 
             # Path 3: NonKYC vs Spectrum (note SigUSD != USDT assumption)
             if nonkyc_price and spectrum_price:
@@ -777,7 +814,8 @@ class ArbitrageScanner:
         )
         grid.add_column("Path", style="bold", no_wrap=True)
         for size in all_sizes:
-            grid.add_column(f"{size:.0f}", justify="right", min_width=6)
+            star = "*" if size > config.MAX_TRADE_SIZE_ERG else ""
+            grid.add_column(f"{size:.0f}{star}", justify="right", min_width=6)
         grid.add_column("Status", justify="center")
 
         # Sort paths: profitable first (by best %), then unprofitable, then blocked
@@ -837,10 +875,23 @@ class ArbitrageScanner:
             for o in opps:
                 if o.assumption:
                     footnotes.add(o.assumption)
+        if any(size > config.MAX_TRADE_SIZE_ERG for size in all_sizes):
+            footnotes.add(f"sizes above MAX_TRADE_SIZE_ERG={config.MAX_TRADE_SIZE_ERG:g}: analysis only")
         if footnotes:
-            grid.caption = " | ".join(f"* {a}" for a in footnotes)
+            grid.caption = " | ".join(f"* {a}" for a in sorted(footnotes))
 
         console.print(grid)
+
+        # Best size per on-chain path (searched, capped by MAX_TRADE_SIZE_ERG)
+        for key, opt in self.last_optima.items():
+            if opt.profit_erg <= 0:
+                console.print(f"  [dim]BEST SIZE {key}: no profitable size up to {config.MAX_TRADE_SIZE_ERG:g} ERG[/dim]")
+                continue
+            style = "bold green" if opt.is_profitable and not opt.blocked else "yellow"
+            console.print(
+                f"  [{style}]BEST SIZE {key}: {opt.input_erg:g} ERG -> {opt.profit_erg:+.4f} ERG "
+                f"({opt.profit_percent:+.2f}%)[/{style}]"
+            )
 
         # Why each path is (not) profitable, including blocked reasons
         for opp in sorted(best_per_path, key=lambda o: -o.profit_percent):
@@ -980,30 +1031,101 @@ class ArbitrageScanner:
             streak_info = ", ".join(f"{k}: {v}" for k, v in active_streaks.items())
             logger.info(f"Streaks: {streak_info}")
 
-    async def _execute_trades(self, opportunities: list[ArbitrageOpportunity]):
-        """Execute trades for profitable opportunities (--live mode only)."""
+    def _update_live_streak(self):
+        """Consecutive scans in which the executable path is profitable at its best size."""
+        opt = self.last_optima.get(LIVE_PATH)
+        ok = bool(opt and not opt.blocked and opt.profit_erg > 0
+                  and opt.profit_percent >= config.MIN_PROFIT_PERCENT)
+        self._live_streak[LIVE_PATH] = self._live_streak.get(LIVE_PATH, 0) + 1 if ok else 0
+
+    @staticmethod
+    def _wallet_value_erg(wallet: dict, prices: dict) -> float:
+        oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+        sigusd_erg = wallet.get("sigusd", 0) / oracle if oracle else 0.0
+        return wallet.get("erg", 0) + sigusd_erg
+
+    def _live_size(self, opt: Optional[ArbitrageOpportunity], wallet: dict) -> float:
+        best = opt.input_erg if opt else 0.0
+        return max(0.0, min(best, config.MAX_TRADE_SIZE_ERG, wallet.get("erg", 0) - config.LIVE_ERG_RESERVE))
+
+    def _trades_today_count(self) -> int:
+        today = datetime.now().strftime("%Y-%m-%d")
+        return self._trades_today[1] if self._trades_today[0] == today else 0
+
+    async def _live_blockers(self, wallet: dict, prices: dict) -> list[str]:
+        """Every reason live trading would not execute right now (empty list = ready)."""
+        blockers = []
+        opt = self.last_optima.get(LIVE_PATH)
+        if not opt or opt.blocked or opt.profit_erg <= 0 or opt.profit_percent < config.MIN_PROFIT_PERCENT:
+            best = f"{opt.profit_percent:+.2f}% at {opt.input_erg:g} ERG" if opt else "no data"
+            blockers.append(f"no profit >= {config.MIN_PROFIT_PERCENT}% (best {best})")
+        streak = self._live_streak.get(LIVE_PATH, 0)
+        if streak < config.LIVE_CONFIRM_SCANS:
+            blockers.append(f"profitable {streak}/{config.LIVE_CONFIRM_SCANS} scans in a row")
+        if os.path.exists(config.LIVE_STOP_FILE):
+            blockers.append(f"STOP file present ({config.LIVE_STOP_FILE})")
+        if self._live_paused:
+            blockers.append(f"paused after: {self._live_paused} (restart to resume)")
+        value = self._wallet_value_erg(wallet, prices)
+        if self._live_start_value is None:
+            self._live_start_value = value
+        elif self._live_start_value - value > config.LIVE_MAX_DRAWDOWN_ERG:
+            blockers.append(f"drawdown {self._live_start_value - value:.2f} ERG > LIVE_MAX_DRAWDOWN_ERG "
+                            f"{config.LIVE_MAX_DRAWDOWN_ERG:g}")
+        wait = config.LIVE_TRADE_COOLDOWN_SECONDS - (time.time() - self._last_trade_time)
+        if self._last_trade_time and wait > 0:
+            blockers.append(f"cooldown {wait:.0f}s")
+        if self._trades_today_count() >= config.LIVE_MAX_TRADES_PER_DAY:
+            blockers.append(f"max {config.LIVE_MAX_TRADES_PER_DAY} trades per day reached")
+        size = self._live_size(opt, wallet)
+        if size < config.MIN_TRADE_SIZE_ERG:
+            blockers.append(f"wallet too small: {wallet.get('erg', 0):.2f} ERG minus {config.LIVE_ERG_RESERVE:g} reserve")
+        health = await self.ergo_node.get_health()
+        if not health.get("ok_to_trade"):
+            blockers.append(f"node not ready (synced={health.get('synced')}, unlocked={health.get('unlocked')})")
+        return blockers
+
+    async def _execute_trades(self, wallet: dict, prices: dict):
+        """--live: run pool buy -> bank redeem at the best size when every check passes."""
         if not self.trading_enabled:
             return
-
-        profitable = [o for o in opportunities if o.is_profitable and not o.blocked and o.risk_adjusted_profitable]
-        if not profitable:
+        blockers = await self._live_blockers(wallet, prices)
+        if blockers:
+            console.print(f"  [dim]LIVE: not trading - {'; '.join(blockers)}[/dim]")
             return
 
-        best = max(profitable, key=lambda x: x.profit_percent)
-        path_name = best.path_key
+        opt = self.last_optima[LIVE_PATH]
+        size = self._live_size(opt, wallet)
+        console.print(Panel(f"[bold red]LIVE: executing {LIVE_PATH} with {size:g} ERG "
+                            f"(planned {opt.profit_percent:+.2f}%)[/bold red]", border_style="red"))
+        trade_id = self.tracker.start_trade(None, size, size + opt.profit_erg * size / opt.input_erg,
+                                            opt.profit_erg * size / opt.input_erg)
+        result = await run_pool_buy_redeem(self.ergo_node.session, int(round(size * 1e9)),
+                                           execute=True, log=lambda m: console.print(m))
+        self._last_trade_time = time.time()
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._trades_today = (today, self._trades_today_count() + 1)
 
-        # TODO: Wire up actual execution per path
-        logger.warning(
-            f"LIVE MODE: Would execute {path_name} with {best.input_erg:.0f} ERG "
-            f"(+{best.profit_percent:.2f}%) - NOT YET IMPLEMENTED"
-        )
-        console.print(Panel(
-            f"[bold yellow]LIVE MODE: Trade execution not yet implemented\n"
-            f"Path: {path_name}\n"
-            f"Size: {best.input_erg:.0f} ERG | Profit: +{best.profit_erg:.4f} ERG[/bold yellow]",
-            title="Trade Execution (pending implementation)",
-            border_style="yellow",
-        ))
+        profit = result.profit_nanoerg / 1e9
+        if result.status == "executed":
+            self.tracker.complete_trade(trade_id, actual_output=size + profit, fee_paid_erg=0.0022,
+                                        tx_ids=[result.tx1, result.tx2], notes="expected (pre-confirmation)")
+            msg = (f"executed {size:g} ERG pool buy -> bank redeem, expected {profit:+.4f} ERG "
+                   f"({result.profit_percent:+.2f}%). Leg 1 {result.tx1}, leg 2 {result.tx2}")
+        elif result.status == "leg2_failed":
+            self._live_paused = f"leg 2 failed ({result.message})"
+            self.tracker.fail_trade(trade_id, result.message, notes=f"leg 1 {result.tx1}; holding SigUSD")
+            msg = (f"LEG 2 FAILED after leg 1 ({result.tx1}): {result.message}. Holding "
+                   f"{result.sigusd_cents / 100:.2f} SigUSD. Live trading paused. Finish with: "
+                   f"{result.recover_command}")
+        else:
+            if result.status == "refused":
+                self._live_paused = f"TX guard refused ({result.message})"
+            self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes="nothing spent")
+            msg = f"did not execute ({result.status}): {result.message or 'see console'}. Nothing was spent."
+        logger.warning(f"LIVE {msg}")
+        if self.discord_enabled:
+            await self.discord.notify_live(msg, ping=result.status != "not_profitable")
 
     async def _fetch_wallet_balances(self) -> dict:
         """Fetch current wallet balances."""
@@ -1486,6 +1608,7 @@ class ArbitrageScanner:
         self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
+        self._update_live_streak()
         self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
         self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities, prices)
@@ -1517,7 +1640,7 @@ class ArbitrageScanner:
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
 
-        await self._execute_trades(opportunities)
+        await self._execute_trades(wallet, prices)
 
         profitable_count = sum(1 for o in opportunities if o.is_profitable and not o.blocked)
         self.tracker.update_daily_summary(profitable_count)

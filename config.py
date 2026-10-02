@@ -99,7 +99,20 @@ CEX_WATCH_COOLDOWN_SECONDS = int(os.getenv("CEX_WATCH_COOLDOWN_SECONDS", "3600")
 
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
-MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))
+MAX_TRADE_SIZE_ERG = float(os.getenv("MAX_TRADE_SIZE_ERG", "100"))  # hard cap on anything executed
+
+
+def parse_sizes(text: str) -> list[float]:
+    """Comma-separated ERG sizes; empty means the default grid."""
+    sizes = [float(x) for x in text.split(",") if x.strip()]
+    sizes = sizes or [10, 100, 200, 500, 1000]
+    return [int(x) if x == int(x) else x for x in sorted(set(sizes))]
+
+
+# Trade sizes the scanner analyses (grid columns). Sizes above MAX_TRADE_SIZE_ERG are shown
+# for analysis only and never executed.
+TRADE_SIZES = parse_sizes(os.getenv("TRADE_SIZES", ""))
+MIN_TRADE_SIZE_ERG = float(os.getenv("MIN_TRADE_SIZE_ERG", "1"))  # lower bound of the best-size search
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
@@ -129,6 +142,14 @@ DISCORD_TIER1_PROFIT_PERCENT = float(os.getenv("DISCORD_TIER1_PROFIT_PERCENT", "
 DISCORD_WALLET_COOLDOWN_SECONDS = int(os.getenv("DISCORD_WALLET_COOLDOWN_SECONDS", "600"))
 DISCORD_SUMMARY_INTERVAL_SECONDS = int(os.getenv("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
 PRICE_STALE_SECONDS = int(os.getenv("PRICE_STALE_SECONDS", "60"))
+
+# --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
+LIVE_CONFIRM_SCANS = int(os.getenv("LIVE_CONFIRM_SCANS", "3"))            # profitable N scans in a row
+LIVE_TRADE_COOLDOWN_SECONDS = int(os.getenv("LIVE_TRADE_COOLDOWN_SECONDS", "300"))
+LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
+LIVE_MAX_DRAWDOWN_ERG = float(os.getenv("LIVE_MAX_DRAWDOWN_ERG", "5"))     # stop if wallet value falls this much
+LIVE_ERG_RESERVE = float(os.getenv("LIVE_ERG_RESERVE", "1"))               # ERG always kept in the wallet
+LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "STOP")                      # kill switch: no trades while it exists
 
 # Tracker: non-profitable scan rows older than this are deleted at startup
 SCAN_RESULTS_RETENTION_DAYS = int(os.getenv("SCAN_RESULTS_RETENTION_DAYS", "14"))
