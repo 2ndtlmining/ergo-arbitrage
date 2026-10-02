@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -132,6 +133,36 @@ def quote_mint_sigusd(state: BankState, budget_nanoerg: int) -> int:
     if affordable < 1:
         return 0
     return max(_max_true(1, affordable, lambda c: can_mint_sigusd(state, c)), 0)
+
+
+def mint_open_price(state: BankState) -> Optional[float]:
+    """ERG/USD oracle price at which the reserve ratio reaches 400% (circulation and reserve fixed).
+
+    RR is proportional to the oracle price, so it is the current price scaled by 400 / RR.
+    None when there is no ratio to scale (no SigUSD circulating, or no oracle price).
+    """
+    rr, oracle = state.reserve_ratio, state.oracle_usd_per_erg
+    if not oracle or not math.isfinite(rr) or rr <= 0:
+        return None
+    return oracle * MIN_RESERVE_RATIO / rr
+
+
+def mint_room_cents(state: BankState) -> int:
+    """Most SigUSD cents mintable now with the post-mint RR still >= 400% (0 when blocked).
+
+    can_mint_sigusd is monotone decreasing in cents whenever RR > 102% (a mint adds ERG at ~102%
+    collateral); below that, minting one cent is already blocked, so the search returns 0.
+    """
+    if state.rate <= 0:
+        return 0
+    upper = state.bank_erg_nano // state.rate + 1   # more SigUSD than the whole reserve could ever cover
+    return max(_max_true(1, upper, lambda c: can_mint_sigusd(state, c)), 0)
+
+
+def mint_room_nanoerg(state: BankState) -> int:
+    """ERG (nanoERG) the largest allowed mint costs: how much ERG the mint gate can take right now."""
+    cents = mint_room_cents(state)
+    return mint_cost_nanoerg(state, cents) if cents > 0 else 0
 
 
 def parse_bank_box(box: dict) -> tuple[int, int]:

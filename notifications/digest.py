@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
+import config
+from notifications.mint_gate import mint_gate_text
+
 DIGEST_KEY = "digest_date"
 
 
@@ -16,9 +19,11 @@ class Digest:
     outages: list = field(default_factory=list)     # (subject, seconds, ongoing)
     outage_since: str = ""
     wallet: Optional[dict] = None
+    mint: Optional[str] = None                      # bank mint gate status text
 
 
-def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: int = 24) -> Digest:
+def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: int = 24,
+                 bank: Optional[dict] = None) -> Digest:
     since = now - timedelta(hours=hours)
     d = Digest(hours=hours, wallet=wallet)
     for row in tracker.chain_episodes_since(since.isoformat()):
@@ -38,6 +43,7 @@ def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: 
         since_wall = max(wall_now - hours * 3600, health.started_at)
         d.outages = health.outages(now=wall_now, since=since_wall)
         d.outage_since = f"since {datetime.fromtimestamp(since_wall):%Y-%m-%d %H:%M}"
+    d.mint = mint_gate_text(bank, config.MINT_GATE_MIN_ROOM_ERG)
     return d
 
 
