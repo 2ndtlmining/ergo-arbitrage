@@ -48,6 +48,7 @@ from notifications import embeds
 from notifications.digest import build_digest, digest_due, mark_digest_sent
 from notifications.episodes import EpisodeTracker
 from notifications.health import HealthMonitor
+from notifications.mint_gate import MintGateWatcher, mint_gate_text
 from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
@@ -78,6 +79,8 @@ class ArbitrageScanner:
         self.health = HealthMonitor(config.DISCORD_HEALTH_CHAIN_SECONDS, config.DISCORD_HEALTH_VENUE_SECONDS,
                                     config.DISCORD_HEALTH_ORACLE_SECONDS, config.DISCORD_HEALTH_REPEAT_SECONDS,
                                     started_at=time.time())
+        self.mint_gate = MintGateWatcher(config.MINT_GATE_CONFIRM_POLLS, config.MINT_GATE_MIN_ROOM_ERG,
+                                         config.MINT_GATE_PING_COOLDOWN_SECONDS)
         self._last_wallet: Optional[dict] = None
         self._last_prices: dict = {}
         self._now = 0.0
@@ -1088,6 +1091,16 @@ class ArbitrageScanner:
             self.discord.edit(lambda ep=ep: ep.message_id, self._episode_embed(ep, "closed"))
             self.state.add_event("info", f"Discord: closed {ep.label} (peak {ep.peak_percent:+.2f}%)")
 
+    def _handle_mint_gate(self, event):
+        if event.kind == "opened":
+            self.discord.post(embeds.mint_gate_embed(event), content=self.discord._ping() if event.ping else "",
+                              on_id=lambda mid, op=event.opening: setattr(op, "message_id", mid))
+            self.state.add_event("good", f"Bank mint OPEN: RR {event.reserve_ratio:.0f}%, "
+                                         f"room ~{event.room_erg:,.0f} ERG")
+        else:
+            self.discord.edit(lambda op=event.opening: op.message_id, embeds.mint_gate_embed(event))
+            self.state.add_event("info", f"Bank mint closed again (RR {event.reserve_ratio:.0f}%)")
+
     def _episode_posted(self, ep, message_id: str):
         ep.message_id = message_id
         self.tracker.set_chain_episode_message(ep.db_id, message_id)  # so a restart can close it
@@ -1115,6 +1128,10 @@ class ArbitrageScanner:
             for h in self.health.update(time.time(), self.state):
                 self.discord.post(embeds.health_embed(h), content=self.discord._ping() if h.ping else "")
                 self.state.add_event("warn" if h.kind == "alert" else "info", f"Discord: {h.text}")
+            bank = None if self.state.chain_error else (self.state.prices or {}).get("bank")
+            gate = self.mint_gate.update(now, bank)
+            if gate:
+                self._handle_mint_gate(gate)
         except Exception as e:
             logger.error(f"Discord tick error: {e}", exc_info=True)
 
@@ -1853,7 +1870,8 @@ class ArbitrageScanner:
         try:
             if self.discord_enabled and digest_due(self.tracker, datetime.now(), config.DISCORD_DIGEST_HOUR):
                 self.discord.post(embeds.digest_embed(build_digest(self.tracker, self.health, self._last_wallet,
-                                                                   datetime.now())))
+                                                                   datetime.now(),
+                                                                   bank=(self.state.prices or {}).get("bank"))))
                 mark_digest_sent(self.tracker, datetime.now())
         except Exception as e:  # the digest must never block a scan or a trade
             logger.error(f"Daily digest error: {e}", exc_info=True)
@@ -1906,6 +1924,7 @@ class ArbitrageScanner:
         s.read_ms = snap.read_ms if snap else None
         s.next_full_scan_in = max(0.0, config.SCAN_INTERVAL_SECONDS - (now - self._last_full_scan))
         s.prices = prices
+        s.mint_text = mint_gate_text(prices.get("bank"), config.MINT_GATE_MIN_ROOM_ERG)
         s.update_venues(describe_all(VenueContext(
             prices={**self._last_prices, **prices}, timestamps=self._price_timestamps, now=time.time(),
             chain_error=self._chain_error, pending=snap.pending if snap else frozenset(), read_ms=s.read_ms,
