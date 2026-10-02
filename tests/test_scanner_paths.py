@@ -1,6 +1,8 @@
 """Scanner path tests against a fixed `prices` snapshot (no network)."""
 import pytest
 
+import config
+
 from arbitrage.scanner import ArbitrageScanner
 from exchanges.sigmausd import BankState, quote_redeem_sigusd
 
@@ -197,5 +199,44 @@ class TestUseDisabled:
         s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
         try:
             assert s.enable_use is False
+        finally:
+            s.tracker.close()
+
+
+class TestPoolRouteCosts:
+    def _opp(self, scanner, path, size=50):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        opps = scanner._find_opportunities(make_prices(state, 0.31))
+        return next(o for o in by_path(opps, path) if o.input_erg == size)
+
+    def test_direct_route_has_no_service_fee(self, scanner):
+        opp = self._opp(scanner, "Spectrum buy->Bank redeem")
+        assert opp.fees.execution_fee_erg == 0
+        assert not any("service fee" in s and "no service fee" not in s for s in opp.steps)
+
+    def test_crux_route_charges_service_fee(self, scanner, monkeypatch):
+        direct = self._opp(scanner, "Spectrum buy->Bank redeem")
+        monkeypatch.setattr(config, "POOL_SWAP_ROUTE", "crux")
+        crux = self._opp(scanner, "Spectrum buy->Bank redeem")
+        assert crux.fees.execution_fee_erg == pytest.approx(config.SPECTRUM_EXECUTION_FEE)
+        assert direct.output_erg - crux.output_erg == pytest.approx(config.SPECTRUM_EXECUTION_FEE, rel=0.01)
+
+    def test_wallet_sigusd_swap_uses_route(self, scanner, monkeypatch):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+
+        def swap_result():
+            a = scanner._build_wallet_analysis({"erg": 0, "sigusd": 10, "use": 0}, make_prices(state, 0.31))
+            return float(next(o for o in a["sigusd"]["options"] if o["name"] == "Spectrum swap")["result"].split()[0])
+
+        direct = swap_result()
+        monkeypatch.setattr(config, "POOL_SWAP_ROUTE", "crux")
+        assert direct - swap_result() == pytest.approx(config.SPECTRUM_EXECUTION_FEE, abs=0.011)
+
+    def test_use_legs_keep_crux_fee(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_use=True)
+        try:
+            prices = TestUsePath()._prices(TestUsePath()._lp(340_000, 100_000))
+            o = next(o for o in s._find_opportunities(prices) if o.path.startswith("Crux mint+sell USE"))
+            assert o.fees.execution_fee_erg == pytest.approx(config.CRUX_MINT_SERVICE_FEE + config.SPECTRUM_EXECUTION_FEE)
         finally:
             s.tracker.close()

@@ -17,6 +17,7 @@ TEST_DEFAULTS = {
     "MAX_FEE_BUDGET_ERG": 1.0,
     "ENABLE_CEX": False,
     "ENABLE_USE": False,
+    "POOL_SWAP_ROUTE": "direct",
 }
 
 

@@ -374,6 +374,7 @@ class ArbitrageScanner:
                     input_erg=trade_size,
                     bank_erg_to_sigusd_rate=bank_rate_after_fees,
                     dex_sigusd_to_erg_output=erg_from_dex_after_fee,
+                    dex_execution_fee=config.pool_service_fee(),
                     slippage=amm_buffer,
                 )
                 opp.path = f"Bank mint->Spectrum sell [{trade_size} ERG]"
@@ -382,7 +383,7 @@ class ArbitrageScanner:
                     f"START: Have {trade_size} ERG in wallet",
                     f"Send {trade_size} ERG to SigmaUSD Bank to mint SigUSD",
                     f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-                    f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                    f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
                     f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
                 ]
                 opp.details = {"sigusd_cents": mint_cents}
@@ -404,6 +405,7 @@ class ArbitrageScanner:
                     input_erg=trade_size,
                     dex_erg_to_sigusd_output=sigusd_from_dex,
                     bank_sigusd_to_erg_rate=bank_redeem_rate,
+                    dex_execution_fee=config.pool_service_fee(),
                     slippage=amm_buffer,
                 )
                 opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
@@ -411,7 +413,7 @@ class ArbitrageScanner:
                 opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
                 opp.steps = [
                     f"START: Have {trade_size} ERG in wallet",
-                    f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                    f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
                     f"Receive ~{sigusd_from_dex:.2f} SigUSD",
                     f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
                     f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
@@ -437,7 +439,7 @@ class ArbitrageScanner:
                     usdt_result = trade_size * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
                     opp.steps = [
                         f"START: Have SigUSD in wallet",
-                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
                         f"Deposit ERG to NonKYC (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
                         f"Sell ERG on NonKYC for USDT at ${nonkyc_price:.4f}/ERG ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
                         f"END RESULT: ~${usdt_result:.2f} USDT on NonKYC (USDT withdrawal fee: {nonkyc_usdt_fee} USDT)",
@@ -448,7 +450,7 @@ class ArbitrageScanner:
                         f"START: Have USDT on NonKYC",
                         f"Buy ERG on NonKYC at ${nonkyc_price:.4f} USDT ({config.NONKYC_TRADING_FEE*100:.1f}% fee)",
                         f"Withdraw ERG to wallet (-{config.NONKYC_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
                         f"END RESULT: SigUSD tokens in Ergo wallet",
                         f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
                     ]
@@ -473,7 +475,7 @@ class ArbitrageScanner:
                     usdt_result = trade_size * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
                     opp.steps = [
                         f"START: Have SigUSD in wallet",
-                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Swap SigUSD -> ERG on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
                         f"Deposit ERG to Kucoin (free, just ~{config.ERGO_TX_FEE} ERG network fee)",
                         f"Sell ERG on Kucoin for USDT at ${kucoin_price:.4f}/ERG ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
                         f"END RESULT: ~${usdt_result:.2f} USDT on Kucoin (USDT withdrawal fee: {kucoin_usdt_fee} USDT)",
@@ -484,7 +486,7 @@ class ArbitrageScanner:
                         f"START: Have USDT on Kucoin",
                         f"Buy ERG on Kucoin at ${kucoin_price:.4f} USDT ({config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
                         f"Withdraw ERG to wallet (-{config.KUCOIN_ERG_WITHDRAW_FEE} ERG withdrawal fee)",
-                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                        f"Swap ERG -> SigUSD on Spectrum DEX ({spectrum_price:.4f} SigUSD/ERG, -0.5% pool fee, {config.pool_fee_text()})",
                         f"END RESULT: SigUSD tokens in Ergo wallet",
                         f"WARNING: Assumes 1 SigUSD = 1 USDT. SigUSD is currently depegged!",
                     ]
@@ -977,7 +979,7 @@ class ArbitrageScanner:
                 if mint_ok:
                     sigusd_out = mint_cents / 100
                     erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd_out)
-                    total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
+                    total_fees = config.pool_service_fee() + config.ERGO_TX_FEE * 2
                     erg_back = erg_before_fees - total_fees
                     net = erg_back - erg
                     pct = (net / erg) * 100
@@ -985,7 +987,7 @@ class ArbitrageScanner:
                         "name": "Bank mint -> Spectrum sell",
                         "steps": [
                             f"Mint SigUSD at Bank: {erg:.2f} ERG -> {sigusd_out:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
-                            f"Swap SigUSD -> ERG on Spectrum: {sigusd_out:.2f} SigUSD -> {erg_before_fees:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                            f"Swap SigUSD -> ERG on Spectrum: {sigusd_out:.2f} SigUSD -> {erg_before_fees:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()})",
                             f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
                         ],
                         "profit_pct": pct,
@@ -1004,14 +1006,14 @@ class ArbitrageScanner:
                 if can_redeem:
                     sigusd_out = self._dex_erg_to_sigusd(prices, erg)
                     _, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_out)
-                    total_fees = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE + config.SIGMAUSD_REDEEM_EXTRA_ERG
+                    total_fees = config.pool_service_fee() + config.ERGO_TX_FEE + config.SIGMAUSD_REDEEM_EXTRA_ERG
                     erg_back = erg_from_bank - total_fees
                     net = erg_back - erg
                     pct = (net / erg) * 100
                     erg_options.append({
                         "name": "Spectrum buy -> Bank redeem",
                         "steps": [
-                            f"Swap ERG -> SigUSD on Spectrum: {erg:.2f} ERG -> {sigusd_out:.2f} SigUSD (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service fee)",
+                            f"Swap ERG -> SigUSD on Spectrum: {erg:.2f} ERG -> {sigusd_out:.2f} SigUSD (-0.5% pool fee, {config.pool_fee_text()})",
                             f"Redeem SigUSD at Bank: {sigusd_out:.2f} SigUSD -> {erg_from_bank:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
                             f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
                         ],
@@ -1080,12 +1082,12 @@ class ArbitrageScanner:
             # 2. Spectrum swap (SigUSD -> ERG)
             if spectrum_price:
                 erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
-                erg_out = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                erg_out = erg_before_fees - config.pool_service_fee() - config.ERGO_TX_FEE
                 pct = ((erg_out - baseline_erg) / baseline_erg) * 100
                 sigusd_options.append({
                     "name": "Spectrum swap",
                     "steps": [
-                        f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                        f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()}, -{config.ERGO_TX_FEE} ERG network)",
                     ],
                     "profit_pct": pct,
                     "profit_desc": f"{erg_out:.2f} ERG ({pct:+.1f}% vs oracle baseline {baseline_erg:.2f} ERG)",
@@ -1096,7 +1098,7 @@ class ArbitrageScanner:
             # 3. Spectrum -> Kucoin (SigUSD -> ERG -> USDT)
             if spectrum_price and kucoin_price:
                 erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
-                erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                erg_from_dex = erg_before_fees - config.pool_service_fee() - config.ERGO_TX_FEE
                 if erg_from_dex > 0:
                     usdt_out = erg_from_dex * kucoin_price * (1 - config.KUCOIN_TRADING_FEE)
                     # Profit: compare USDT out to what SigUSD "should be worth" ($1 per SigUSD if pegged)
@@ -1105,7 +1107,7 @@ class ArbitrageScanner:
                     sigusd_options.append({
                         "name": "Spectrum -> Kucoin",
                         "steps": [
-                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()}, -{config.ERGO_TX_FEE} ERG network)",
                             f"Deposit {erg_from_dex:.2f} ERG to Kucoin (free)",
                             f"Sell on Kucoin: {erg_from_dex:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
                         ],
@@ -1118,7 +1120,7 @@ class ArbitrageScanner:
             # 4. Spectrum -> NonKYC (SigUSD -> ERG -> USDT)
             if spectrum_price and nonkyc_price:
                 erg_before_fees = self._dex_sigusd_to_erg(prices, sigusd)
-                erg_from_dex = erg_before_fees - config.SPECTRUM_EXECUTION_FEE - config.ERGO_TX_FEE
+                erg_from_dex = erg_before_fees - config.pool_service_fee() - config.ERGO_TX_FEE
                 if erg_from_dex > 0:
                     usdt_out = erg_from_dex * nonkyc_price * (1 - config.NONKYC_TRADING_FEE)
                     baseline_usdt = sigusd
@@ -1126,7 +1128,7 @@ class ArbitrageScanner:
                     sigusd_options.append({
                         "name": "Spectrum -> NonKYC",
                         "steps": [
-                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service, -{config.ERGO_TX_FEE} ERG network)",
+                            f"Swap on Spectrum: {sigusd:.2f} SigUSD -> {erg_from_dex:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()}, -{config.ERGO_TX_FEE} ERG network)",
                             f"Deposit {erg_from_dex:.2f} ERG to NonKYC (free)",
                             f"Sell on NonKYC: {erg_from_dex:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
                         ],
@@ -1240,7 +1242,7 @@ class ArbitrageScanner:
                     if spectrum_price and can_redeem:
                         sigusd_from_spectrum = self._dex_erg_to_sigusd(prices, erg_from_crux)
                         erg_hop2 = self._bank_redeem_erg(bank_state, sigusd_from_spectrum)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
-                        total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE
+                        total_fees_hop2 = config.pool_service_fee() + config.ERGO_TX_FEE
                         erg_final = erg_hop2 - total_fees_hop2
                         net = erg_final - erg_from_crux
                         pct_arb = (net / erg_from_crux) * 100
@@ -1248,7 +1250,7 @@ class ArbitrageScanner:
                             "name": "Crux -> Spectrum -> Bank redeem",
                             "steps": [
                                 crux_step,
-                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service)",
+                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-0.5% pool fee, {config.pool_fee_text()})",
                                 f"Redeem at Bank: {sigusd_from_spectrum:.2f} SigUSD -> {erg_hop2:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
                                 f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
                             ],
@@ -1263,7 +1265,7 @@ class ArbitrageScanner:
                     if spectrum_price and use_mint_ok:
                         sigusd_from_bank = use_mint_cents / 100
                         erg_from_spectrum = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
-                        total_fees_hop2 = config.SPECTRUM_EXECUTION_FEE + config.ERGO_TX_FEE * 2
+                        total_fees_hop2 = config.pool_service_fee() + config.ERGO_TX_FEE * 2
                         erg_final = erg_from_spectrum - total_fees_hop2
                         net = erg_final - erg_from_crux
                         pct_arb = (net / erg_from_crux) * 100
@@ -1272,7 +1274,7 @@ class ArbitrageScanner:
                             "steps": [
                                 crux_step,
                                 f"Mint SigUSD at Bank: {erg_from_crux:.2f} ERG -> {sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
-                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-0.5% pool fee, -{config.SPECTRUM_EXECUTION_FEE} ERG service)",
+                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()})",
                                 f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
                             ],
                             "profit_pct": pct_arb,
