@@ -41,10 +41,12 @@ class TestChooseSize:
 @pytest.fixture
 def offline(monkeypatch):
     """run_arb with node calls replaced; signing stops at the dry-run point."""
-    async def fetch(ns, nfts):
-        boxes = {config.SPECTRUM_SIGUSD_POOL_NFT: POOL, config.SIGMAUSD_BANK_NFT: BANK_BOX,
-                 config.SIGMAUSD_ORACLE_NFT: ORACLE_BOX}
-        return [boxes[n] for n in nfts]
+    boxes = {config.SPECTRUM_SIGUSD_POOL_NFT: POOL, config.SIGMAUSD_BANK_NFT: BANK_BOX,
+             config.SIGMAUSD_ORACLE_NFT: ORACLE_BOX}
+    pending: dict = {}
+
+    async def latest(ns, nft, explorer=None):
+        return boxes[nft], pending.get(nft, False)
 
     async def ctx(ns):
         return wallet(1_000), 1_900_000, OUR_TREE
@@ -55,10 +57,11 @@ def offline(monkeypatch):
     async def sign(ns, node, tx, policy, *, execute):
         raise DryRun()
 
-    monkeypatch.setattr(runner, "_fetch_boxes", fetch)
+    monkeypatch.setattr(runner, "latest_box", latest)
     monkeypatch.setattr(runner, "wallet_context", ctx)
     monkeypatch.setattr(runner, "wallet_trees", trees)
     monkeypatch.setattr(runner, "guarded_sign", sign)
+    return pending
 
 
 def test_run_arb_without_size_uses_best_size(offline):
@@ -81,3 +84,52 @@ def test_run_arb_without_size_stops_when_nothing_is_worth_trading(offline, monke
 def test_run_arb_with_explicit_size_keeps_it(offline):
     r = asyncio.run(runner.run_arb(None, "redeem", 3 * 10**9, log=lambda m: None))
     assert r.erg_in == 3 * 10**9
+
+
+def test_runner_spends_the_pending_pool_box():
+    from tests.fake_node import FakeSession
+    nft = config.SPECTRUM_SIGUSD_POOL_NFT
+    pending = dict(POOL, boxId="pool-pending")
+    ns = FakeSession({f"/transactions/unconfirmed/outputs/byTokenId/{nft}": (200, [pending]),
+                      "/utxo/withPool/byId/pool-pending": (200, pending)})
+    (got,) = asyncio.run(runner._fetch_boxes(ns, (nft,)))
+    assert got["boxId"] == "pool-pending"
+
+
+def test_cli_reads_the_pending_bank_box():
+    from ergo import actions
+    from tests.fake_node import FakeSession
+    nft = config.SIGMAUSD_BANK_NFT
+    pending = dict(BANK_BOX, boxId="bank-pending")
+    ns = FakeSession({f"/transactions/unconfirmed/outputs/byTokenId/{nft}": (200, [pending]),
+                      "/utxo/withPool/byId/bank-pending": (200, pending)})
+    (got,) = asyncio.run(actions._boxes(ns, nft))
+    assert got["boxId"] == "bank-pending"
+
+
+def test_run_arb_waits_while_an_oracle_update_is_pending(offline):
+    offline[config.SIGMAUSD_ORACLE_NFT] = True
+    logs = []
+    r = asyncio.run(runner.run_arb(None, "redeem", 3 * 10**9, log=logs.append))
+    assert r.status == "aborted" and "oracle update pending" in r.message
+
+
+def test_force_ignores_a_pending_oracle_update(offline):
+    offline[config.SIGMAUSD_ORACLE_NFT] = True
+    r = asyncio.run(runner.run_arb(None, "redeem", 3 * 10**9, force=True, log=lambda m: None))
+    assert r.status == "dry_run"
+
+
+def test_redeem_leg2_rebuild_is_not_ready_while_an_oracle_update_is_pending(offline):
+    offline[config.SIGMAUSD_ORACLE_NFT] = True
+    with pytest.raises(runner.LegNotReady):
+        asyncio.run(runner._leg2_boxes(None, "redeem"))
+    (pool,) = asyncio.run(runner._leg2_boxes(None, "mint"))  # pool sell does not use the oracle
+    assert pool is POOL
+
+
+def test_leg2_rebuild_boxes(offline):
+    bank, oracle = asyncio.run(runner._leg2_boxes(None, "redeem"))
+    assert bank is BANK_BOX and oracle is ORACLE_BOX
+    (pool,) = asyncio.run(runner._leg2_boxes(None, "mint"))
+    assert pool is POOL

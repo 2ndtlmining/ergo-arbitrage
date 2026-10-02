@@ -291,13 +291,22 @@ ratio stays >= 400% after minting:
 | Check | Setting (default) |
 |---|---|
 | Profitable at its best size | `MIN_PROFIT_PERCENT` (0.5), `SIZE_PROFIT_CAPTURE` (0.95) |
-| ...for N scans in a row | `LIVE_CONFIRM_SCANS` (3) |
+| ...for N chain polls in a row (~2 s apart) | `LIVE_CONFIRM_POLLS` (2) |
+| Chain state readable, no oracle update pending | node polled every `CHAIN_POLL_SECONDS` (2) |
 | Size capped | `MAX_TRADE_SIZE_ERG`, wallet minus `LIVE_ERG_RESERVE` (1) |
 | Node synced and wallet unlocked | checked before each trade |
 | Kill switch file absent | `LIVE_STOP_FILE` (`STOP`) |
 | Wallet value drawdown since start | `LIVE_MAX_DRAWDOWN_ERG` (5) |
 | Time since last trade | `LIVE_TRADE_COOLDOWN_SECONDS` (300) |
 | Trades today | `LIVE_MAX_TRADES_PER_DAY` (10) |
+
+**Chain watcher.** Pool, bank and oracle boxes come from your node every `CHAIN_POLL_SECONDS`
+(2 s), mempool included: a pending pool or bank transaction is priced right away, and trades chain
+onto it instead of conflicting with it. The oracle box is only a data input of the bank
+transaction, so it is always read from the confirmed state; while an oracle update is pending,
+nothing trades until it confirms (about one block). Each poll re-runs the exact sizing and the live
+gate; the tables, SQLite logging and Discord stay on `SCAN_INTERVAL_SECONDS`. If the node cannot be
+read, nothing trades until it can. A `CHAIN` line is printed whenever a contract box changes.
 
 Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 failure or a
 TX-guard refusal pauses live trading until restart and is sent to Discord with the redeem

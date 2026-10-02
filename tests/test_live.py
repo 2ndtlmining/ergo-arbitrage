@@ -36,7 +36,7 @@ def live(tmp_path, monkeypatch):
     prices = discount_prices(pool_erg=2_000)
     s._find_opportunities(prices)
     s._prices = prices
-    for _ in range(config.LIVE_CONFIRM_SCANS):
+    for _ in range(config.LIVE_CONFIRM_POLLS):
         s._update_live_streak()
     yield s
     s.tracker.close()
@@ -92,7 +92,7 @@ def test_not_in_monitor_mode(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("setup,reason", [
-    (lambda s, tp: s._live_streak.__setitem__(KEY, 1), "scans"),
+    (lambda s, tp: s._live_streak.__setitem__(KEY, 1), "polls"),
     (lambda s, tp: open(config.LIVE_STOP_FILE, "w").close(), "STOP"),
     (lambda s, tp: setattr(s, "_live_paused", "earlier failure"), "paused"),
 ])
@@ -197,7 +197,7 @@ def test_mint_path_executed_when_it_is_the_profitable_one(tmp_path, monkeypatch)
     prices = make_prices(state, spot)
     prices["spectrum_pool"] = pool
     s._find_opportunities(prices)
-    for _ in range(config.LIVE_CONFIRM_SCANS):
+    for _ in range(config.LIVE_CONFIRM_POLLS):
         s._update_live_streak()
     run(s._execute_trades(WALLET, prices))
     assert calls == ["mint"]

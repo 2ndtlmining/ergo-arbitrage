@@ -7,7 +7,8 @@ import aiohttp
 
 import config
 from arbitrage.sizing import Market, SizeChoice, best_size
-from ergo.chain import find_box_id, node_box, wait_for_box, wallet_context
+from ergo.chain import wait_for_box, wallet_context
+from ergo.chain_state import latest_box
 from ergo.chain_arb import (
     build_pool_sell_leg,
     build_redeem_leg,
@@ -20,6 +21,10 @@ from ergo.tx_guard import TxGuardError, verify_unsigned_tx
 
 UI_FEE_TREE = "0008cd02c5f61c83056a746a19a9e449e3c9596314cc417a2ef496b7567af558518f2bc7"  # SigmaUSD UI fee
 TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+
+class LegNotReady(RuntimeError):
+    """Leg 2 cannot be rebuilt yet (an oracle update is pending); retry without counting a rebuild."""
 
 
 @dataclass
@@ -66,7 +71,10 @@ async def watch_leg2(tx_id: str, get_status, rebuild, *, timeout: float, interva
             try:
                 tx_id = await rebuild()
                 log(f"  Leg 2 resubmitted: https://explorer.ergoplatform.com/en/transactions/{tx_id}")
-            except (RuntimeError, TimeoutError, TxGuardError, ValueError) as e:
+            except LegNotReady as e:
+                rebuilds -= 1
+                log(f"  Leg 2 rebuild waiting: {e}")
+            except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
                 log(f"  Leg 2 rebuild failed ({e}); retrying next round")
         if loop.time() >= deadline:
             return "timeout", tx_id
@@ -95,8 +103,27 @@ async def _leg2_status(ns, tx_id: str, leg1_box_id: str, explorer=None) -> str:
         return "dropped" if r.status == 200 else "pending"
 
 
+async def _fetch_latest(ns, nfts) -> list[tuple[dict, bool]]:
+    """(box, pending) per NFT from ergo/chain_state.py: pending pool/bank boxes included,
+    the oracle always confirmed with pending=True while an update is in the mempool."""
+    return list(await asyncio.gather(*(latest_box(ns, nft) for nft in nfts)))
+
+
 async def _fetch_boxes(ns, nfts) -> list[dict]:
-    return [await node_box(ns, await find_box_id(nft, ns)) for nft in nfts]
+    return [b for b, _ in await _fetch_latest(ns, nfts)]
+
+
+ORACLE_PENDING = "oracle update pending (a bank TX on the old oracle box would be dropped); retry after the next block"
+
+
+async def _leg2_boxes(ns, path: str) -> list[dict]:
+    """Fresh contract boxes for rebuilding leg 2: [bank, oracle] (redeem) or [pool] (mint)."""
+    if path == "mint":
+        return await _fetch_boxes(ns, (config.SPECTRUM_SIGUSD_POOL_NFT,))
+    (bank, _), (oracle, oracle_pending) = await _fetch_latest(ns, (config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
+    if oracle_pending:
+        raise LegNotReady(ORACLE_PENDING)
+    return [bank, oracle]
 
 
 async def _submit(ns, signed: dict) -> str:
@@ -153,8 +180,12 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
     _, planner, describe = PATHS[path]
     node = config.ERGO_NODE_URL
     try:
-        pool_box, bank_box, oracle_box = await _fetch_boxes(
+        (pool_box, _), (bank_box, _), (oracle_box, oracle_pending) = await _fetch_latest(
             ns, (config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
+        if oracle_pending:
+            if not force:
+                raise RuntimeError(ORACLE_PENDING)
+            log(f"  --force: ignoring {ORACLE_PENDING.split(' (')[0]}")
         wallet_boxes, height, our_tree = await wallet_context(ns)
         trees = await wallet_trees(ns, node)
         if erg_in is None:
@@ -233,11 +264,11 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
 
     async def build_and_submit_leg2() -> str:
         if path == "redeem":
-            bank, oracle = await _fetch_boxes(ns, (config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT))
+            bank, oracle = await _leg2_boxes(ns, path)
             tx2, info2, policy2 = build_redeem_leg(bank, oracle, leg1_out, cents, height, our_tree, UI_FEE_TREE)
             erg_back = info2["user_receives"]
         else:
-            (pool,) = await _fetch_boxes(ns, (config.SPECTRUM_SIGUSD_POOL_NFT,))
+            (pool,) = await _leg2_boxes(ns, path)
             tx2, info2, policy2 = build_pool_sell_leg(pool, leg1_out, cents, height, our_tree)
             erg_back = info2["amount_out"]
         signed2 = await guarded_sign(ns, node, tx2, policy2, execute=True)
@@ -255,8 +286,8 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
     try:
         await wait_for_box(ns, leg1_out["boxId"], timeout=60)
         result.tx2 = await build_and_submit_leg2()
-    except (RuntimeError, TimeoutError, TxGuardError, ValueError) as e:
-        return fail(str(e))
+    except (RuntimeError, TimeoutError, TxGuardError, ValueError, aiohttp.ClientError) as e:
+        return fail(str(e) or e.__class__.__name__)
     log(f"  Leg 2 submitted: https://explorer.ergoplatform.com/en/transactions/{result.tx2}")
 
     if not wait_leg2:

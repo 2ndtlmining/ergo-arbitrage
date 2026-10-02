@@ -4,6 +4,7 @@ Every action explains each step, verifies the transaction with the TX guard,
 and only signs/submits when asked (mode "check" signs and validates on the node
 without broadcasting; "execute" submits and then follows the TX until confirmed).
 """
+import asyncio
 from typing import Callable, Optional
 
 import aiohttp
@@ -11,8 +12,9 @@ import aiohttp
 import config
 from arbitrage.sizing import Market, best_size
 from ergo.amounts import erg_spendable, token_total
-from ergo.arb_runner import run_arb
-from ergo.chain import find_box_id, node_box, wallet_context
+from ergo.arb_runner import ORACLE_PENDING, run_arb
+from ergo.chain import wallet_context
+from ergo.chain_state import latest_box
 from ergo.chain_arb import redeem_policy
 from ergo.pool_swap import MINER_FEE, build_pool_swap_tx
 from ergo.progress import wait_confirmed
@@ -73,8 +75,16 @@ def balance_lines(confirmed: dict, unconfirmed: dict, oracle_usd_per_erg: Option
 
 # ---------- node I/O ----------
 
-async def _boxes(ns, *nfts) -> list[dict]:
-    return [await node_box(ns, await find_box_id(nft, ns)) for nft in nfts]
+async def _boxes(ns, *nfts, bank_tx: bool = False) -> list[dict]:
+    """Contract boxes through ergo/chain_state.py (pending pool/bank boxes included).
+
+    bank_tx: the boxes feed a bank transaction, so raise RuntimeError while an oracle
+    update is pending (a TX on the old oracle box would be dropped once it confirms).
+    """
+    found = await asyncio.gather(*(latest_box(ns, nft) for nft in nfts))
+    if bank_tx and any(p for nft, (_, p) in zip(nfts, found) if nft == config.SIGMAUSD_ORACLE_NFT):
+        raise RuntimeError(ORACLE_PENDING)
+    return [b for b, _ in found]
 
 
 async def _get(ns, path: str):
@@ -237,7 +247,7 @@ async def swap(ns, sell: str, amount, mode: str, log: Log):
 async def redeem(ns, sigusd, mode: str, log: Log):
     log("Step 1: reading the bank and oracle boxes and your wallet from your node...")
     try:
-        bank, oracle_box = await _boxes(ns, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT)
+        bank, oracle_box = await _boxes(ns, config.SIGMAUSD_BANK_NFT, config.SIGMAUSD_ORACLE_NFT, bank_tx=True)
     except RuntimeError as e:
         log(f"  ABORTED: {e}")
         return
