@@ -28,8 +28,20 @@ async def node_box(ns, box_id: str) -> dict:
         return await r.json()
 
 
-async def wallet_context(ns) -> tuple[list[dict], int, str]:
-    """(P2PK wallet boxes, current height, ErgoTree of the wallet's first address)."""
+async def _visible_on_node(ns, box_id: str) -> bool:
+    async with ns.get(f"{config.ERGO_NODE_URL}/utxo/withPool/byId/{box_id}", timeout=TIMEOUT) as r:
+        return r.status == 200
+
+
+async def wallet_context(ns, on_stale=None) -> tuple[list[dict], int, str]:
+    """(spendable P2PK wallet boxes, current height, ErgoTree of the wallet's first address).
+
+    The node wallet can keep listing outputs of unconfirmed transactions that became
+    invalid (e.g. a leg 2 whose oracle box was replaced). Only boxes the node can
+    actually spend from (UTXO set or a valid pending TX, via /utxo/withPool) are
+    returned; the rest are passed to `on_stale` if given.
+    """
+    import asyncio
     node = config.ERGO_NODE_URL
     async with ns.get(f"{node}/wallet/boxes/unspent?minConfirmations=0&minInclusionHeight=0", timeout=TIMEOUT) as r:
         boxes = [wb["box"] for wb in await r.json()]
@@ -40,7 +52,12 @@ async def wallet_context(ns) -> tuple[list[dict], int, str]:
     async with ns.get(f"{node}/utils/addressToRaw/{first_address}", timeout=TIMEOUT) as r:
         our_tree = "0008cd" + (await r.json())["raw"]
     trees = await wallet_trees(ns, node)
-    return [b for b in boxes if b.get("ergoTree") in trees], height, our_tree
+    mine = [b for b in boxes if b.get("ergoTree") in trees]
+    visible = await asyncio.gather(*(_visible_on_node(ns, b["boxId"]) for b in mine))
+    stale = [b for b, ok in zip(mine, visible) if not ok]
+    if stale and on_stale:
+        on_stale(stale)
+    return [b for b, ok in zip(mine, visible) if ok], height, our_tree
 
 
 async def wait_for_box(ns, box_id: str, timeout: float = 60, interval: float = 1.0) -> dict:
