@@ -281,3 +281,48 @@ class TestExplanations:
         with console.capture() as cap:
             scanner._display_opportunities(opps, prices)
         assert "WHY Bank mint->Spectrum sell" in cap.get()
+
+
+class TestCexPaths:
+    """Issues #2/#3 in the scanner: bid/ask from the order books, every CEX path watch-only."""
+
+    @staticmethod
+    def book(bid, ask):
+        from exchanges.base import OrderBook, OrderBookLevel
+        return OrderBook("x", "ERG/USDT", [OrderBookLevel(bid, 10_000)], [OrderBookLevel(ask, 10_000)])
+
+    def prices(self, state, kucoin_mid=0.30, nonkyc_mid=0.31):
+        p = make_prices(state, 0.31)
+        p.update({"kucoin_erg_usdt": kucoin_mid, "nonkyc_erg_usdt": nonkyc_mid,
+                  "kucoin_orderbook": self.book(kucoin_mid - 0.01, kucoin_mid + 0.01),
+                  "nonkyc_orderbook": self.book(nonkyc_mid - 0.01, nonkyc_mid + 0.01)})
+        return p
+
+    @pytest.fixture
+    def cex_scanner(self, tmp_path):
+        s = ArbitrageScanner(db_path=str(tmp_path / "c.db"), enable_cex=True)
+        yield s
+        s.tracker.close()
+
+    def test_every_cex_path_is_watch_only(self, cex_scanner):
+        from arbitrage.calculator import WATCH_ONLY_REASON
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        opps = cex_scanner._find_opportunities(self.prices(state))
+        cex = [o for o in opps if any(n in o.path for n in ("<>Spectrum", "<>Bank"))]
+        assert len(cex) == 4 * len(cex_scanner._trade_sizes)
+        assert all(o.blocked and WATCH_ONLY_REASON in o.blocked_reason for o in cex)
+        assert not any("SigUSD=USDT" in o.assumption for o in opps)
+
+    def test_cex_legs_use_the_order_book_sides(self, cex_scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        opps = cex_scanner._find_opportunities(self.prices(state, kucoin_mid=0.30, nonkyc_mid=0.30))
+        cex_cex = [o for o in opps if o.path.startswith(("Kucoin->NonKYC", "NonKYC->Kucoin")) and o.input_erg == 10]
+        (o,) = cex_cex
+        assert (o.source_price, o.target_price) == (pytest.approx(0.29), pytest.approx(0.31))  # sell bid, buy ask
+
+    def test_bank_to_cex_profits_only_when_the_bank_pays_more(self, cex_scanner):
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
+        cheap_cex = cex_scanner._find_opportunities(self.prices(state, kucoin_mid=0.25))   # oracle $0.3226
+        dear_cex = cex_scanner._find_opportunities(self.prices(state, kucoin_mid=0.40))
+        pick = lambda opps: next(o for o in opps if o.path.startswith("Kucoin<>Bank") and o.input_erg == 10)
+        assert pick(cheap_cex).profit_erg > 0 and pick(dear_cex).profit_erg < 0

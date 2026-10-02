@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 import config
+from exchanges.sigmausd import BankState, affordable_mint_cents, can_mint_sigusd
 
 logger = logging.getLogger("ergo_arb.calculator")
 
@@ -79,6 +80,19 @@ EXECUTION_TIMES = {
 
 # Price risk per minute (estimated % price can move)
 PRICE_RISK_PER_MINUTE = 0.02  # 0.02% per minute (~1.2% per hour)
+
+# Paths that end (or start) in SigUSD on one side and USDT on the other cannot be executed: there is
+# no SigUSD<->USDT venue in this codebase. Their figures are shown for comparison only.
+WATCH_ONLY_REASON = "watch-only: no SigUSD<->USDT venue"
+
+
+def sigusd_redeem_value_usd() -> float:
+    """USD one SigUSD is worth when redeemed at the bank (the exit the bot can actually execute)."""
+    return (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
+
+
+def _sigusd_assumption(sigusd_usd: float) -> str:
+    return f"SigUSD valued at its bank redeem value (${sigusd_usd:.3f})"
 
 
 class ArbitrageCalculator:
@@ -249,50 +263,57 @@ class ArbitrageCalculator:
     def calc_cex_vs_dex(
         self,
         input_erg: float,
-        cex_erg_usdt_price: float,  # ERG/USDT on CEX
-        dex_erg_sigusd_price: float,  # ERG/SigUSD on DEX (assuming SigUSD ≈ USDT)
+        cex_buy_price: float,           # USDT per ERG you pay on the CEX (ask side, for this size)
+        cex_sell_price: float,          # USDT per ERG you get on the CEX (bid side, for this size)
+        dex_erg_sigusd_price: float,    # SigUSD per ERG on the pool (spot)
         direction: str = "buy_cex_sell_dex",  # or "buy_dex_sell_cex"
         cex_trading_fee: float = config.NONKYC_TRADING_FEE,
         erg_withdraw_fee: float = config.NONKYC_ERG_WITHDRAW_FEE,
-        dex_execution_fee: float = config.SPECTRUM_EXECUTION_FEE,
-        slippage: float = 0.0,
+        dex_execution_fee: Optional[float] = None,   # None: the configured pool route's service fee
+        slippage: float = 0.0,          # extra fraction of the DEX leg, when no pool reserves are known
+        pool=None,                      # PoolState (x = ERG, y = SigUSD): exact AMM output when given
+        sigusd_usd: Optional[float] = None,          # USD per SigUSD; default: its bank redeem value
     ) -> ArbitrageOpportunity:
+        """CEX ERG/USDT against the ERG/SigUSD pool, as two legs in real units.
+
+        buy_cex_sell_dex: USDT -> ERG on the CEX (ask, taker fee) -> withdraw (fee once) -> ERG -> SigUSD
+        on the pool. buy_dex_sell_cex: SigUSD -> ERG on the pool -> deposit -> ERG -> USDT on the CEX
+        (bid, taker fee). The SigUSD side is valued at `sigusd_usd`; profit is the USD difference,
+        expressed in ERG at the CEX price. Watch-only: nothing converts SigUSD and USDT.
         """
-        Compare CEX ERG/USDT vs DEX ERG/SigUSD prices.
-        Assumes SigUSD ≈ 1 USDT for comparison purposes.
-        """
-        fees = FeeBreakdown()
+        exec_fee = config.pool_service_fee() if dex_execution_fee is None else dex_execution_fee
+        sigusd_usd = sigusd_redeem_value_usd() if sigusd_usd is None else sigusd_usd
+        fees = FeeBreakdown(execution_fee_erg=exec_fee)
 
         if direction == "buy_cex_sell_dex":
-            # Buy cheap ERG on CEX, sell expensive on DEX
-            # This means CEX price < DEX price
-            usdt_spent = input_erg * cex_erg_usdt_price
-            fees.trading_fee = usdt_spent * cex_trading_fee
+            usd_in = input_erg * cex_buy_price
+            fees.trading_fee = usd_in * cex_trading_fee
+            erg_bought = input_erg * (1 - cex_trading_fee)
             fees.withdraw_fee_erg = erg_withdraw_fee
-
-            erg_on_node = input_erg - erg_withdraw_fee  # after CEX withdrawal
-            # Swap ERG -> SigUSD on DEX
-            sigusd_received = erg_on_node * dex_erg_sigusd_price * (1 - config.SPECTRUM_POOL_FEE)
-            fees.execution_fee_erg = dex_execution_fee
             fees.network_fee_erg = config.ERGO_TX_FEE
-            fees.slippage_cost = erg_on_node * slippage
-
-            # We end up with SigUSD, need to convert back to ERG value for comparison
-            erg_equivalent = sigusd_received / cex_erg_usdt_price  # value in ERG at CEX rate
-            output_erg = erg_equivalent
-            path = f"Buy ERG (NonKYC ${cex_erg_usdt_price:.4f}) -> SigUSD (DEX ${dex_erg_sigusd_price:.4f})"
+            erg_in = erg_bought - erg_withdraw_fee - exec_fee - config.ERGO_TX_FEE
+            fees.slippage_cost = 0.0 if pool else erg_in * slippage
+            erg_in -= fees.slippage_cost
+            sigusd_out = (pool.swap_output(erg_in, True) if pool
+                          else erg_in * dex_erg_sigusd_price * (1 - config.SPECTRUM_POOL_FEE))
+            usd_out = max(sigusd_out, 0.0) * sigusd_usd
+            ref_price = cex_buy_price
+            path = f"Buy ERG (CEX ask ${cex_buy_price:.4f}) -> SigUSD (DEX {dex_erg_sigusd_price:.4f})"
         else:
-            # Buy ERG cheap on DEX (swap SigUSD->ERG), sell expensive on CEX
-            # This path requires having SigUSD already or buying it first
-            path = f"Buy ERG (DEX ${dex_erg_sigusd_price:.4f}) -> Sell (NonKYC ${cex_erg_usdt_price:.4f})"
-            # For now, just compare the price differential
-            price_diff = cex_erg_usdt_price - dex_erg_sigusd_price
-            output_erg = input_erg * (1 + price_diff / dex_erg_sigusd_price)
-            fees.trading_fee = input_erg * cex_erg_usdt_price * cex_trading_fee
-            fees.execution_fee_erg = dex_execution_fee
-            fees.network_fee_erg = config.ERGO_TX_FEE
+            sigusd_in = input_erg * dex_erg_sigusd_price
+            usd_in = sigusd_in * sigusd_usd
+            erg = (pool.swap_output(sigusd_in, False) if pool
+                   else sigusd_in / dex_erg_sigusd_price * (1 - config.SPECTRUM_POOL_FEE))
+            fees.network_fee_erg = 2 * config.ERGO_TX_FEE           # the swap, then the deposit
+            fees.slippage_cost = 0.0 if pool else erg * slippage
+            erg -= exec_fee + fees.network_fee_erg + fees.slippage_cost
+            usd_out = max(erg, 0.0) * cex_sell_price * (1 - cex_trading_fee)
+            fees.trading_fee = max(erg, 0.0) * cex_sell_price * cex_trading_fee
+            ref_price = cex_sell_price
+            path = f"Buy ERG (DEX {dex_erg_sigusd_price:.4f}) -> Sell (CEX bid ${cex_sell_price:.4f})"
 
-        profit_erg = output_erg - input_erg - fees.total_fee_erg
+        profit_usd = usd_out - usd_in
+        profit_erg = profit_usd / ref_price if ref_price else 0.0
         profit_percent = (profit_erg / input_erg) * 100 if input_erg > 0 else 0
 
         exec_time = EXECUTION_TIMES["cex_to_dex"]
@@ -301,17 +322,71 @@ class ArbitrageCalculator:
         return ArbitrageOpportunity(
             path=path,
             input_erg=input_erg,
+            output_erg=input_erg + profit_erg,
+            profit_erg=profit_erg,
+            profit_percent=profit_percent,
+            fees=fees,
+            source_price=cex_buy_price if direction == "buy_cex_sell_dex" else dex_erg_sigusd_price,
+            target_price=dex_erg_sigusd_price if direction == "buy_cex_sell_dex" else cex_sell_price,
+            source_exchange="CEX" if direction == "buy_cex_sell_dex" else "Spectrum DEX",
+            target_exchange="Spectrum DEX" if direction == "buy_cex_sell_dex" else "CEX",
+            is_profitable=profit_percent > config.MIN_PROFIT_PERCENT,
+            blocked=True,
+            blocked_reason=WATCH_ONLY_REASON,
+            assumption=_sigusd_assumption(sigusd_usd),
+            requires_transfer=True,
+            estimated_execution_minutes=exec_time,
+            price_risk_percent=price_risk,
+            profit_usd=profit_usd,
+        )
+
+    def calc_bank_to_cex(
+        self,
+        input_erg: float,
+        bank_state: BankState,
+        cex_buy_price: float,           # USDT per ERG you pay on the CEX (ask side, for this size)
+        cex_trading_fee: float,
+        erg_withdraw_fee: float,
+        sigusd_usd: Optional[float] = None,          # USD per SigUSD when sold; default: bank redeem value
+        execution_minutes: float = 60,
+    ) -> ArbitrageOpportunity:
+        """Mint SigUSD at the bank -> (sell SigUSD for USDT: no venue) -> buy ERG on the CEX -> withdraw.
+
+        The mint is contract-exact (fees included). ERG out per ERG in is the bank's USD per ERG over the
+        CEX ask, so it pays only when the bank values ERG above the CEX price. Watch-only.
+        """
+        sigusd_usd = sigusd_redeem_value_usd() if sigusd_usd is None else sigusd_usd
+        budget = int(max(input_erg - config.ERGO_TX_FEE, 0) * 1e9)
+        cents = affordable_mint_cents(bank_state, budget)
+        usd = cents / 100 * sigusd_usd
+        erg_bought = usd / cex_buy_price * (1 - cex_trading_fee) if cex_buy_price else 0.0
+        output_erg = erg_bought - erg_withdraw_fee
+        profit_erg = output_erg - input_erg
+        profit_percent = (profit_erg / input_erg) * 100 if input_erg > 0 else 0
+        reasons = [WATCH_ONLY_REASON]
+        if not can_mint_sigusd(bank_state, max(cents, 1)):
+            reasons.append(f"Bank mint blocked (RR={bank_state.reserve_ratio:.0f}%, post-mint RR must stay >=400%)")
+        fees = FeeBreakdown(trading_fee=usd * cex_trading_fee, withdraw_fee_erg=erg_withdraw_fee,
+                            network_fee_erg=config.ERGO_TX_FEE,
+                            protocol_fee=input_erg * bank_state.oracle_usd_per_erg - cents / 100)
+        return ArbitrageOpportunity(
+            path="Bank mint -> CEX buy",
+            input_erg=input_erg,
             output_erg=output_erg,
             profit_erg=profit_erg,
             profit_percent=profit_percent,
             fees=fees,
-            source_price=cex_erg_usdt_price if direction == "buy_cex_sell_dex" else dex_erg_sigusd_price,
-            target_price=dex_erg_sigusd_price if direction == "buy_cex_sell_dex" else cex_erg_usdt_price,
-            source_exchange="CEX" if direction == "buy_cex_sell_dex" else "Spectrum DEX",
-            target_exchange="Spectrum DEX" if direction == "buy_cex_sell_dex" else "CEX",
+            source_price=bank_state.oracle_usd_per_erg,
+            target_price=cex_buy_price,
+            source_exchange="SigmaUSD Bank",
+            target_exchange="CEX",
             is_profitable=profit_percent > config.MIN_PROFIT_PERCENT,
+            blocked=True,
+            blocked_reason="; ".join(reasons),
+            assumption=_sigusd_assumption(sigusd_usd),
             requires_transfer=True,
-            estimated_execution_minutes=exec_time,
-            price_risk_percent=price_risk,
-            profit_usd=profit_erg * cex_erg_usdt_price,
+            estimated_execution_minutes=execution_minutes,
+            price_risk_percent=execution_minutes * PRICE_RISK_PER_MINUTE,
+            profit_usd=profit_erg * cex_buy_price,
+            details={"sigusd_cents": cents},
         )
