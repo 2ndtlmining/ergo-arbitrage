@@ -221,7 +221,7 @@ async def swap(ns, sell: str, amount, mode: str, log: Log):
         return
     wallet_boxes, height, our_tree = await wallet_context(ns)
     if amount == "all":
-        amount_in = erg_spendable(wallet_boxes, MINER_FEE) if sell_erg else token_total(wallet_boxes, SIGUSD)
+        amount_in = erg_spendable(wallet_boxes, MINER_FEE, keep_box=True) if sell_erg else token_total(wallet_boxes, SIGUSD)
         log(f"  'all' = {amount_in / (1e9 if sell_erg else 100):,.4f} {'ERG' if sell_erg else 'SigUSD'}")
     else:
         amount_in = int(round(amount * (1e9 if sell_erg else 100)))

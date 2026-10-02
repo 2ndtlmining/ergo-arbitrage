@@ -363,7 +363,8 @@ async def main():
     print("--- Step 4: Signing Transaction ---")
     async with aiohttp.ClientSession(headers=node_headers) as ns:
         try:
-            policy = SignPolicy(max_erg_spent=SWAP_NANO + int(mint_status.get('fee_amount', 0)) + FEE_BUDGET, min_received={USE_TOKEN: int(quote_dexy_mint(SWAP_NANO - int(mint_status.get('fee_amount', 0)), mint_status['box_state']) * (1 - config.SLIPPAGE_TOLERANCE))})
+            policy = SignPolicy(max_erg_spent=SWAP_NANO + int(mint_status.get('fee_amount', 0)) + FEE_BUDGET, min_received={USE_TOKEN: int(quote_dexy_mint(SWAP_NANO - int(mint_status.get('fee_amount', 0)), mint_status['box_state']) * (1 - config.SLIPPAGE_TOLERANCE))},
+                                contract_nfts=None)  # Crux's Dexy mint boxes: NFTs this bot does not track
             signed_tx = await sign_transaction(ns, unsigned_tx, policy)
         except DryRun as e:
             print(f"  {e}")

@@ -26,5 +26,5 @@ def decode_int_register(hex_value: str) -> int:
         zz |= (b & 0x7F) << shift
         shift += 7
         if not b & 0x80:
-            break
-    return (zz >> 1) ^ -(zz & 1)
+            return (zz >> 1) ^ -(zz & 1)
+    raise ValueError(f"truncated SInt/SLong constant: {hex_value[:16]}")

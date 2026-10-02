@@ -26,6 +26,8 @@ def build_redeem_tx(bank_box: dict, oracle_box: dict, wallet_boxes: list[dict], 
     Wallet boxes are selected until they cover `cents` SigUSD and the miner fee +
     receipt box; leftover SigUSD and any other tokens go back in the payout box.
     """
+    if cents <= 0:
+        raise ValueError("cents must be positive")
     sigusd_circ = register_int(bank_box, "R4")
     sigrsv_circ = register_int(bank_box, "R5")
     oracle_r4 = register_int(oracle_box, "R4")
