@@ -148,8 +148,10 @@ def test_leg2_failure_pauses_and_alerts(live, monkeypatch):
         return True
 
     monkeypatch.setattr(live.discord, "_send", fake_send)
+    live.discord.enabled = True
     live._next_result = ArbResult("leg2_failed", "oracle moved", erg_in=10**10, sigusd_cents=310, tx1="t1")
     run(live._execute_trades(WALLET, live._prices))
+    run(live.discord.stop())  # the alert is queued; deliver it
     assert live._live_paused
     assert sent and "arb.py redeem --sigusd 3.10" in sent[-1]
     row = live.tracker.conn.execute("SELECT status FROM trades").fetchone()

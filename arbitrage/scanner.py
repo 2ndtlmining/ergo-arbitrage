@@ -44,6 +44,10 @@ from arbitrage.calculator import (
 )
 from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
+from notifications import embeds
+from notifications.digest import build_digest, digest_due, mark_digest_sent
+from notifications.episodes import EpisodeTracker
+from notifications.health import HealthMonitor
 from logging_config import console
 
 logger = logging.getLogger("ergo_arb.scanner")
@@ -68,6 +72,12 @@ class ArbitrageScanner:
         self.show_wallet = show_wallet
         self.out = console if view == "plain" else Console(quiet=True)  # all scan printing goes here
         self.state = DashboardState(mode)
+        self.episodes = EpisodeTracker(config.DISCORD_CONFIRM_SECONDS, config.DISCORD_CLOSE_SECONDS,
+                                       config.DISCORD_EDIT_SECONDS, config.DISCORD_MIN_PROFIT_PERCENT,
+                                       config.DISCORD_MIN_PROFIT_ERG)
+        self.health = HealthMonitor(config.DISCORD_HEALTH_CHAIN_SECONDS, config.DISCORD_HEALTH_VENUE_SECONDS,
+                                    config.DISCORD_HEALTH_ORACLE_SECONDS, config.DISCORD_HEALTH_REPEAT_SECONDS,
+                                    started_at=time.time())
         self._last_wallet: Optional[dict] = None
         self._last_prices: dict = {}
         self._now = 0.0
@@ -1055,6 +1065,42 @@ class ArbitrageScanner:
             if key not in profitable_keys:
                 self._opportunity_streak[key] = 0
 
+    def _episode_embed(self, ep, status: str) -> dict:
+        s = self.state
+        bank = (s.prices or {}).get("bank") or {}
+        age = time.time() - self._price_timestamps["spectrum"] if self._price_timestamps.get("spectrum") else None
+        return embeds.episode_embed(ep, status, height=s.height, data_age_s=age,
+                                    oracle_usd=bank.get("oracle_erg_usd"))
+
+    def _handle_episode(self, event):
+        ep = event.episode
+        if event.kind == "open":
+            ep.db_id = self.tracker.open_chain_episode(ep)
+            tier1 = ep.profit_percent >= config.DISCORD_TIER1_PROFIT_PERCENT
+            self.discord.post(self._episode_embed(ep, "open"), content=self.discord._ping() if tier1 else "",
+                              on_id=lambda mid, ep=ep: setattr(ep, "message_id", mid))
+            self.state.add_event("info", f"Discord: opened {ep.label} {ep.profit_percent:+.2f}%")
+        elif event.kind == "update":
+            self.tracker.update_chain_episode(ep.db_id, ep)
+            self.discord.edit(lambda ep=ep: ep.message_id, self._episode_embed(ep, "open"))
+        else:
+            self.tracker.close_chain_episode(ep.db_id, ep)
+            self.discord.edit(lambda ep=ep: ep.message_id, self._episode_embed(ep, "closed"))
+            self.state.add_event("info", f"Discord: closed {ep.label} (peak {ep.peak_percent:+.2f}%)")
+
+    def _discord_tick(self, now: float):
+        """Episodes and health alerts from the freshly refreshed state. Never awaits Discord."""
+        if not self.discord_enabled:
+            return
+        try:
+            for event in self.episodes.update(now, self.state.paths):
+                self._handle_episode(event)
+            for h in self.health.update(time.time(), self.state):
+                self.discord.post(embeds.health_embed(h), content=self.discord._ping() if h.ping else "")
+                self.state.add_event("warn" if h.kind == "alert" else "info", f"Discord: {h.text}")
+        except Exception as e:
+            logger.error(f"Discord tick error: {e}", exc_info=True)
+
     async def _notify_discord(self, opportunities: list[ArbitrageOpportunity]):
         """Send Discord notifications for confirmed, non-stale opportunities."""
         if not self.discord_enabled:
@@ -1067,6 +1113,8 @@ class ArbitrageScanner:
         for opp in opportunities:
             if not opp.is_profitable or opp.blocked:
                 continue
+            if opp.path_key in LIVE_PATHS:
+                continue  # on-chain paths: one edited message per episode (_discord_tick)
             path_key = opp.path_key
             streak = self._opportunity_streak.get(path_key, 0)
             if streak < config.DISCORD_CONFIRM_SCANS:
@@ -1257,6 +1305,8 @@ class ArbitrageScanner:
                 self._live_paused = f"TX guard refused ({result.message})"
             self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes=f"{path}; nothing spent")
             msg = f"did not execute {key} ({result.status}): {result.message or 'see console'}. Nothing was spent."
+        self.episodes.note_trade(key, f"{result.status}: {profit:+.4f} ERG" if result.status == "executed"
+                                 else f"{result.status}: {result.message or ''}")
         logger.warning(f"LIVE {msg}")
         self.state.add_event("good" if result.status == "executed" else "warn", f"LIVE {msg}")
         if self.discord_enabled:
@@ -1783,6 +1833,13 @@ class ArbitrageScanner:
                 await self.discord.send_scan_summary(opportunities, scan_number=self.scan_count)
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
+        try:
+            if self.discord_enabled and digest_due(self.tracker, datetime.now(), config.DISCORD_DIGEST_HOUR):
+                self.discord.post(embeds.digest_embed(build_digest(self.tracker, self.health, self._last_wallet,
+                                                                   datetime.now())))
+                mark_digest_sent(self.tracker, datetime.now())
+        except Exception as e:  # the digest must never block a scan or a trade
+            logger.error(f"Daily digest error: {e}", exc_info=True)
 
         await self._execute_trades(wallet, prices)
 
@@ -1816,6 +1873,7 @@ class ArbitrageScanner:
             await self._poll(now)
         finally:
             self._refresh_state(now)
+            self._discord_tick(now)
         if full and self.view == "json":
             sys.stdout.write(json.dumps(self.state.to_json(), default=str) + "\n")
             sys.stdout.flush()
@@ -1983,6 +2041,9 @@ class ArbitrageScanner:
             self._restore_signal_handlers(restore)
             if self.view == "plain":
                 self.tracker.print_summary()
+            if self.discord_enabled:
+                for event in self.episodes.close_all(self._now, "bot stopped"):
+                    self._handle_episode(event)
             if self.discord_enabled:
                 await self.discord.send_summary_message(self.tracker.get_session_stats())
             await self.disconnect_all()

@@ -11,7 +11,7 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.tracker")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ProfitTracker:
@@ -28,6 +28,8 @@ class ProfitTracker:
         self._open_episodes: dict[str, int] = {}  # path_key -> episode id
         self._session_episode_best: dict[int, float] = {}  # episode id -> best profit
         self._close_stale_episodes()
+        self.conn.execute("UPDATE chain_episodes SET closed_at = opened_at WHERE closed_at IS NULL")
+        self.conn.commit()
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -151,6 +153,22 @@ class ProfitTracker:
                 CREATE INDEX IF NOT EXISTS ix_scan_results_path ON scan_results(path);
                 CREATE INDEX IF NOT EXISTS ix_opportunities_ts ON opportunities(timestamp);
                 CREATE INDEX IF NOT EXISTS ix_episodes_path ON opportunity_episodes(path, first_seen);
+            """)
+        if version < 2:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS chain_episodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    peak_profit_erg REAL NOT NULL,
+                    peak_profit_percent REAL NOT NULL,
+                    peak_size_erg REAL NOT NULL,
+                    last_profit_percent REAL,
+                    trade TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_chain_episodes_opened ON chain_episodes(opened_at);
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """)
         if version < SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -627,6 +645,46 @@ class ProfitTracker:
             fee_table.add_row("Total Fees (ERG)", f"{fee_analysis.get('avg_total_fee_erg', 0):.4f}")
 
             console.print(fee_table)
+
+    def open_chain_episode(self, ep) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO chain_episodes (path, opened_at, peak_profit_erg, peak_profit_percent, peak_size_erg,
+               last_profit_percent) VALUES (?, ?, ?, ?, ?, ?)""",
+            (ep.label, datetime.now().isoformat(), ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_chain_episode(self, episode_id: int, ep):
+        self.conn.execute(
+            """UPDATE chain_episodes SET peak_profit_erg = ?, peak_profit_percent = ?, peak_size_erg = ?,
+               last_profit_percent = ? WHERE id = ?""",
+            (ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent, episode_id))
+        self.conn.commit()
+
+    def close_chain_episode(self, episode_id: int, ep):
+        self.update_chain_episode(episode_id, ep)
+        self.conn.execute("UPDATE chain_episodes SET closed_at = ?, trade = ? WHERE id = ?",
+                          (datetime.now().isoformat(), ep.trade, episode_id))
+        self.conn.commit()
+
+    def chain_episodes_since(self, since_iso: str) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM chain_episodes WHERE opened_at >= ? ORDER BY opened_at",
+                                 (since_iso,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def trades_since(self, since_iso: str) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM trades WHERE started_at >= ? ORDER BY started_at",
+                                 (since_iso,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_meta(self, key: str):
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str):
+        self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                          "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
