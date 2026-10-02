@@ -54,7 +54,7 @@ def offline(monkeypatch):
     async def trees(ns, node):
         return {OUR_TREE}
 
-    async def sign(ns, node, tx, policy, *, execute):
+    async def sign(ns, node, tx, policy, *, execute, log=print):
         raise DryRun()
 
     monkeypatch.setattr(runner, "latest_box", latest)

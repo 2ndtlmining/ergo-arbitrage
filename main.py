@@ -2,73 +2,97 @@ import argparse
 import asyncio
 import sys
 
+from rich.live import Live
+
 import config
-from logging_config import setup_logging, console
+from arbitrage.dashboard_view import render_safe
 from arbitrage.scanner import ArbitrageScanner
+from logging_config import EventLogHandler, console, setup_logging
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Ergo Arbitrage Monitor")
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--notify", action="store_true",
-        help="Notification mode: monitor + send Discord alerts (no trade execution)"
-    )
-    mode_group.add_argument(
-        "--live", action="store_true",
-        help="Live mode: monitor + Discord alerts + auto-execute profitable trades"
-    )
-    args = parser.parse_args()
+def positive(kind):
+    def parse(text):
+        value = kind(text)
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"must be greater than 0, got {text}")
+        return value
+    return parse
 
-    if args.live:
-        mode = "live"
-    elif args.notify:
-        mode = "notify"
-    else:
-        mode = "monitor"
 
-    logger = setup_logging("INFO")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Ergo Arbitrage Monitor (live dashboard by default)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--notify", action="store_true", help="monitor + Discord alerts (no trades)")
+    mode.add_argument("--live", action="store_true", help="monitor + Discord alerts + auto-execute trades")
+    view = p.add_mutually_exclusive_group()
+    view.add_argument("--plain", action="store_true", help="scrolling output instead of the dashboard")
+    view.add_argument("--json", action="store_true", help="one JSON line per full scan on stdout")
+    p.add_argument("--once", action="store_true", help="one full scan, then exit")
+    p.add_argument("--interval", type=positive(int), help="seconds between full scans (SCAN_INTERVAL_SECONDS)")
+    p.add_argument("--max-trade-erg", type=positive(float), help="cap on any executed trade (MAX_TRADE_SIZE_ERG)")
+    p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
+                   help="log file level (arbitrage.log, rotated daily, 14 days kept)")
+    p.add_argument("--db", default="arbitrage_tracker.db", help="tracker database path")
+    p.add_argument("--no-wallet", action="store_true", help="hide the wallet panel and wallet analysis")
+    return p
 
-    console.print("[bold magenta]" + "=" * 60 + "[/bold magenta]")
-    console.print("[bold magenta]       ERGO ARBITRAGE MONITOR[/bold magenta]")
-    console.print("[bold magenta]       Goal: Accumulate more ERG[/bold magenta]")
-    console.print("[bold magenta]" + "=" * 60 + "[/bold magenta]")
-    console.print()
 
-    mode_labels = {
-        "monitor": ("[dim]MONITOR ONLY[/dim]", "Console output only, no notifications or trades"),
-        "notify": ("[bold green]NOTIFICATION MODE[/bold green]", "Console + Discord alerts, no trades"),
-        "live": ("[bold red]LIVE TRADING MODE[/bold red]", "Console + Discord + auto-execute trades"),
-    }
-    label, desc = mode_labels[mode]
-    console.print(f"  Mode: {label}")
-    console.print(f"  {desc}")
-    console.print()
+def view_of(args) -> str:
+    return "plain" if args.plain else ("json" if args.json else "dashboard")
 
-    if mode in ("notify", "live"):
-        if config.DISCORD_ENABLED:
-            console.print("[bold green]  Discord: ENABLED[/bold green]")
-            console.print(f"    Min profit to notify: {config.DISCORD_MIN_PROFIT_PERCENT}%")
-            console.print(f"    Cooldown per path: {config.DISCORD_COOLDOWN_SECONDS}s")
-            if config.DISCORD_USER_ID:
-                console.print(f"    User ping: <@{config.DISCORD_USER_ID}>")
-            else:
-                console.print("    User ping: not configured (set DISCORD_USER_ID in .env)")
-        else:
-            console.print("[bold yellow]  Discord: NOT CONFIGURED[/bold yellow]")
-            console.print("    Set DISCORD_WEBHOOK_URL in .env to enable notifications")
-    console.print()
 
+def mode_of(args) -> str:
+    return "live" if args.live else ("notify" if args.notify else "monitor")
+
+
+def apply_overrides(args):
+    if args.interval is not None:
+        config.SCAN_INTERVAL_SECONDS = args.interval
+    if args.max_trade_erg is not None:
+        config.MAX_TRADE_SIZE_ERG = args.max_trade_erg
+
+
+def print_banner(mode: str):
+    labels = {"monitor": "[dim]MONITOR ONLY[/dim]", "notify": "[bold green]NOTIFICATION MODE[/bold green]",
+              "live": "[bold red]LIVE TRADING MODE[/bold red]"}
+    console.print("[bold magenta]ERGO ARBITRAGE MONITOR[/bold magenta]  " + labels[mode])
     if mode == "live":
-        console.print("[bold red]  WARNING: Live trading will execute real transactions![/bold red]")
-        console.print()
+        console.print("[bold red]WARNING: live trading executes real transactions.[/bold red]")
 
-    scanner = ArbitrageScanner(mode=mode)
 
+async def run(scanner: ArbitrageScanner, view: str, once: bool):
+    if view != "dashboard":
+        await scanner.run(once=once)
+        return
+    with Live(get_renderable=lambda: render_safe(scanner.state), console=console, refresh_per_second=2,
+              screen=not once, redirect_stdout=False, redirect_stderr=False):
+        await scanner.run(once=once)
+
+
+def ensure_utf8(stream=None):
+    """Piped output on Windows defaults to cp1252, which cannot encode the dashboard's symbols."""
+    stream = stream or sys.stdout
+    if hasattr(stream, "reconfigure") and (stream.encoding or "").lower().replace("-", "") != "utf8":
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    ensure_utf8(sys.stdout)
+    ensure_utf8(sys.stderr)
+    apply_overrides(args)
+    view, mode = view_of(args), mode_of(args)
+    logger = setup_logging(args.log_level, console_handler=view == "plain")
+    if view == "plain":
+        print_banner(mode)
+    scanner = ArbitrageScanner(mode=mode, db_path=args.db, view=view, show_wallet=not args.no_wallet)
+    if view == "dashboard":
+        logger.addHandler(EventLogHandler(scanner.state))
     try:
-        asyncio.run(scanner.run())
+        asyncio.run(run(scanner, view, args.once))
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted. Goodbye![/bold yellow]")
+        if view != "json":
+            console.print("[bold yellow]Interrupted. Goodbye![/bold yellow]")
         sys.exit(0)
 
 

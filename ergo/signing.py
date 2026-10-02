@@ -37,7 +37,8 @@ async def wallet_trees(ns, node_url: str) -> set[str]:
     return trees
 
 
-async def guarded_sign(ns, node_url: str, unsigned_tx: dict, policy: SignPolicy, *, execute: bool) -> dict:
+async def guarded_sign(ns, node_url: str, unsigned_tx: dict, policy: SignPolicy, *, execute: bool,
+                       log=print) -> dict:
     """Verify `unsigned_tx` against `policy` using input boxes from our node, then sign it.
 
     Raises TxGuardError (and never calls the sign endpoint) if verification fails,
@@ -69,7 +70,7 @@ async def guarded_sign(ns, node_url: str, unsigned_tx: dict, policy: SignPolicy,
         f"wallet spends {report.erg_spent / 1e9:.6f} ERG, receives "
         f"{ {k[:8]: v for k, v in report.received.items()} }, service fee {report.service_fee / 1e9:.4f} ERG"
     )
-    print(f"  TX guard OK: {summary}")
+    log(f"  TX guard OK: {summary}")
     if not execute:
         raise DryRun("TX verified but not signed (dry run). Re-run with --execute to sign and submit.")
 

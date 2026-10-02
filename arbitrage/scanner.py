@@ -1,13 +1,17 @@
 import asyncio
+import json
+import re
 import logging
 import os
 import signal
+import sys
 import time
 from datetime import datetime
 from typing import Optional
 
 import aiohttp
 
+from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
@@ -29,6 +33,8 @@ from ergo.arb_runner import ArbResult, run_arb
 from ergo.chain_state import ChainSnapshot, prices_from_snapshot, read_snapshot
 from arbitrage.optimizer import maximize
 from arbitrage.sizing import Market, SizeChoice, best_size
+from arbitrage.dashboard_state import PATH_LABELS, DashboardState
+from arbitrage.venues import VenueContext, describe_all
 from arbitrage.calculator import (
     ArbitrageCalculator,
     ArbitrageOpportunity,
@@ -53,11 +59,18 @@ WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "
 class ArbitrageScanner:
     def __init__(self, mode: str = "monitor", db_path: str = "arbitrage_tracker.db",
                  enable_cex: Optional[bool] = None, enable_use: Optional[bool] = None,
-                 cex_watch: Optional[bool] = None):
+                 cex_watch: Optional[bool] = None, view: str = "plain", show_wallet: bool = True):
         """
         mode: "monitor" (console only), "notify" (console + Discord), "live" (console + Discord + execute)
         """
         self.mode = mode
+        self.view = view                    # plain | dashboard | json
+        self.show_wallet = show_wallet
+        self.out = console if view == "plain" else Console(quiet=True)  # all scan printing goes here
+        self.state = DashboardState(mode)
+        self._last_wallet: Optional[dict] = None
+        self._last_prices: dict = {}
+        self._now = 0.0
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
@@ -75,6 +88,8 @@ class ArbitrageScanner:
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
         self._chain_prices: Optional[dict] = None           # its price entries
         self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
+        self._last_blocked_logged: Optional[tuple] = None   # their shape, last written to the log
+        self._health_blocker: Optional[str] = None          # node health from the last live gate check
         self._chain_error: Optional[str] = None             # set while chain reads fail
         self._last_full_scan = float("-inf")
         self._last_key: Optional[tuple] = None
@@ -265,6 +280,7 @@ class ArbitrageScanner:
         results["nonkyc_orderbook"] = nonkyc_ob
         results["kucoin_orderbook"] = kucoin_ob
 
+        self._last_prices = results
         return results
 
     def _display_prices(self, prices: dict):
@@ -329,7 +345,7 @@ class ArbitrageScanner:
             am_ok = (use_mint.get("arb_mint") or {}).get("is_available", False)
             table.add_row("", "USE Mint", "", f"FreeMint: {'YES' if fm_ok else 'NO'} | ArbMint: {'YES' if am_ok else 'NO'}")
 
-        console.print(table)
+        self.out.print(table)
 
     @staticmethod
     def _dex_erg_to_sigusd(prices: dict, erg: float) -> float:
@@ -772,7 +788,7 @@ class ArbitrageScanner:
         for g in self._cex_watch_gaps(prices):
             style = "bold yellow" if g["alert"] else "dim"
             hint = " -> worth connecting?" if g["alert"] else ""
-            console.print(f"  [{style}]WATCH {g['exchange']}: {g['text']}{hint}[/{style}]")
+            self.out.print(f"  [{style}]WATCH {g['exchange']}: {g['text']}{hint}[/{style}]")
 
     @staticmethod
     def _sigusd_premium_percent(prices: dict) -> Optional[float]:
@@ -819,7 +835,7 @@ class ArbitrageScanner:
     def _display_opportunities(self, opportunities: list[ArbitrageOpportunity], prices: Optional[dict] = None):
         """Display opportunities as a full grid: paths x trade sizes."""
         if not opportunities:
-            console.print("[dim]No opportunities to display[/dim]")
+            self.out.print("[dim]No opportunities to display[/dim]")
             return
 
         # Group by path type
@@ -918,20 +934,20 @@ class ArbitrageScanner:
         if footnotes:
             grid.caption = " | ".join(f"* {a}" for a in sorted(footnotes))
 
-        console.print(grid)
+        self.out.print(grid)
 
         # Best size per on-chain path (searched, capped by MAX_TRADE_SIZE_ERG)
         for key, opt in self.last_optima.items():
             choice = self.last_sizing.get(key)
             if choice is not None:
                 style = "bold green" if choice.ok else "dim"
-                console.print(f"  [{style}]BEST SIZE {key}: {choice.summary()}[/{style}]")
+                self.out.print(f"  [{style}]BEST SIZE {key}: {choice.summary()}[/{style}]")
                 continue
             if opt.profit_erg <= 0:
-                console.print(f"  [dim]BEST SIZE {key}: no profitable size up to {config.MAX_TRADE_SIZE_ERG:g} ERG[/dim]")
+                self.out.print(f"  [dim]BEST SIZE {key}: no profitable size up to {config.MAX_TRADE_SIZE_ERG:g} ERG[/dim]")
                 continue
             style = "bold green" if opt.is_profitable and not opt.blocked else "yellow"
-            console.print(
+            self.out.print(
                 f"  [{style}]BEST SIZE {key}: {opt.input_erg:g} ERG -> {opt.profit_erg:+.4f} ERG "
                 f"({opt.profit_percent:+.2f}%)[/{style}]"
             )
@@ -939,7 +955,7 @@ class ArbitrageScanner:
         # Why each path is (not) profitable, including blocked reasons
         for opp in sorted(best_per_path, key=lambda o: -o.profit_percent):
             style = "green" if opp.is_profitable and not opp.blocked else ("red" if opp.blocked else "dim")
-            console.print(f"  [bold]WHY {opp.path_key}:[/bold] [{style}]{self._explain(opp, prices or {})}[/{style}]")
+            self.out.print(f"  [bold]WHY {opp.path_key}:[/bold] [{style}]{self._explain(opp, prices or {})}[/{style}]")
 
         # Show steps for GO/RISKY paths
         actionable = [o for o in best_per_path if o.is_profitable and not o.blocked]
@@ -947,13 +963,13 @@ class ArbitrageScanner:
             path_name = opp.path_key
             risk_ok = opp.risk_adjusted_profitable
             status_tag = "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]"
-            console.print(f"\n>> {path_name} [{opp.input_erg:.0f} ERG] {status_tag} [bold green]{opp.profit_percent:+.1f}% ({opp.profit_erg:+.2f} ERG)[/bold green]")
+            self.out.print(f"\n>> {path_name} [{opp.input_erg:.0f} ERG] {status_tag} [bold green]{opp.profit_percent:+.1f}% ({opp.profit_erg:+.2f} ERG)[/bold green]")
             if opp.steps:
                 for i, step in enumerate(opp.steps, 1):
                     if step.startswith("WARNING:"):
-                        console.print(f"   [bold yellow]!! {step}[/bold yellow]")
+                        self.out.print(f"   [bold yellow]!! {step}[/bold yellow]")
                     else:
-                        console.print(f"   [dim]{i}. {step}[/dim]")
+                        self.out.print(f"   [dim]{i}. {step}[/dim]")
 
         # --- Summary table for profitable paths only ---
         if profitable:
@@ -983,10 +999,10 @@ class ArbitrageScanner:
                     f"{opp.estimated_execution_minutes:.0f}m",
                     "[bold green]GO[/bold green]" if risk_ok else "[yellow]RISKY[/yellow]",
                 )
-            console.print(summary)
+            self.out.print(summary)
 
             best = max(profitable, key=lambda x: x.profit_percent)
-            console.print(Panel(
+            self.out.print(Panel(
                 f"[bold green]BEST: {best.path}\n"
                 f"Input: {best.input_erg:.2f} ERG -> Output: {best.output_erg:.4f} ERG\n"
                 f"Profit: {best.profit_erg:+.4f} ERG (${best.profit_usd:+.2f}) ({best.profit_percent:+.2f}%)\n"
@@ -1067,6 +1083,7 @@ class ArbitrageScanner:
             )
             if sent > 0:
                 logger.info(f"Sent {sent} Discord notification(s) (confirmed)")
+                self.state.add_event("info", f"Discord alert sent ({sent} path(s))")
 
         # Log streak status for visibility
         active_streaks = {k: v for k, v in self._opportunity_streak.items() if v > 0}
@@ -1111,8 +1128,8 @@ class ArbitrageScanner:
             blockers.append(f"wallet too small: {wallet.get('erg', 0):.2f} ERG minus {config.LIVE_ERG_RESERVE:g} reserve")
         return blockers
 
-    async def _global_blockers(self, wallet: dict, prices: dict) -> list[str]:
-        """Reasons no path would trade right now (kill switch, pause, limits, node)."""
+    def _sync_global_blockers(self, wallet: Optional[dict], prices: dict) -> list[str]:
+        """Global blockers that need no node call (chain, oracle, STOP, pause, drawdown, cooldown, daily max)."""
         blockers = []
         if self._chain_error is not None:
             blockers.append(f"chain state unavailable ({self._chain_error})")
@@ -1122,25 +1139,51 @@ class ArbitrageScanner:
             blockers.append(f"STOP file present ({config.LIVE_STOP_FILE})")
         if self._live_paused:
             blockers.append(f"paused after: {self._live_paused} (restart to resume)")
-        value = self._wallet_value_erg(wallet, prices)
-        if self._live_start_value is None:
-            self._live_start_value = value
-        elif self._live_start_value - value > config.LIVE_MAX_DRAWDOWN_ERG:
-            blockers.append(f"drawdown {self._live_start_value - value:.2f} ERG > LIVE_MAX_DRAWDOWN_ERG "
-                            f"{config.LIVE_MAX_DRAWDOWN_ERG:g}")
+        if wallet is not None and self._live_start_value is not None:
+            drop = self._live_start_value - self._wallet_value_erg(wallet, prices)
+            if drop > config.LIVE_MAX_DRAWDOWN_ERG:
+                blockers.append(f"drawdown {drop:.2f} ERG > LIVE_MAX_DRAWDOWN_ERG {config.LIVE_MAX_DRAWDOWN_ERG:g}")
         wait = config.LIVE_TRADE_COOLDOWN_SECONDS - (time.time() - self._last_trade_time)
         if self._last_trade_time and wait > 0:
             blockers.append(f"cooldown {wait:.0f}s")
         if self._trades_today_count() >= config.LIVE_MAX_TRADES_PER_DAY:
             blockers.append(f"max {config.LIVE_MAX_TRADES_PER_DAY} trades per day reached")
+        return blockers
+
+    async def _global_blockers(self, wallet: dict, prices: dict) -> list[str]:
+        """Reasons no path would trade right now (kill switch, pause, limits, node)."""
+        if self._live_start_value is None:
+            self._live_start_value = self._wallet_value_erg(wallet, prices)
+        blockers = self._sync_global_blockers(wallet, prices)
         health = await self.ergo_node.get_health()
+        self._health_blocker = None
         if not health.get("ok_to_trade"):
-            blockers.append(f"node not ready (synced={health.get('synced')}, unlocked={health.get('unlocked')})")
+            self._health_blocker = (f"node not ready (synced={health.get('synced')}, "
+                                    f"unlocked={health.get('unlocked')})")
+            blockers.append(self._health_blocker)
         return blockers
 
     async def _live_blockers(self, wallet: dict, prices: dict, key: str = LIVE_PATH) -> list[str]:
         """Every reason `key` would not execute right now (empty list = ready)."""
         return self._path_blockers(key, wallet) + await self._global_blockers(wallet, prices)
+
+    def _trade_log(self, message: str):
+        """Runner progress: always in the log file, printed in plain view, an event otherwise.
+
+        Runs between the two legs of a live trade, so it must never raise: node error text can
+        contain things that look like rich markup (e.g. "[/detail]").
+        """
+        logger.info(f"LIVE {message.strip()}")
+        try:
+            self.out.print(message)
+        except Exception:
+            self.out.print(message, markup=False)
+        try:
+            text = Text.from_markup(message).plain.strip()
+        except Exception:
+            text = message.strip()
+        if text:
+            self.state.add_event("trade", text)
 
     async def _execute_trades(self, wallet: dict, prices: dict, quiet: bool = False):
         """--live: run the most profitable executable path at its best size when every check passes.
@@ -1156,8 +1199,13 @@ class ArbitrageScanner:
                           f"{'; '.join(self._path_blockers(key, wallet) + global_blockers)}" for key in LIVE_PATHS)
             if not (quiet and lines == self._last_blocked):
                 for line in lines:
-                    console.print(f"  [dim]{line}[/dim]")
+                    self.out.print(f"  [dim]{line}[/dim]")
             self._last_blocked = lines
+            shape = tuple(re.sub(r"\d+(\.\d+)?", "#", line) for line in lines)  # ignore ticking counters
+            if self.view != "plain" and shape != self._last_blocked_logged:
+                for line in lines:
+                    logger.info(line)
+            self._last_blocked_logged = shape
             return
         self._last_blocked = None
 
@@ -1165,13 +1213,13 @@ class ArbitrageScanner:
         path = LIVE_PATHS[key]
         choice = self.last_sizing[key]
         cap = self._live_cap(wallet)
-        console.print(Panel(f"[bold red]LIVE: executing {key}, scan says {choice.summary()}; "
+        self.out.print(Panel(f"[bold red]LIVE: executing {key}, scan says {choice.summary()}; "
                             f"re-sizing on fresh boxes (cap {cap:g} ERG)[/bold red]", border_style="red"))
         trade_id = self.tracker.start_trade(None, choice.cost_erg, choice.cost_erg + choice.profit_erg,
                                             choice.profit_erg)
         try:
             result = await run_arb(self.ergo_node.session, path, None, max_erg_in=int(round(cap * 1e9)),
-                                   execute=True, log=lambda m: console.print(m))
+                                   execute=True, log=self._trade_log)
         except Exception as e:  # fail closed: leg 1 may already be on chain
             logger.error(f"LIVE runner error: {e}", exc_info=True)
             result = ArbResult("error", f"{e.__class__.__name__}: {e}", path=path)
@@ -1210,6 +1258,7 @@ class ArbitrageScanner:
             self.tracker.fail_trade(trade_id, f"{result.status}: {result.message}", notes=f"{path}; nothing spent")
             msg = f"did not execute {key} ({result.status}): {result.message or 'see console'}. Nothing was spent."
         logger.warning(f"LIVE {msg}")
+        self.state.add_event("good" if result.status == "executed" else "warn", f"LIVE {msg}")
         if self.discord_enabled:
             await self.discord.notify_live(msg, ping=result.status != "not_profitable")
 
@@ -1597,8 +1646,8 @@ class ArbitrageScanner:
         sigusd = wallet.get("sigusd", 0)
         use = wallet.get("use", 0)
 
-        console.print()
-        console.print(Panel(
+        self.out.print()
+        self.out.print(Panel(
             f"[bold]ERG:[/bold] {erg:.4f}  |  [bold]SigUSD:[/bold] {sigusd:.2f}  |  [bold]USE:[/bold] {use:.3f}",
             title="Wallet Balances",
             border_style="cyan",
@@ -1613,14 +1662,14 @@ class ArbitrageScanner:
 
             minimum, unit, fmt = WALLET_MINIMUMS[asset_key]
             if balance <= 0:
-                console.print(f"  [dim]{label}: No balance[/dim]")
+                self.out.print(f"  [dim]{label}: No balance[/dim]")
                 continue
             if balance < minimum:
-                console.print(f"  [dim]{label}: {balance:{fmt}} (below {minimum:g} {unit} minimum for path analysis)[/dim]")
+                self.out.print(f"  [dim]{label}: {balance:{fmt}} (below {minimum:g} {unit} minimum for path analysis)[/dim]")
                 continue
 
             if not options:
-                console.print(f"  [dim]{label}: No paths available[/dim]")
+                self.out.print(f"  [dim]{label}: No paths available[/dim]")
                 continue
 
             available = [o for o in options if not o["blocked"] and o.get("blocked_reason") != "exit to USDT"]
@@ -1632,16 +1681,16 @@ class ArbitrageScanner:
             # Header line
             if profitable:
                 best = max(profitable, key=lambda x: x["profit_pct"])
-                console.print(f"\n  [bold green]{label}: {len(profitable)} profitable option(s). Best: {best['name']} ({best['profit_pct']:+.1f}%)[/bold green]")
+                self.out.print(f"\n  [bold green]{label}: {len(profitable)} profitable option(s). Best: {best['name']} ({best['profit_pct']:+.1f}%)[/bold green]")
             elif available:
                 best = max(available, key=lambda x: x["profit_pct"])
                 if best.get("blocked_reason") == "too small":
-                    console.print(f"\n  [yellow]{label}: {best['profit_desc']}[/yellow]")
+                    self.out.print(f"\n  [yellow]{label}: {best['profit_desc']}[/yellow]")
                 else:
-                    console.print(f"\n  [yellow]{label}: No profitable options. Best: {best['name']} ({best['profit_pct']:+.1f}%)[/yellow]")
+                    self.out.print(f"\n  [yellow]{label}: No profitable options. Best: {best['name']} ({best['profit_pct']:+.1f}%)[/yellow]")
             else:
                 reasons = ", ".join(o["blocked_reason"] for o in blocked if o["blocked_reason"])
-                console.print(f"\n  [dim]{label}: All paths blocked ({reasons})[/dim]")
+                self.out.print(f"\n  [dim]{label}: All paths blocked ({reasons})[/dim]")
 
             # Show each option with steps
             all_available = sorted(available, key=lambda x: x["profit_pct"], reverse=True)
@@ -1651,18 +1700,18 @@ class ArbitrageScanner:
                 tag = "[bold green]" if pct > 0.5 else "[yellow]" if pct > -1 else "[dim]"
                 end_tag = "[/bold green]" if pct > 0.5 else "[/yellow]" if pct > -1 else "[/dim]"
 
-                console.print(f"    {tag}{o['name']} ({pct:+.1f}%):{end_tag}")
+                self.out.print(f"    {tag}{o['name']} ({pct:+.1f}%):{end_tag}")
                 for step in o["steps"]:
-                    console.print(f"      {tag}{step}{end_tag}")
-                console.print(f"      {tag}-> {o['profit_desc']}{end_tag}")
+                    self.out.print(f"      {tag}{step}{end_tag}")
+                self.out.print(f"      {tag}-> {o['profit_desc']}{end_tag}")
 
             # Show USDT exit options (ERG only)
             for o in usdt_exits:
-                console.print(f"    [dim]{o['name']}: {o['profit_desc']}[/dim]")
+                self.out.print(f"    [dim]{o['name']}: {o['profit_desc']}[/dim]")
 
             # Show blocked
             for o in blocked:
-                console.print(f"    [dim]-- {o['name']}: {o['blocked_reason']}[/dim]")
+                self.out.print(f"    [dim]-- {o['name']}: {o['blocked_reason']}[/dim]")
 
     def _should_send_wallet_analysis(self, opportunities: list[ArbitrageOpportunity]) -> bool:
         """Check if wallet analysis should be sent to Discord."""
@@ -1687,12 +1736,12 @@ class ArbitrageScanner:
     async def scan_once(self):
         """Run a single scan cycle."""
         self.scan_count += 1
-        console.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
+        self.out.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
 
         prices = await self.fetch_all_prices()
         outage = self._chain_error is not None
         if outage:  # prices below are the last good state: show them, but do not log or alert on them
-            console.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
+            self.out.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
                           f"state; nothing is logged, alerted or traded until the node can be read[/bold yellow]")
         else:
             self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
@@ -1709,7 +1758,9 @@ class ArbitrageScanner:
 
         # Wallet-based analysis
         wallet = await self._fetch_wallet_balances()
-        self._display_wallet_opportunities(wallet, opportunities, prices)
+        self._last_wallet = wallet
+        if self.show_wallet:
+            self._display_wallet_opportunities(wallet, opportunities, prices)
 
         if not outage:
             await self._notify_discord(opportunities)
@@ -1751,12 +1802,66 @@ class ArbitrageScanner:
         changed = [n for n, a, b in zip(names, snap.key, self._last_key or (None,) * 3) if a != b]
         pending = f" pending: {', '.join(sorted(snap.pending))}" if snap.pending else ""
         best = " | ".join(f"{LIVE_PATHS[k]}: {c.summary()}" for k, c in self.last_sizing.items())
-        console.print(f"[dim]{datetime.now().strftime('%H:%M:%S')} CHAIN h{snap.height} "
+        self.out.print(f"[dim]{datetime.now().strftime('%H:%M:%S')} CHAIN h{snap.height} "
                       f"changed: {', '.join(changed)}{pending} ({snap.read_ms:.0f} ms) | {best}[/dim]")
+        self.state.add_event("info", f"CHAIN h{snap.height} changed: {', '.join(changed)}{pending}")
         self._last_key = snap.key
 
     async def poll_once(self, now: float):
-        """One tick: full scan when due, otherwise a fast node read, exact sizing and the live gate."""
+        """One tick: full scan when due, otherwise a fast node read, exact sizing and the live gate.
+        The dashboard state is refreshed exactly once per tick (also when the tick fails)."""
+        self._now = now
+        full = now - self._last_full_scan >= config.SCAN_INTERVAL_SECONDS
+        try:
+            await self._poll(now)
+        finally:
+            self._refresh_state(now)
+        if full and self.view == "json":
+            sys.stdout.write(json.dumps(self.state.to_json(), default=str) + "\n")
+            sys.stdout.flush()
+
+    def _refresh_state(self, now: float):
+        """Fill self.state (what the dashboard and --json show) from the scanner's current view."""
+        s = self.state
+        snap = self._snapshot
+        prices = self._chain_prices or {}
+        s.scan_count, s.chain_error = self.scan_count, self._chain_error
+        s.node_ok = self._chain_error is None and snap is not None
+        s.height = snap.height if snap else s.height
+        s.read_ms = snap.read_ms if snap else None
+        s.next_full_scan_in = max(0.0, config.SCAN_INTERVAL_SECONDS - (now - self._last_full_scan))
+        s.prices = prices
+        s.update_venues(describe_all(VenueContext(
+            prices={**self._last_prices, **prices}, timestamps=self._price_timestamps, now=time.time(),
+            chain_error=self._chain_error, pending=snap.pending if snap else frozenset(), read_ms=s.read_ms,
+            enable_cex=self.enable_cex, enable_use=self.enable_use, cex_watch=self.cex_watch)))
+        steps = {k: self.last_optima[k].steps for k in PATH_LABELS if k in self.last_optima}
+        s.update_paths(self.last_sizing, self._live_streak, self._chain_error, steps)
+        wallet = self._last_wallet
+        s.wallet_ok = wallet is not None
+        if wallet is not None and self.show_wallet:
+            value = self._wallet_value_erg(wallet, prices) if prices else None
+            oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+            s.wallet = dict(wallet, value_erg=value, value_usd=value * oracle if value and oracle else None)
+        s.trades_today = self._trades_today_count()
+        if self._live_start_value is not None and wallet is not None and prices:
+            s.drawdown = max(0.0, self._live_start_value - self._wallet_value_erg(wallet, prices))
+        if not self.trading_enabled:
+            s.set_live("off", [f"{self.mode} mode: no trading"])
+        elif self._live_paused:
+            s.set_live("paused", [self._live_paused, "restart to resume"])
+        else:
+            # Global reasons first (they block every path), then the closest path's own reasons.
+            reasons = self._sync_global_blockers(wallet, prices)
+            if self._health_blocker:
+                reasons.append(self._health_blocker)
+            ready = [k for k in LIVE_PATHS if not self._path_blockers(k, wallet or {})]
+            if not ready:
+                best = max(LIVE_PATHS, key=lambda k: self._live_streak.get(k, 0))
+                reasons = reasons + self._path_blockers(best, wallet or {})
+            s.set_live("blocked" if reasons else "armed", reasons)
+
+    async def _poll(self, now: float):
         if now - self._last_full_scan >= config.SCAN_INTERVAL_SECONDS:
             self._last_full_scan = now
             await self.scan_once()
@@ -1772,7 +1877,9 @@ class ArbitrageScanner:
         self._note_change()
         if self.trading_enabled and any(self._live_streak.get(k, 0) >= config.LIVE_CONFIRM_POLLS
                                         for k in LIVE_PATHS):
-            await self._execute_trades(await self._fetch_wallet_balances(), prices, quiet=True)
+            wallet = await self._fetch_wallet_balances()
+            self._last_wallet = wallet
+            await self._execute_trades(wallet, prices, quiet=True)
 
     def request_stop(self):
         """Ask the main loop to finish the current scan and shut down cleanly."""
@@ -1806,7 +1913,7 @@ class ArbitrageScanner:
             else:
                 signal.signal(sig, previous)
 
-    async def run(self):
+    async def run(self, once: bool = False):
         """Main scan loop: fixed-rate scans until request_stop() or SIGINT/SIGTERM."""
         mode_display = {
             "monitor": "MONITOR ONLY (console output)",
@@ -1829,7 +1936,7 @@ class ArbitrageScanner:
         else:
             discord_line = "Discord: DISABLED (use --notify or --live to enable)"
 
-        console.print(Panel(
+        self.out.print(Panel(
             "[bold]Ergo Arbitrage Scanner[/bold]\n"
             f"Mode: {mode_display}\n"
             f"Min profit: {config.MIN_PROFIT_PERCENT}%\n"
@@ -1864,15 +1971,18 @@ class ArbitrageScanner:
                     await self.poll_once(loop.time())
                 except Exception as e:
                     logger.error(f"Poll error: {e}", exc_info=True)
+                if once:
+                    break
                 next_tick = max(next_tick + config.CHAIN_POLL_SECONDS, loop.time())
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=next_tick - loop.time())
                 except asyncio.TimeoutError:
                     pass
-            console.print("\n[bold yellow]Shutting down...[/bold yellow]")
+            self.out.print("\n[bold yellow]Shutting down...[/bold yellow]")
         finally:
             self._restore_signal_handlers(restore)
-            self.tracker.print_summary()
+            if self.view == "plain":
+                self.tracker.print_summary()
             if self.discord_enabled:
                 await self.discord.send_summary_message(self.tracker.get_session_stats())
             await self.disconnect_all()

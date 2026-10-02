@@ -27,15 +27,44 @@ The app connects to your Ergo node to:
 ## Modes
 
 ```bash
-# Monitor mode (console only, no notifications)
-python main.py
-
-# Notification mode (console + Discord alerts, no trades)
-python main.py --notify
-
-# Live mode (console + Discord + auto-execute) - NOT YET WIRED
-python main.py --live
+python main.py            # monitor: live dashboard, no notifications, no trades
+python main.py --notify   # + Discord alerts
+python main.py --live     # + auto-execute (see "Live mode" below)
 ```
+
+The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+C quits):
+
+```
+ ERGO ARB  MONITOR   h1885748  node ● 2 ms  wallet ●  poll 2s  full scan in 3s  confirm 2  19:38:12
+┌──────────── Prices ────────────┐┌──────────────── Live ────────────────┐
+│ Pool    0.3127 SigUSD/ERG  …   ││ off   trades today 0/10  drawdown …   │
+│ Oracle  $0.3238/ERG  peg +3.5% ││   monitor mode: no trading            │
+│ Bank    RR 330%  redeem ✓  mint ✗││ Wallet: 20.7119 ERG  0.00 SigUSD …   │
+┌──────────────────────────── Paths ───────────────────────────────────────┐
+│ path            size   profit      %   b/even  conf  status     last 30  │
+│ pool→redeem        —  -0.0644      —       —   0/2   no edge: … ▁▁▁▁▁▁▁  │
+│ mint→pool sell     —        —      —       —   0/2   BLOCKED: … ▁▁▁▁▁▁▁  │
+┌──────────────────────────── Events ──────────────────────────────────────┐
+│ 19:37:29 CHAIN h1885748 changed: pool, bank, oracle                      │
+┌──────────────────────────── Venues ──────────────────────────────────────┐
+│ ErgoDEX pool   on-chain  ● live          0.3127 SigUSD/ERG, 111,872 ERG  │
+│ SigmaUSD bank  on-chain  ● live          RR 330%, mint ✗                 │
+│ Oracle         on-chain  ● live          $0.3238/ERG                     │
+│ Dexy USE       on-chain  – disabled      ENABLE_USE=false                │
+│ Kucoin         CEX       ○ watch only    $0.3238 / $0.3242               │
+│ NonKYC         CEX       ○ watch only    $0.3261 / $0.3267               │
+```
+
+| Flag | Effect |
+|---|---|
+| `--plain` | the classic scrolling output (tables per scan) |
+| `--json` | one JSON line per full scan on stdout, nothing else |
+| `--once` | one full scan, then exit (works with every view) |
+| `--interval N` | seconds between full scans (`SCAN_INTERVAL_SECONDS`) |
+| `--max-trade-erg X` | cap on any executed trade (`MAX_TRADE_SIZE_ERG`) |
+| `--log-level L` | level of `arbitrage.log` (rotated at midnight, 14 days kept) |
+| `--db PATH` | tracker database |
+| `--no-wallet` | hide the wallet panel and wallet analysis |
 
 ## Arbitrage Strategies
 
@@ -50,7 +79,7 @@ When the bank's oracle price values ERG higher than the DEX pool price:
   Step 1: Send 10 ERG to SigmaUSD Bank, mint SigUSD
           Receive: 10 * $0.32 * (1 - 2.2% fee) = 3.13 SigUSD
   Step 2: Swap 3.13 SigUSD -> ERG on Spectrum
-          Receive: 3.13 / $0.29 * (1 - 0.5% pool) - 0.785 ERG service = ~9.9 ERG
+          Receive: 3.13 / $0.29 * (1 - 0.5% pool) - miner fee = ~10.7 ERG (direct pool swap)
   Result:  10 ERG -> ~9.9 ERG (fees eat the spread in this example)
 
   RESTRICTION: Bank minting requires reserve ratio > 400%
@@ -64,7 +93,7 @@ When the DEX pool prices ERG higher than the bank's oracle rate:
   Spectrum: 1 ERG = $0.35 (SigUSD)
   Oracle:   1 ERG = $0.32
 
-  Step 1: Swap 10 ERG -> SigUSD on Spectrum (-0.5% pool, -0.785 ERG service)
+  Step 1: Swap 10 ERG -> SigUSD on Spectrum (-0.5% pool, direct swap: miner fee only)
   Step 2: Redeem SigUSD at Bank (-2.2% bank fee, -0.002 ERG receipt)
   Result:  Depends on spread vs fees
 
@@ -100,7 +129,7 @@ Every opportunity calculation includes ALL of these costs:
 | Kucoin trading fee | 0.1% | CEX buy/sell |
 | Kucoin ERG withdrawal | 0.73 ERG | Moving ERG off Kucoin |
 | Spectrum pool fee | 0.5% | SigUSD/ERG pool swaps |
-| Spectrum service fee | ~0.785 ERG flat | Via Crux routing to Spectrum |
+| Spectrum service fee | none (direct pool swap) | ~0.785 ERG only with `POOL_SWAP_ROUTE=crux` |
 | Mew Finance fee | ~0.55 ERG flat | 0.54 batcher + 0.002 protocol + 0.007 overhead + 0.001 miner |
 | Crux Finance LP (USE) | 0.3% pool fee + ~0.785 ERG | LP swap service fee |
 | Crux Finance mint (USE) | ~0.79 ERG flat | Mint transaction fee |
@@ -167,7 +196,7 @@ PRICE_STALE_SECONDS=60                 # Max price age before skipping (default 
 ### Installation
 
 ```bash
-cd ergo_arbitrage
+cd ergo-arbitrage
 pip install -r requirements.txt
 ```
 
@@ -206,14 +235,10 @@ SCAN_INTERVAL_SECONDS=15
 ### Running
 
 ```bash
-# Monitor mode (console only)
-python main.py
-
-# Notification mode (console + Discord)
-python main.py --notify
-
-# Live mode (NOT YET IMPLEMENTED - placeholder only)
-python main.py --live
+python main.py              # monitor (dashboard)
+python main.py --notify     # + Discord
+python main.py --live       # + auto-execute
+python main.py --once --plain   # one scan, classic output
 
 # Run tests
 python -m pytest tests/ -v
@@ -375,7 +400,7 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 - **SigmaUSD Bank has restrictions** - SigUSD minting is blocked if the post-mint RR would fall below 400%; SigUSD redeem is always allowed (the 800% cap only applies to SigRSV minting)
 - **SigUSD is currently depegged** - trading at ~$1.23 instead of $1.00 (makes CEX<>DEX paths unreliable)
 - **USE (DexyUSD) is well-pegged** - trading at ~$0.99, more predictable for arb paths
-- **Crux service fee is ~0.785 ERG flat** - brutal for small swaps, negligible for large ones
+- **Crux service fee is ~0.785 ERG flat** - only paid on Crux-routed swaps (USE LP, or SigUSD with `POOL_SWAP_ROUTE=crux`); SigUSD pool swaps go direct and pay only the miner fee
 - **Ergo TX fees are EXPLICIT** - must be an output box, not implicit (inputs must equal outputs)
 - **Node must be fully synced** for wallet operations to work correctly
 
