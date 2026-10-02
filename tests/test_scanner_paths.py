@@ -240,3 +240,44 @@ class TestPoolRouteCosts:
             assert o.fees.execution_fee_erg == pytest.approx(config.CRUX_MINT_SERVICE_FEE + config.SPECTRUM_EXECUTION_FEE)
         finally:
             s.tracker.close()
+
+
+class TestExplanations:
+    def _setup(self, scanner, premium):
+        # oracle 0.32 USD/ERG; pool prices SigUSD at `premium` above the oracle
+        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=3_125_000_000)
+        spot = state.oracle_usd_per_erg / (1 + premium)
+        from exchanges.base import PoolState
+        pool = PoolState(exchange="t", pool_id="p", token_x="ERG", token_y="SigUSD",
+                         reserve_x=1_000_000, reserve_y=1_000_000 * spot, fee_num=995, fee_denom=1000)
+        prices = make_prices(state, spot)
+        prices["spectrum_pool"] = pool
+        opps = scanner._find_opportunities(prices)
+        return prices, opps
+
+    def _best(self, opps, path):
+        return max(by_path(opps, path), key=lambda o: o.profit_percent)
+
+    def test_mint_path_explains_shortfall(self, scanner):
+        prices, opps = self._setup(scanner, premium=0.02)
+        text = scanner._explain(self._best(opps, "Bank mint->Spectrum sell"), prices)
+        assert "+2.00%" in text          # SigUSD premium on the pool
+        assert "short by" in text
+
+    def test_redeem_path_needs_discount(self, scanner):
+        prices, opps = self._setup(scanner, premium=0.02)
+        text = scanner._explain(self._best(opps, "Spectrum buy->Bank redeem"), prices)
+        assert "discount" in text and "short by" in text
+
+    def test_profitable_path_says_so(self, scanner):
+        prices, opps = self._setup(scanner, premium=0.06)
+        best = self._best(opps, "Bank mint->Spectrum sell")
+        assert best.profit_percent > config.MIN_PROFIT_PERCENT
+        assert "clears" in scanner._explain(best, prices)
+
+    def test_display_prints_why_lines(self, scanner):
+        from logging_config import console
+        prices, opps = self._setup(scanner, premium=0.02)
+        with console.capture() as cap:
+            scanner._display_opportunities(opps, prices)
+        assert "WHY Bank mint->Spectrum sell" in cap.get()
