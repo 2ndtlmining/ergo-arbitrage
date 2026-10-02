@@ -24,6 +24,7 @@ from exchanges.sigmausd import (
 )
 from exchanges.ergo_node import ErgoNodeClient
 from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
+from arbitrage.optimizer import maximize
 from arbitrage.calculator import (
     ArbitrageCalculator,
     ArbitrageOpportunity,
@@ -75,6 +76,7 @@ class ArbitrageScanner:
         self._nonkyc_usdt_fee: float = 0.0
         self._stop = asyncio.Event()
         self.node_health: dict = {}
+        self.last_optima: dict[str, ArbitrageOpportunity] = {}
         self._kucoin_usdt_fee: float = 1.0
 
     @property
@@ -335,9 +337,96 @@ class ArbitrageScanner:
         cents = int(sigusd * 100)
         return cents, quote_redeem_sigusd(state, cents) / 1e9
 
+    def _amm_buffer(self, prices: dict, trade_size: float) -> float:
+        return config.EXECUTION_BUFFER if prices.get("spectrum_pool") else config.get_recommended_slippage(trade_size)
+
+    def _path_bank_mint(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
+        """Path 1: ERG -> SigUSD (bank mint) -> ERG (pool sell). Always computed, marked blocked."""
+        bank = prices.get("bank", {})
+        bank_state: Optional[BankState] = bank.get("state")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        if not (bank_state and spectrum_price and spectrum_price > 0):
+            return None
+        oracle_price = bank.get("oracle_erg_usd") or bank_state.oracle_usd_per_erg
+        reserve_ratio = bank.get("reserve_ratio")
+        rr_str = f"{reserve_ratio:.0f}%" if reserve_ratio else "N/A"
+
+        mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
+        sigusd_from_bank = mint_cents / 100
+        bank_rate_after_fees = sigusd_from_bank / trade_size
+        erg_from_dex_after_fee = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
+
+        opp = self.calculator.calc_bank_to_dex(
+            input_erg=trade_size,
+            bank_erg_to_sigusd_rate=bank_rate_after_fees,
+            dex_sigusd_to_erg_output=erg_from_dex_after_fee,
+            dex_execution_fee=config.pool_service_fee(),
+            slippage=self._amm_buffer(prices, trade_size),
+        )
+        opp.path = f"Bank mint->Spectrum sell [{trade_size:g} ERG]"
+        fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+        opp.steps = [
+            f"START: Have {trade_size:g} ERG in wallet",
+            f"Send {trade_size:g} ERG to SigmaUSD Bank to mint SigUSD",
+            f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+            f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+        ]
+        opp.details = {"sigusd_cents": mint_cents}
+        if not mint_ok:
+            opp.blocked = True
+            opp.blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
+            opp.is_profitable = False
+        return opp
+
+    def _path_pool_buy_redeem(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
+        """Path 2: ERG -> SigUSD (pool buy) -> ERG (bank redeem). Executable by execute_arb.py."""
+        bank = prices.get("bank", {})
+        bank_state: Optional[BankState] = bank.get("state")
+        spectrum_price = prices.get("spectrum_erg_sigusd")
+        if not (bank_state and spectrum_price and spectrum_price > 0):
+            return None
+        oracle_price = bank.get("oracle_erg_usd") or bank_state.oracle_usd_per_erg
+
+        sigusd_from_dex = self._dex_erg_to_sigusd(prices, trade_size)
+        redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
+        bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
+
+        opp = self.calculator.calc_dex_to_bank(
+            input_erg=trade_size,
+            dex_erg_to_sigusd_output=sigusd_from_dex,
+            bank_sigusd_to_erg_rate=bank_redeem_rate,
+            dex_execution_fee=config.pool_service_fee(),
+            slippage=self._amm_buffer(prices, trade_size),
+        )
+        opp.path = f"Spectrum buy->Bank redeem [{trade_size:g} ERG]"
+        fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
+        opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
+        opp.steps = [
+            f"START: Have {trade_size:g} ERG in wallet",
+            f"Swap {trade_size:g} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"Receive ~{sigusd_from_dex:.2f} SigUSD",
+            f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
+            f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
+        ]
+        return opp
+
+    def _optimize_sizes(self, prices: dict) -> dict[str, ArbitrageOpportunity]:
+        """Best size per on-chain path within [MIN_TRADE_SIZE_ERG, MAX_TRADE_SIZE_ERG] (issue #10)."""
+        lo, hi = config.MIN_TRADE_SIZE_ERG, max(config.MAX_TRADE_SIZE_ERG, config.MIN_TRADE_SIZE_ERG)
+        optima = {}
+        for path_fn in (self._path_bank_mint, self._path_pool_buy_redeem):
+            if path_fn(prices, lo) is None:
+                continue
+            x, _ = maximize(lambda size: path_fn(prices, size).profit_erg, lo, hi)
+            opp = path_fn(prices, round(x, 2))
+            optima[opp.path_key] = opp
+        return optima
+
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
-        """Analyze prices and find all arbitrage opportunities."""
+        """Analyze prices and find all arbitrage opportunities (grid sizes); best sizes go to last_optima."""
         opportunities = []
+        self.last_optima = self._optimize_sizes(prices)
 
         nonkyc_price = prices.get("nonkyc_erg_usdt") if self.enable_cex else None
         kucoin_price = prices.get("kucoin_erg_usdt") if self.enable_cex else None
@@ -364,62 +453,10 @@ class ArbitrageScanner:
 
             # ---- SigUSD Paths ----
 
-            # Path 1: Bank mint -> Spectrum (always calculate, mark blocked)
-            if bank_state and spectrum_price and spectrum_price > 0:
-                mint_cents, mint_ok = self._bank_mint(bank_state, trade_size)
-                sigusd_from_bank = mint_cents / 100
-                bank_rate_after_fees = sigusd_from_bank / trade_size
-                erg_from_dex_after_fee = self._dex_sigusd_to_erg(prices, sigusd_from_bank)
-
-                opp = self.calculator.calc_bank_to_dex(
-                    input_erg=trade_size,
-                    bank_erg_to_sigusd_rate=bank_rate_after_fees,
-                    dex_sigusd_to_erg_output=erg_from_dex_after_fee,
-                    dex_execution_fee=config.pool_service_fee(),
-                    slippage=amm_buffer,
-                )
-                opp.path = f"Bank mint->Spectrum sell [{trade_size} ERG]"
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                opp.steps = [
-                    f"START: Have {trade_size} ERG in wallet",
-                    f"Send {trade_size} ERG to SigmaUSD Bank to mint SigUSD",
-                    f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-                    f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
-                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
-                ]
-                opp.details = {"sigusd_cents": mint_cents}
-                if not mint_ok:
-                    opp.blocked = True
-                    opp.blocked_reason = (
-                        f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
-                    )
-                    opp.is_profitable = False
-                opportunities.append(opp)
-
-            # Path 2: Spectrum -> Bank redeem (always calculate, mark blocked)
-            if bank_state and spectrum_price and spectrum_price > 0:
-                sigusd_from_dex = self._dex_erg_to_sigusd(prices, trade_size)
-                redeem_cents, erg_from_bank = self._bank_redeem_erg(bank_state, sigusd_from_dex)
-                bank_redeem_rate = erg_from_bank / sigusd_from_dex if sigusd_from_dex > 0 else 0
-
-                opp = self.calculator.calc_dex_to_bank(
-                    input_erg=trade_size,
-                    dex_erg_to_sigusd_output=sigusd_from_dex,
-                    bank_sigusd_to_erg_rate=bank_redeem_rate,
-                    dex_execution_fee=config.pool_service_fee(),
-                    slippage=amm_buffer,
-                )
-                opp.path = f"Spectrum buy->Bank redeem [{trade_size} ERG]"
-                fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
-                opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
-                opp.steps = [
-                    f"START: Have {trade_size} ERG in wallet",
-                    f"Swap {trade_size} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
-                    f"Receive ~{sigusd_from_dex:.2f} SigUSD",
-                    f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-                    f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
-                ]
-                opportunities.append(opp)
+            for path_fn in (self._path_bank_mint, self._path_pool_buy_redeem):
+                opp = path_fn(prices, trade_size)
+                if opp is not None:
+                    opportunities.append(opp)
 
             # Path 3: NonKYC vs Spectrum (note SigUSD != USDT assumption)
             if nonkyc_price and spectrum_price:
@@ -834,6 +871,17 @@ class ArbitrageScanner:
             grid.caption = " | ".join(f"* {a}" for a in sorted(footnotes))
 
         console.print(grid)
+
+        # Best size per on-chain path (searched, capped by MAX_TRADE_SIZE_ERG)
+        for key, opt in self.last_optima.items():
+            if opt.profit_erg <= 0:
+                console.print(f"  [dim]BEST SIZE {key}: no profitable size up to {config.MAX_TRADE_SIZE_ERG:g} ERG[/dim]")
+                continue
+            style = "bold green" if opt.is_profitable and not opt.blocked else "yellow"
+            console.print(
+                f"  [{style}]BEST SIZE {key}: {opt.input_erg:g} ERG -> {opt.profit_erg:+.4f} ERG "
+                f"({opt.profit_percent:+.2f}%)[/{style}]"
+            )
 
         # Why each path is (not) profitable, including blocked reasons
         for opp in sorted(best_per_path, key=lambda o: -o.profit_percent):

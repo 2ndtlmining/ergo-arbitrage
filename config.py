@@ -112,6 +112,7 @@ def parse_sizes(text: str) -> list[float]:
 # Trade sizes the scanner analyses (grid columns). Sizes above MAX_TRADE_SIZE_ERG are shown
 # for analysis only and never executed.
 TRADE_SIZES = parse_sizes(os.getenv("TRADE_SIZES", ""))
+MIN_TRADE_SIZE_ERG = float(os.getenv("MIN_TRADE_SIZE_ERG", "1"))  # lower bound of the best-size search
 SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.01"))  # 1%
 MAX_FEE_BUDGET_ERG = float(os.getenv("MAX_FEE_BUDGET_ERG", "1.0"))  # max service + miner fees per signed TX
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
