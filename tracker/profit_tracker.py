@@ -699,6 +699,14 @@ class ProfitTracker:
                                  (since_iso,)).fetchall()
         return [dict(r) for r in rows]
 
+    def recent_chain_episodes(self, limit: int = 5) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM chain_episodes ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_trades(self, limit: int = 5) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
     def trades_since(self, since_iso: str) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM trades WHERE started_at >= ? ORDER BY started_at",
                                  (since_iso,)).fetchall()

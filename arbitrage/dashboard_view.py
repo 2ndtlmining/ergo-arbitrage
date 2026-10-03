@@ -10,6 +10,7 @@ from rich.text import Text
 
 import config
 from arbitrage.dashboard_state import DashboardState
+from notifications.embeds import duration
 
 SPARK = "▁▂▃▄▅▆▇█"
 VENUE_STYLE = {"live": ("●", "green"), "pending": ("◐", "yellow"), "watch": ("○", "cyan"),
@@ -19,6 +20,10 @@ LIVE_STYLE = {"armed": "bold green", "blocked": "yellow", "paused": "bold red", 
 EVENT_STYLE = {"good": "green", "warn": "yellow", "error": "bold red", "trade": "bold cyan", "info": ""}
 EVENTS_SHOWN = 10
 LIVE_REASONS_SHOWN = 5
+HISTORY_SHOWN = 5
+RR_TREND_HOURS = 6
+RR_TREND_WIDTH = 24
+EXCHANGE_STYLE = {"live": "", "down": "red", "disabled": "dim"}
 
 
 def sparkline(values) -> str:
@@ -29,6 +34,50 @@ def sparkline(values) -> str:
     if hi - lo < 1e-9:
         return SPARK[0] * len(values)
     return "".join(SPARK[int((v - lo) / (hi - lo) * (len(SPARK) - 1))] for v in values)
+
+
+def _level(value, warn, bad) -> str:
+    """Style for a number that is fine below `warn`, yellow below `bad`, red at or above it."""
+    if value is None:
+        return "dim"
+    return "red" if value >= bad else ("yellow" if value >= warn else "green")
+
+
+def health_strip(s: DashboardState) -> Text:
+    """One line: how long each source took and whether anything is backed up or stale."""
+    h = s.health or {}
+    t = Text(" ")
+    parts = []
+    if s.read_ms is not None:
+        parts.append((f"chain {s.read_ms:.0f} ms", _level(s.read_ms, 500, 2000)))
+    cex = h.get("cex_ms") or {}
+    if cex:
+        parts.append((" · ".join(f"{n} {ms:.0f}" for n, ms in cex.items()) + " ms",
+                      _level(max(cex.values()), 1000, 3000)))
+    if h.get("full_scan_ms") is not None:
+        parts.append((f"full scan {h['full_scan_ms']:.0f} ms", _level(h["full_scan_ms"], 2000, 8000)))
+    if h.get("discord_queue") is not None:
+        parts.append((f"Discord queue {h['discord_queue']}", _level(h["discord_queue"], 10, 50)))
+    if h.get("data_age_s") is not None:
+        parts.append((f"data {h['data_age_s']:.0f}s", _level(h["data_age_s"], 30, 60)))
+    if not parts:
+        t.append("waiting for the first scan…", style="dim")
+    for i, (label, style) in enumerate(parts):
+        if i:
+            t.append("  ·  ", style="dim")
+        t.append(label, style=style)
+    return t
+
+
+def rr_trend(samples, now: float, hours: float = RR_TREND_HOURS, width: int = RR_TREND_WIDTH) -> str:
+    """Reserve-ratio sparkline over the last `hours` (bucket averages), e.g. "▁▂▃▅ (6h, 322→330%)"."""
+    recent = [v for t, v in samples if now - t <= hours * 3600]
+    if len(recent) < 2:
+        return ""
+    n = min(width, len(recent))
+    buckets = [recent[i * len(recent) // n:(i + 1) * len(recent) // n] for i in range(n)]
+    means = [sum(b) / len(b) for b in buckets if b]
+    return f"{sparkline(means)} ({hours:g}h, {means[0]:.0f}→{means[-1]:.0f}%)"
 
 
 def _age(seconds) -> str:
@@ -75,6 +124,9 @@ def prices_panel(s: DashboardState) -> Panel:
     if bank.get("reserve_ratio") is not None:
         mint = s.mint_text or ("✓" if bank.get("can_mint_sigusd") else "✗ (<400%)")
         rows.append(f"Bank    RR {bank['reserve_ratio']:.0f}%  redeem ✓  mint {mint}")
+        trend = rr_trend(s.rr_history, datetime.now().timestamp())
+        if trend:
+            rows.append(f"        RR trend {trend}")
     return Panel("\n".join(rows), title="Prices")
 
 
@@ -146,21 +198,90 @@ def events_panel(s: DashboardState) -> Panel:
     return Panel(t, title="Events")
 
 
+def _hhmm(iso) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return "--:--"
+
+
+def _lasted(row) -> str:
+    try:
+        return duration((datetime.fromisoformat(row["closed_at"])
+                         - datetime.fromisoformat(row["opened_at"])).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        return "open"
+
+
+def history_panel(s: DashboardState) -> Panel:
+    """The last opportunity episodes and live trades, from the tracker database."""
+    if not (s.recent_episodes or s.recent_trades):
+        return Panel(Text("no episodes or trades yet", style="dim"), title="History")
+    t = Text()
+    if s.recent_episodes:
+        t.append("Episodes", style="bold")
+        for row in s.recent_episodes[:HISTORY_SHOWN]:
+            t.append(f"\n {_hhmm(row.get('opened_at'))} ", style="dim")
+            t.append(f"{row.get('path', '?')}  {_lasted(row)}  peak {row.get('peak_profit_percent') or 0:+.2f}%")
+    if s.recent_trades:
+        if s.recent_episodes:
+            t.append("\n")
+        t.append("Trades", style="bold")
+        for row in s.recent_trades[:HISTORY_SHOWN]:
+            profit = row.get("actual_profit_erg")
+            if profit is None:
+                profit = row.get("expected_profit_erg")
+            status = row.get("status", "?")
+            style = "green" if status == "completed" else ("red" if status == "failed" else "")
+            t.append(f"\n {_hhmm(row.get('started_at'))} ", style="dim")
+            t.append(f"{status}", style=style)
+            path = (row.get("notes") or "").split(";")[0]
+            t.append(f"  {path}  {row.get('input_erg') or 0:g} ERG"
+                     + (f"  {profit:+.4f} ERG" if profit is not None else ""))
+    return Panel(t, title="History")
+
+
+def exchanges_panel(s: DashboardState) -> Panel:
+    """Watch-only CEX books: bid/ask, gap to the oracle, fees (live or default), response time."""
+    t = Table(expand=True, box=None, pad_edge=False)
+    for col, justify in (("exchange", "left"), ("bid", "right"), ("ask", "right"), ("vs oracle", "right"),
+                         ("taker · withdrawal", "left"), ("ms", "right")):
+        t.add_column(col, justify=justify, no_wrap=True, overflow="ellipsis",
+                     ratio=1 if col == "taker · withdrawal" else None)
+    for e in s.exchanges:
+        style = EXCHANGE_STYLE.get(e.state, "")
+        if e.state == "live":
+            t.add_row(e.name, f"{e.bid:.4f}", f"{e.ask:.4f}",
+                      f"{e.vs_oracle_percent:+.2f}%" if e.vs_oracle_percent is not None else "—",
+                      e.fees, f"{e.latency_ms:.0f}" if e.latency_ms is not None else "")
+        else:
+            t.add_row(e.name, "—", "—", "—", Text(f"{e.state}: {e.error}" if e.error else e.state, style=style),
+                      f"{e.latency_ms:.0f}" if e.latency_ms is not None else "", style="dim" if e.state == "disabled" else None)
+    body = Group(t, Text(f"best spread: {s.spread_text}", style="dim")) if s.spread_text else t
+    return Panel(body, title="Exchanges (watch-only, * = fee published by the exchange)")
+
+
 def venues_panel(s: DashboardState) -> Panel:
     if not s.venues:
         return Panel(Text("waiting for the first scan…", style="dim"), title="Venues")
+    split = bool(s.exchanges)        # CEX rows live in the Exchanges panel; these are all on-chain
+    venues = [v for v in s.venues if v.kind != "CEX"] if split else s.venues
     t = Table(expand=True, box=None, pad_edge=False)
-    for col, justify in (("venue", "left"), ("kind", "left"), ("status", "left"), ("quote", "left"),
-                         ("age", "right"), ("ms", "right")):
-        t.add_column(col, justify=justify, no_wrap=True)
-    for v in s.venues:
+    cols = (("venue", "left"), ("status", "left"), ("quote", "left"), ("age", "right"), ("ms", "right"))
+    if not split:
+        cols = cols[:1] + (("kind", "left"),) + cols[1:]
+    for col, justify in cols:
+        t.add_column(col, justify=justify, no_wrap=True, overflow="ellipsis",
+                     ratio=1 if col == "quote" else None)
+    for v in venues:
         symbol, style = VENUE_STYLE.get(v.state, ("?", ""))
         label = "update pending" if v.state == "pending" and v.name == "Oracle" else v.state.replace("watch", "watch only")
         status = Text(f"{symbol} {label}", style=style)
         quote = v.quote if v.state != "down" else (v.error or "no data")
-        t.add_row(v.name, v.kind, status, quote, _age(v.age_s),
-                  f"{v.latency_ms:.0f}" if v.latency_ms is not None else "",
-                  style="dim" if v.state == "disabled" else None)
+        cells = [v.name, status, quote, _age(v.age_s), f"{v.latency_ms:.0f}" if v.latency_ms is not None else ""]
+        if not split:
+            cells.insert(1, v.kind)
+        t.add_row(*cells, style="dim" if v.state == "disabled" else None)
     return Panel(t, title="Venues")
 
 
@@ -168,16 +289,25 @@ def render(s: DashboardState) -> Layout:
     layout = Layout()
     paths_rows = len(s.paths or {}) + 4 + max((len(r.steps) for r in (s.paths or {}).values()
                                                if r.choice and r.choice.ok), default=0)
+    on_chain = [v for v in s.venues if v.kind != "CEX"] if s.exchanges else s.venues
+    bottom_rows = max(len(on_chain), len(s.exchanges) + (2 if s.spread_text else 0)) + 3 if s.venues else 3
+    trend_rows = 1 if rr_trend(s.rr_history, datetime.now().timestamp()) else 0
     layout.split_column(
         Layout(header(s), size=1),
-        Layout(name="top", size=max(7, 6 + min(len(s.live_detail), LIVE_REASONS_SHOWN + 1))),
+        Layout(health_strip(s), size=1),
+        Layout(name="top", size=max(7 + trend_rows, 6 + min(len(s.live_detail), LIVE_REASONS_SHOWN + 1))),
         Layout(paths_panel(s), size=paths_rows),
-        Layout(events_panel(s), minimum_size=4),
-        Layout(venues_panel(s), size=len(s.venues) + 3 if s.venues else 3),
+        Layout(name="middle", minimum_size=4),
+        Layout(name="bottom", size=bottom_rows),
     )
     right = Layout()
     right.split_column(Layout(live_panel(s), ratio=3), Layout(wallet_panel(s), size=3))
     layout["top"].split_row(Layout(prices_panel(s)), right)
+    layout["middle"].split_row(Layout(events_panel(s), ratio=3), Layout(history_panel(s), ratio=2))
+    if s.exchanges:
+        layout["bottom"].split_row(Layout(venues_panel(s), ratio=2), Layout(exchanges_panel(s), ratio=3))
+    else:
+        layout["bottom"].update(venues_panel(s))
     return layout
 
 

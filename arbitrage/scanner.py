@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 import logging
 import os
@@ -33,7 +34,7 @@ from ergo.arb_runner import ArbResult, run_arb
 from ergo.chain_state import ChainSnapshot, prices_from_snapshot, read_snapshot
 from arbitrage.optimizer import maximize
 from arbitrage.sizing import Market, SizeChoice, best_size
-from arbitrage.dashboard_state import PATH_LABELS, DashboardState
+from arbitrage.dashboard_state import PATH_LABELS, DashboardState, ExchangeRow
 from arbitrage.venues import VenueContext, describe_all
 from arbitrage.calculator import (
     ArbitrageCalculator,
@@ -44,7 +45,7 @@ from arbitrage.calculator import (
 )
 from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
-from exchanges.cex_public import CexQuote, FeeBook, best_spread, fetch_all_quotes
+from exchanges.cex_public import VENUES as CEX_VENUES, CexQuote, FeeBook, best_spread, fetch_all_quotes
 from notifications import embeds
 from notifications.digest import build_digest, digest_due, mark_digest_sent
 from notifications.episodes import EpisodeTracker
@@ -54,6 +55,7 @@ from logging_config import console
 
 MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
 CEX_FEE_REFRESH_SECONDS = 3600            # how often published CEX fees are re-read
+HISTORY_ROWS = 5                          # episodes and trades shown in the History panel
 CEX_STALE_SECONDS = 60                    # a CEX snapshot older than this is shown as stale, not used
 CEX_FIRST_WAIT_SECONDS = 10               # the first scan waits this long for the first CEX snapshot
 EPISODE_HEARTBEAT_S = 60                 # how often an open episode's last-seen time is saved
@@ -112,6 +114,7 @@ class ArbitrageScanner:
         self._cex_quotes: dict = {}               # latest CEX books, filled by the background feed
         self._cex_ready: Optional[asyncio.Event] = None
         self._cex_task: Optional[asyncio.Task] = None
+        self._last_full_scan_ms: Optional[float] = None
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
         self._chain_prices: Optional[dict] = None           # its price entries
         self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
@@ -1910,6 +1913,7 @@ class ArbitrageScanner:
         self.out.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
 
         prices = await self.fetch_all_prices()
+        self._record_dashboard_history(prices)
         outage = self._chain_error is not None
         if outage:  # prices below are the last good state: show them, but do not log or alert on them
             self.out.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
@@ -1985,14 +1989,60 @@ class ArbitrageScanner:
         The dashboard state is refreshed exactly once per tick (also when the tick fails)."""
         self._now = now
         full = now - self._last_full_scan >= config.SCAN_INTERVAL_SECONDS
+        started = time.perf_counter()
         try:
             await self._poll(now)
         finally:
+            if full:
+                self._last_full_scan_ms = (time.perf_counter() - started) * 1000
             self._refresh_state(now)
             self._discord_tick(now)
         if full and self.view == "json":
             sys.stdout.write(json.dumps(self.state.to_json(), default=str) + "\n")
             sys.stdout.flush()
+
+    def _record_dashboard_history(self, prices: dict):
+        """Once per full scan: a reserve-ratio sample for the trend, and the latest episodes/trades."""
+        try:
+            rr = (prices.get("bank") or {}).get("reserve_ratio")
+            if rr is not None and math.isfinite(rr) and not self._chain_error:
+                self.state.rr_history.append((time.time(), rr))
+            self.state.recent_episodes = self.tracker.recent_chain_episodes(HISTORY_ROWS)
+            self.state.recent_trades = self.tracker.recent_trades(HISTORY_ROWS)
+        except Exception as e:  # dashboard extras only
+            logger.debug(f"dashboard history refresh failed: {e}")
+
+    def _refresh_exchanges_and_health(self, s):
+        """Exchanges panel rows, the best spread and the health strip, from the last full scan's data."""
+        last = self._last_prices or {}
+        cex = last.get("cex") or {}
+        oracle = ((self._chain_prices or {}).get("bank") or {}).get("oracle_erg_usd")
+        rows = []
+        if self.enable_cex or self.cex_watch:
+            for name in CEX_VENUES:
+                q = cex.get(name)
+                if q is None:
+                    continue
+                fees = self.cex_fees.get(name).compact()
+                if q.book is not None:
+                    mid = (q.bid + q.ask) / 2
+                    rows.append(ExchangeRow(name, "live", q.bid, q.ask,
+                                            (mid / oracle - 1) * 100 if oracle else None, fees, q.latency_ms))
+                else:
+                    disabled = (q.error or "").startswith("disabled")
+                    rows.append(ExchangeRow(name, "disabled" if disabled else "down", fees=fees,
+                                            latency_ms=q.latency_ms,
+                                            error=(q.error or "").split(": ", 1)[-1] if disabled else (q.error or "")))
+        s.exchanges = rows
+        spread = self._cex_spread(last) if cex else None
+        s.spread_text = self._spread_text(spread) if spread is not None else None
+        chain_ts = self._price_timestamps.get("spectrum")
+        s.health = {
+            "full_scan_ms": self._last_full_scan_ms,
+            "discord_queue": len(self.discord._jobs) if self.discord_enabled else None,
+            "data_age_s": time.time() - chain_ts if chain_ts else None,
+            "cex_ms": {n: q.latency_ms for n, q in cex.items() if q.latency_ms is not None},
+        }
 
     def _refresh_state(self, now: float):
         """Fill self.state (what the dashboard and --json show) from the scanner's current view."""
@@ -2006,6 +2056,10 @@ class ArbitrageScanner:
         s.next_full_scan_in = max(0.0, config.SCAN_INTERVAL_SECONDS - (now - self._last_full_scan))
         s.prices = prices
         s.mint_text = mint_gate_text(prices.get("bank"), config.MINT_GATE_MIN_ROOM_ERG)
+        try:
+            self._refresh_exchanges_and_health(s)
+        except Exception as e:  # the extra panels must never break the dashboard refresh
+            logger.debug(f"exchange/health refresh failed: {e}")
         s.update_venues(describe_all(VenueContext(
             prices={**self._last_prices, **prices}, timestamps=self._price_timestamps, now=time.time(),
             chain_error=self._chain_error, pending=snap.pending if snap else frozenset(), read_ms=s.read_ms,

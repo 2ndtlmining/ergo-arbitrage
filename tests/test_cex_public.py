@@ -199,3 +199,4 @@ def test_fee_book_records_which_fees_are_published():
     run(book.refresh(FakeSession({"currency_pairs/ERG_USDT": FakeResp(200, GATE_PAIR)}), names=("Gate",)))
     gate = book.get("Gate")
     assert gate.live_fields == ("taker",) and gate.describe() == "taker 0.20% (live), withdrawal 0.403 ERG (default)"
+    assert gate.compact() == "0.20%* · 0.403 ERG"
