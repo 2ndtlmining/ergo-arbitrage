@@ -261,7 +261,6 @@ captcha page, shown as "blocked by Cloudflare".
 ```env
 GATE_TRADING_FEE=0.002        GATE_ERG_WITHDRAW_FEE=0.403
 MEXC_TRADING_FEE=0.0008       MEXC_ERG_WITHDRAW_FEE=0.1
-KUCOIN_ERG_WITHDRAW_FEE=2.0   NONKYC_ERG_WITHDRAW_FEE=3.1      # fallbacks; read live when published
 SAFETRADE_ENABLED=false       SAFETRADE_TRADING_FEE=0.002      # SAFETRADE_ERG_WITHDRAW_FEE=
 CEX_USDT_TRANSFER_FEE=1.0     TRADE_SIZES_UNFUNDED=false
 ```
@@ -269,90 +268,197 @@ CEX_USDT_TRANSFER_FEE=1.0     TRADE_SIZES_UNFUNDED=false
 The analysis grid (`TRADE_SIZES`) only prices sizes your wallet can fund, plus that funded size
 itself; `TRADE_SIZES_UNFUNDED=true` prices the whole grid again (marked `*` above `MAX_TRADE_SIZE_ERG`).
 
-## Setup
+## Getting started
 
-### Prerequisites
+From a fresh Ubuntu machine to a bot that watches the chain and posts to Discord. Every block is
+copy-paste; run them in order.
 
-- Python 3.11+ (CI tests 3.11 and 3.12)
-- An Ergo node with a wallet (can be on a local VM), and its API key
-- (Optional) a Discord webhook URL for notifications
-- (Optional) NonKYC / Kucoin API keys. The bot is on-chain only by default (`ENABLE_CEX=false`);
-  the CEX prices are shown watch-only and need no keys.
-
-### Installation
-
-Use a virtual environment (venv). Recent Ubuntu/Debian versions refuse a system-wide
-`pip install`, and a venv keeps the bot's packages separate from everything else. You create it
-once.
-
-**Linux** (on Ubuntu the command is `python3`; inside the venv it is plain `python`):
+### 1. Install
 
 ```bash
+sudo apt update && sudo apt install -y git python3-venv
+cd ~
+git clone https://github.com/2ndtlmining/ergo-arbitrage.git
 cd ergo-arbitrage
-sudo apt install python3-venv        # only if the next line says venv is missing
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python3 --version
 ```
 
-**Windows** (PowerShell):
+The bot needs **Python 3.11 or newer** (tested on 3.11 and 3.12). Ubuntu 24.04 ships 3.12: go on
+to the venv. **Ubuntu 22.04 ships 3.10**; install 3.11 next to it (the system Python stays as it is)
+and use `python3.11` instead of `python3` in the next block:
+
+```bash
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update && sudo apt install -y python3.11 python3.11-venv
+```
+
+Create the virtual environment (venv) once. It keeps the bot's packages separate; recent Ubuntu
+refuses a system-wide `pip install`.
+
+```bash
+python3 -m venv .venv              # 22.04: python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Inside the venv the command is plain `python`. Either activate it in every new terminal
+(`source .venv/bin/activate`) or call `.venv/bin/python` directly, as the examples below do. An
+alias saves typing (adjust the folder if you cloned elsewhere):
+
+```bash
+echo "alias arb='cd ~/ergo-arbitrage && .venv/bin/python main.py'" >> ~/.bashrc && source ~/.bashrc
+# then: arb --notify
+```
+
+**Windows** (PowerShell), for development:
 
 ```powershell
+git clone https://github.com/2ndtlmining/ergo-arbitrage.git
 cd ergo-arbitrage
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main.py --once --plain
 ```
 
-In every new terminal, activate the venv again (`source .venv/bin/activate`) before running the
-bot, or skip activation and call the venv's Python directly: `.venv/bin/python main.py --notify`
-(Windows: `.venv\Scripts\python main.py --notify`). A shell alias saves typing:
+### 2. Node setup
+
+The bot reads prices from your own Ergo node and signs with its wallet. The node needs:
+
+| | Why | Scala node (`ergo.conf`) | Rust node (`ergo-node.toml`) |
+|---|---|---|---|
+| Extra index | finds the pool, bank and oracle boxes (`/blockchain/*`) | `ergo.node.extraIndex = true` | `[indexer] enabled = true` |
+| API key | wallet, signing | `scorex.restApi.apiKeyHash` | `[api.security] api_key_hash` |
+| Reachable REST API | the bot's only data source | `scorex.restApi.bindAddress` | `[api] bind` (+ `public_bind`) |
+| Wallet restored and unlocked | signs the trades (`--live`, `arb.py`) | `/wallet/restore`, `/wallet/unlock` | same routes |
+
+The extra index needs a full archival node (the default for both) and builds once, in the
+background, after it is switched on. Until it is ready `arb.py doctor` reports "chain state" as failed.
+
+**API key.** Pick a random secret and hash it. The secret goes in the bot's `.env`; only the hash
+goes in the node config.
 
 ```bash
-alias arb='cd ~/ergo-arbitrage && .venv/bin/python main.py'   # in ~/.bashrc, then: arb --notify
+secret=$(openssl rand -hex 32)
+echo "ERGO_NODE_API_KEY=$secret"                       # for .env (step 3); keep it safe
+printf '%s' "$secret" | b2sum -l 256 | cut -d' ' -f1   # the hash, for the node config
 ```
+
+(A running Scala node can also hash it: `curl -s -X POST http://127.0.0.1:9053/utils/hash/blake2b -H "Content-Type: application/json" -d "\"$secret\""`.)
+
+**Same machine or LAN.** If the bot runs on the node's machine, leave the API on `127.0.0.1` and
+use `ERGO_NODE_URL=http://127.0.0.1:9053`. If the node is another machine in your LAN, bind the API
+to that machine's LAN address and let only the bot's machine in. **Never port-forward the API port to
+the internet:** the API key travels in plain HTTP, and the Rust node's transaction submission needs
+no key at all. On the node machine, with `192.168.40.50` standing in for the bot's IP:
+
+```bash
+sudo ufw allow OpenSSH       # first, or enabling the firewall locks out your SSH session
+sudo ufw allow from 192.168.40.50 to any port 9053 proto tcp
+sudo ufw allow 9030/tcp      # peer-to-peer port, so the node can sync
+sudo ufw enable
+```
+
+**Scala node**, in `ergo.conf` (merge into the sections you already have):
+
+```hocon
+ergo {
+  node {
+    extraIndex = true
+  }
+}
+scorex {
+  restApi {
+    bindAddress = "0.0.0.0:9053"     # LAN; keep "127.0.0.1:9053" when the bot runs on this machine
+    apiKeyHash = "<the hash from above>"
+  }
+}
+```
+
+**Rust node** ([arkadianet/ergo](https://github.com/arkadianet/ergo)), in its `ergo-node.toml`. Its
+API defaults to port **9099**; the lines below keep the Scala port so the URL stays the same.
+Check its `docs/configuration.md` for your version: its configuration may change before 1.0.
+
+```toml
+[indexer]
+enabled = true
+
+[api]
+bind = "192.168.40.86:9053"   # the node's LAN address; "127.0.0.1:9053" when the bot runs on this machine
+public_bind = true            # required for any non-loopback bind; leave it out on 127.0.0.1
+
+[api.security]
+api_key_hash = "<the hash from above>"   # 64 lowercase hex characters
+```
+
+The bot handles the one API difference it meets (the Rust node's mempool lookup by token is a POST)
+by itself.
+
+**Wallet.** Restore the wallet the bot trades with on the node, once. Use the node's web UI
+(Scala: `http://<node>:9053/panel`; Rust: the dashboard at `http://<node>:<port>/`, Wallet), or the
+API (the leading space keeps the mnemonic out of your shell history in most shells):
+
+```bash
+ curl -s -X POST http://127.0.0.1:9053/wallet/restore -H "api_key: $secret" -H "Content-Type: application/json" \
+   -d '{"pass": "<wallet password>", "mnemonic": "<your words>", "mnemonicPass": ""}'
+```
+
+The node then scans the chain for the wallet's boxes; balances may be missing until it finishes. The
+wallet is **locked again after every node restart**; unlock it each time:
+
+```bash
+ curl -s -X POST http://127.0.0.1:9053/wallet/unlock -H "api_key: $secret" -H "Content-Type: application/json" \
+   -d '{"pass": "<wallet password>"}'
+```
+
+Use a dedicated wallet holding only what the bot may trade.
+
+### 3. Configure
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+The minimum for `--notify`:
+
+```env
+ERGO_NODE_URL=http://192.168.40.86:9053    # or http://127.0.0.1:9053 on the node's machine
+ERGO_NODE_API_KEY=<the secret from step 2>
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+DISCORD_USER_ID=<your numeric Discord user id>   # optional: @mentions for the important alerts
+```
+
+Everything else has a sensible default; see the [settings reference](#settings-reference). Check
+what the bot will use (secrets masked, typos and leftover placeholders flagged):
+
+```bash
+.venv/bin/python arb.py config
+```
+
+### 4. First launch
+
+```bash
+.venv/bin/python arb.py doctor            # settings, Discord webhook, node, wallet, index, mempool, sign check
+.venv/bin/python main.py --once --plain   # one full scan, printed
+.venv/bin/python main.py --notify         # the dashboard + Discord; Ctrl+C stops it
+```
+
+`arb.py doctor` prints one line per check, each failure with a hint; fix them top to bottom. Its last
+check signs a 1 ERG trade and has the node validate it, without broadcasting it. When everything is
+OK, `--notify` is safe to leave running: it never spends anything. Before `--live`, read
+**Live mode** and **First live run** below.
 
 ### Updating
 
 ```bash
 # stop the bot first (Ctrl+C), then:
+cd ~/ergo-arbitrage
 git pull
-pip install -r requirements.txt      # inside the venv; only needed when requirements.txt changed
+.venv/bin/pip install -r requirements.txt   # only needed when requirements.txt changed
+.venv/bin/python arb.py config              # new settings appear with their defaults
 ```
 
 The tracker database (`arbitrage_tracker.db`) is not in git and is upgraded in place on start.
-
-### Configuration
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your credentials:
-
-```env
-# Ergo Node (your VM)
-ERGO_NODE_URL=http://YOUR_NODE_IP:9053
-ERGO_NODE_API_KEY=your_api_key
-
-# NonKYC Exchange
-NONKYC_API_KEY=your_api_key
-NONKYC_API_SECRET=your_api_secret
-
-# Kucoin Exchange
-KUCOIN_API_KEY=your_api_key
-KUCOIN_API_SECRET=your_api_secret
-KUCOIN_API_PASSPHRASE=your_passphrase
-
-# Discord Notifications (optional)
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-DISCORD_USER_ID=your_discord_user_id
-
-# Arbitrage Settings
-MIN_PROFIT_PERCENT=0.5
-MAX_TRADE_SIZE_ERG=100
-SCAN_INTERVAL_SECONDS=15
-```
 
 ### Running
 
@@ -365,6 +471,122 @@ python main.py --once --plain   # one scan, classic output
 # Run tests (unit only; add -m live for the tests that call your node and public APIs)
 python -m pytest -q
 ```
+
+## Settings reference
+
+Settings live in `.env` in the bot folder (environment variables of the same name win). A blank
+value, or one still holding a `your_..._here` placeholder, uses the default. `python arb.py config`
+lists every setting with its value and source. Times are in seconds, amounts in ERG unless noted.
+
+**Node**
+
+| Setting | Default | Effect |
+|---|---|---|
+| `ERGO_NODE_URL` | `http://127.0.0.1:9053` | Your node's REST API. |
+| `ERGO_NODE_API_KEY` | (none) | Plain secret whose hash is the node's API key hash. Needed for the wallet, signing and `--live`. |
+| `ERGO_EXPLORER_API_URL` | `https://api.ergoplatform.com/api/v1` | Public explorer, the fallback when the node's extra index cannot find a box. |
+| `CHAIN_POLL_SECONDS` | `2` | How often the node is polled for pool, bank, oracle and mempool changes. |
+| `CHAIN_STALL_SECONDS` | `1200` | No new block for this long = node stalled: nothing trades and a health alert fires. |
+
+**Venues**
+
+| Setting | Default | Effect |
+|---|---|---|
+| `ENABLE_CEX` | `false` | Price the CEX paths with your exchange API keys (they never auto-trade). |
+| `ENABLE_USE` | `false` | Price the USE (Dexy) paths. Off: the USE LP was drained. |
+| `POOL_SWAP_ROUTE` | `direct` | SigUSD pool legs: `direct` (own pool swap, miner fee only) or `crux` (Crux API, ~0.785 ERG per leg). |
+| `USE_TOKEN_ID` | current USE token | Set after the expected USE token migration. |
+| `DEXY_USE_LP_NFT` | current USE LP | Set after the expected USE token migration. |
+| `EXTRA_SERVICE_FEE_ERGO_TREES` | (none) | Extra service-fee ErgoTrees (comma separated) the transaction guard lets a third-party-built TX pay. |
+| `NONKYC_API_KEY`, `NONKYC_API_SECRET` | (none) | NonKYC keys, only read with `ENABLE_CEX=true`. |
+| `KUCOIN_API_KEY`, `KUCOIN_API_SECRET`, `KUCOIN_API_PASSPHRASE` | (none) | Kucoin keys, only read with `ENABLE_CEX=true`. |
+
+**Sizing and profit**
+
+| Setting | Default | Effect |
+|---|---|---|
+| `MIN_PROFIT_PERCENT` | `0.5` | A path below this is not an opportunity (and `--live` does not trade it). |
+| `MAX_TRADE_SIZE_ERG` | `100` | Hard cap on anything executed. `main.py --max-trade-erg X` overrides it for one run. |
+| `TRADE_SIZES` | `10,100,200,500,1000` | Sizes the analysis grid prices. Sizes above `MAX_TRADE_SIZE_ERG` are analysis only. |
+| `TRADE_SIZES_UNFUNDED` | `false` | `true` prices the whole grid, not only the sizes the wallet can fund. |
+| `MIN_TRADE_SIZE_ERG` | `1` | Smallest size the best-size search and the doctor's sign check use. |
+| `SIZE_PROFIT_CAPTURE` | `0.95` | Trade the smallest size that earns this share of the best profit; `1.0` = maximise profit. |
+| `SLIPPAGE_TOLERANCE` | `0.01` | Slippage allowed on legs without known depth. |
+| `EXECUTION_BUFFER` | `0.003` | Margin for the pool moving between quote and inclusion. |
+| `MAX_FEE_BUDGET_ERG` | `1.0` | Most service + miner fees the transaction guard allows per signed TX. |
+| `SCAN_INTERVAL_SECONDS` | `15` | Seconds between full scans. `main.py --interval N` overrides it. |
+| `PRICE_STALE_SECONDS` | `60` | A price older than this keeps a path out of the scan-based alerts. |
+
+**Live** (`main.py --live`)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `LIVE_CONFIRM_POLLS` | `2` | Chain polls in a row a path must stay profitable before it trades. |
+| `LIVE_TRADE_COOLDOWN_SECONDS` | `300` | Pause after each trade. |
+| `LIVE_MAX_TRADES_PER_DAY` | `10` | Trades per day before live mode stops for the day. |
+| `LIVE_MAX_DRAWDOWN_ERG` | `5` | Live mode pauses if the wallet value falls this much. |
+| `LIVE_ERG_RESERVE` | `1` | ERG always left in the wallet. |
+| `LIVE_STOP_FILE` | `STOP` | Kill switch: while this file exists nothing trades (relative = in the bot folder). |
+| `LEG2_WATCH_TIMEOUT_SECONDS` | `1200` | How long leg 2 (bank redeem) is followed until confirmed. |
+| `LEG2_WATCH_INTERVAL_SECONDS` | `20` | How often it is checked. |
+| `LEG2_MAX_REBUILDS` | `5` | Times leg 2 is rebuilt on fresh boxes if it drops from the mempool. |
+
+**Discord** (see [Discord Notifications](#discord-notifications))
+
+| Setting | Default | Effect |
+|---|---|---|
+| `DISCORD_WEBHOOK_URL` | (none) | Webhook for `--notify` / `--live`. Blank = no Discord. |
+| `DISCORD_USER_ID` | (none) | Your numeric user id for @mentions. Blank = no pings. |
+| `DISCORD_MIN_PROFIT_PERCENT` | `1.0` | Smallest profit % that posts. |
+| `DISCORD_MIN_PROFIT_ERG` | `0.5` | Smallest profit in ERG that posts (both minimums must be met). |
+| `DISCORD_TIER1_PROFIT_PERCENT` | `2.0` | At or above this the message pings you. |
+| `DISCORD_CONFIRM_SECONDS` | `10` | An on-chain opportunity must hold this long before its message opens. |
+| `DISCORD_CLOSE_SECONDS` | `10` | Gone this long before its message closes. |
+| `DISCORD_EDIT_SECONDS` | `30` | At most one edit of an open message per this. |
+| `DISCORD_HEALTH_CHAIN_SECONDS` | `120` | Chain unreadable this long: alert (ping). |
+| `DISCORD_HEALTH_VENUE_SECONDS` | `300` | An exchange down this long: alert. |
+| `DISCORD_HEALTH_ORACLE_SECONDS` | `600` | Oracle update pending this long: alert. |
+| `DISCORD_HEALTH_REPEAT_SECONDS` | `1800` | A failure that continues is re-alerted this often. |
+| `DISCORD_DIGEST_HOUR` | `8` | Local hour of the daily digest; `-1` = off. |
+| `DISCORD_CONFIRM_SCANS` | `3` | Scan-based alerts (CEX/USE paths): scans in a row before posting. |
+| `DISCORD_COOLDOWN_SECONDS` | `300` | Scan-based alerts: per-path cooldown. |
+| `DISCORD_WALLET_COOLDOWN_SECONDS` | `600` | Wallet analysis at most this often. |
+| `DISCORD_SUMMARY_INTERVAL_SECONDS` | `1800` | The text summary of all paths. |
+
+**Bank mint gate**
+
+| Setting | Default | Effect |
+|---|---|---|
+| `MINT_GATE_CONFIRM_POLLS` | `3` | Agreeing polls before a mint open/close alert. |
+| `MINT_GATE_MIN_ROOM_ERG` | `MIN_TRADE_SIZE_ERG` | Less mint room than this counts as closed. |
+| `MINT_GATE_PING_COOLDOWN_SECONDS` | `3600` | At most one mint-open ping per this. |
+| `MINT_GATE_CLOSE_SECONDS` | `600` | Minting shut this long before the message says closed. |
+
+**CEX watch** (see [CEX prices](#cex-prices-watch-only)). Kucoin's and NonKYC's fees are read from
+the exchanges and are not settings.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `CEX_WATCH` | `true` | Read public exchange prices (no keys); never trades. |
+| `CEX_WATCH_ALERT_PERCENT` | `3.0` | Gap to the pool that posts a watch message. |
+| `CEX_WATCH_COOLDOWN_SECONDS` | `3600` | At most one watch message per this. |
+| `GATE_TRADING_FEE` | `0.002` | Fallback until Gate's taker fee is read. |
+| `GATE_ERG_WITHDRAW_FEE` | `0.403` | Gate's ERG withdrawal fee (not public; check on Gate). |
+| `MEXC_TRADING_FEE` | `0.0008` | Fallback until MEXC's taker fee is read. |
+| `MEXC_ERG_WITHDRAW_FEE` | `0.1` | MEXC's ERG withdrawal fee (not public; check on MEXC). |
+| `SAFETRADE_ENABLED` | `false` | Try SafeTrade (often blocked by Cloudflare). |
+| `SAFETRADE_TRADING_FEE` | `0.002` | SafeTrade taker fee. |
+| `SAFETRADE_ERG_WITHDRAW_FEE` | (read from SafeTrade) | Override SafeTrade's withdrawal fee. |
+| `CEX_USDT_TRANSFER_FEE` | `1.0` | USDT cost of moving the proceeds back after a cross-exchange round. |
+
+**Housekeeping**
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SCAN_RESULTS_RETENTION_DAYS` | `14` | Non-profitable scan rows older than this are deleted at startup. |
+
+Command-line flags of `main.py` (`--interval`, `--max-trade-erg`, `--db`, ...) are in the table
+under [Modes](#modes).
 
 ## Project Structure
 
@@ -422,14 +644,21 @@ python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the gua
 python arb.py arb    --check                            # two-leg pool buy -> bank redeem at the best size
 python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint -> pool sell
 python arb.py doctor                                    # is the node ready for the bot? (see below)
+python arb.py config                                    # settings in use and mistakes in .env
 ```
 
-**`arb.py doctor`** checks everything the bot needs from your node, one line each (OK / WARN / FAIL
-with a hint / SKIP): reachable and synced, API key accepted, wallet restored and unlocked, wallet
+**`arb.py doctor`** first warns about `.env` mistakes and checks the Discord webhook (a GET that shows
+its name and posts nothing). Then it checks everything the bot needs from your node, one line each
+(OK / WARN / FAIL with a hint / SKIP): reachable and synced, API key accepted, wallet restored and unlocked, wallet
 boxes, the pool/bank/oracle boxes through the extra index, the mempool lookup (the GET form on the
 Scala node, the POST form on the Rust node `arkadianet/ergo`), and finally a 1 ERG pool buy -> bank
 redeem that the node signs and validates but that is **never broadcast** (`--no-sign` skips it).
-It exits with 1 when anything fails. Run it after switching or upgrading the node.
+It exits with 1 when a node check fails. Run it after switching or upgrading the node.
+
+**`arb.py config`** lists every setting with the value in use and where it comes from (`.env`,
+environment or default), secrets masked, and flags keys the bot does not read (with the closest real
+name, e.g. `DISCORD_WEBHOOK` -> `DISCORD_WEBHOOK_URL?`), values still holding a `.env.example`
+placeholder (ignored) and renamed settings. It needs no node.
 
 **Trade size.** `arb.py arb` (without `--erg`, or `--erg best`) and live mode size the trade
 on the exact pool, bank and oracle boxes the transactions will spend (`arbitrage/sizing.py`,
