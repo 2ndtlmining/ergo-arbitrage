@@ -32,7 +32,9 @@ logger = logging.getLogger("ergo_arb.chain_state")
 # the Rust node (arkadianet/ergo) only has POST /transactions/unconfirmed/byTokenId (body: the token id as a
 # JSON string, answer: pool transactions). None = not known yet; True once the GET form answered 404.
 _MEMPOOL_BY_TOKEN_POST = None
+NOT_SUPPORTED = (400, 404)   # "this node has no such endpoint" (older Scala nodes answer 400); 5xx fails closed
 PENDING_OK = frozenset({config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT})  # spent as inputs
+POLL_EXPLORER_TIMEOUT = aiohttp.ClientTimeout(total=5)
 _BOX_IDS: dict[str, str] = {}  # NFT -> last confirmed box id (saves an index/explorer lookup per poll)
 CONTRACTS = (("pool", config.SPECTRUM_SIGUSD_POOL_NFT), ("bank", config.SIGMAUSD_BANK_NFT),
              ("oracle", config.SIGMAUSD_ORACLE_NFT))
@@ -49,19 +51,23 @@ async def _mempool_outputs_by_token(ns, nft: str) -> list[dict]:
     global _MEMPOOL_BY_TOKEN_POST
     if not _MEMPOOL_BY_TOKEN_POST:
         status, outputs = await _get(ns, f"/transactions/unconfirmed/outputs/byTokenId/{nft}")
-        if status != 404:
+        if status not in NOT_SUPPORTED:
             _MEMPOOL_BY_TOKEN_POST = False
-            return outputs or [] if status == 200 else []
+            if status != 200:   # an error is not "nothing pending": fail closed
+                raise RuntimeError(f"mempool lookup failed: HTTP {status}")
+            return outputs or []
         if _MEMPOOL_BY_TOKEN_POST is None:
             logger.info("Node has no GET /transactions/unconfirmed/outputs/byTokenId; "
                         "using POST /transactions/unconfirmed/byTokenId (Rust node API)")
         _MEMPOOL_BY_TOKEN_POST = True
     async with ns.post(f"{config.ERGO_NODE_URL}/transactions/unconfirmed/byTokenId", data=json.dumps(nft),
                        headers={"Content-Type": "application/json"}, timeout=CHAIN_TIMEOUT) as r:
-        if r.status == 404:            # neither form here: try the GET form again next time
+        if r.status in NOT_SUPPORTED:  # neither form here: try the GET form again next time
             _MEMPOOL_BY_TOKEN_POST = None
             return []
-        txs = await r.json() if r.status == 200 else []
+        if r.status != 200:    # an error is not "nothing pending": fail closed
+            raise RuntimeError(f"mempool lookup failed: HTTP {r.status}")
+        txs = await r.json()
     return [o for tx in txs or [] for o in tx.get("outputs", [])
             if any(a.get("tokenId") == nft for a in o.get("assets", []))]
 
@@ -118,7 +124,8 @@ async def _confirmed(ns, nft: str, explorer, read) -> dict:
             return await read(ns, cached)
         except RuntimeError:
             _BOX_IDS.pop(nft, None)  # spent: look the new one up
-    box_id = await find_box_id(nft, ns, explorer)
+    # one quick explorer attempt here: this runs on the 2 s poll, and the explorer backs off on its own
+    box_id = await find_box_id(nft, ns, explorer, attempts=1, timeout=POLL_EXPLORER_TIMEOUT)
     b = await read(ns, box_id)
     _BOX_IDS[nft] = box_id
     return b
@@ -138,11 +145,30 @@ class ChainSnapshot:
         return self.pool["boxId"], self.bank["boxId"], self.oracle["boxId"]
 
 
+MAX_HEADER_LAG = 3                       # blocks between headersHeight and fullHeight still counted as synced
+_TIP = {"height": None, "since": None}   # last block height seen and when it first appeared (monotonic)
+
+
 async def _height(ns) -> int:
+    """The node's block height, refusing (RuntimeError) a node that is syncing, stalled or on another
+    network: its boxes would be old, and the bot must not price, alert or trade on them."""
     status, info = await _get(ns, "/info")
     if status != 200 or not info:
         raise RuntimeError(f"node /info returned HTTP {status}")
-    return int(info.get("fullHeight") or 0)
+    network = str(info.get("network") or "").lower()
+    if "test" in network or "dev" in network:   # only clearly-not-mainnet names; spellings of mainnet vary
+        raise RuntimeError(f"node is on {info.get('network')}, not mainnet")
+    height = int(info.get("fullHeight") or 0)
+    headers = info.get("headersHeight")
+    if headers is not None and int(headers) - height >= MAX_HEADER_LAG:
+        raise RuntimeError(f"node syncing: {int(headers) - height} blocks behind (height {height}, headers {headers})")
+    now = time.monotonic()
+    if height != _TIP["height"]:
+        _TIP["height"], _TIP["since"] = height, now
+    elif now - _TIP["since"] > config.CHAIN_STALL_SECONDS:
+        raise RuntimeError(f"no new block for {(now - _TIP['since']) / 60:.0f} min at height {height} "
+                           f"(node stalled or without peers?)")
+    return height
 
 
 async def read_snapshot(ns, explorer=None) -> ChainSnapshot:

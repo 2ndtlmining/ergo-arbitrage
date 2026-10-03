@@ -1,7 +1,17 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+REPO_DIR = Path(__file__).resolve().parent
+load_dotenv(REPO_DIR / ".env")
+
+
+def repo_path(path) -> Path:
+    """A relative path resolved against the bot's folder (not the directory it was started from)."""
+    p = Path(path)
+    return p if p.is_absolute() else REPO_DIR / p
+
 
 
 # Ergo Node
@@ -193,7 +203,8 @@ LIVE_TRADE_COOLDOWN_SECONDS = int(os.getenv("LIVE_TRADE_COOLDOWN_SECONDS", "300"
 LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
 LIVE_MAX_DRAWDOWN_ERG = float(os.getenv("LIVE_MAX_DRAWDOWN_ERG", "5"))     # stop if wallet value falls this much
 LIVE_ERG_RESERVE = float(os.getenv("LIVE_ERG_RESERVE", "1"))               # ERG always kept in the wallet
-LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "STOP")                      # kill switch: no trades while it exists
+LIVE_STOP_FILE = os.getenv("LIVE_STOP_FILE", "STOP")                      # kill switch: no trades while it exists (relative = in the bot folder)
+CHAIN_STALL_SECONDS = float(os.getenv("CHAIN_STALL_SECONDS", "1200"))       # no new block for this long = node stalled
 # Leg 2 (bank redeem) is watched until confirmed; if a bank/oracle box update drops it from the
 # mempool it is rebuilt on fresh boxes and resubmitted (it spends leg 1's output, which stays ours).
 LEG2_WATCH_TIMEOUT_SECONDS = int(os.getenv("LEG2_WATCH_TIMEOUT_SECONDS", "1200"))

@@ -1,5 +1,6 @@
 import logging
 import logging.handlers
+from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.theme import Theme
@@ -50,7 +51,7 @@ class EventLogHandler(logging.Handler):
 
 
 def setup_logging(log_level: str = "INFO", console_handler: bool = True,
-                  log_path: str = "arbitrage.log") -> logging.Logger:
+                  log_path: str = str(Path(__file__).resolve().parent / "arbitrage.log")) -> logging.Logger:
     """File log rotated at midnight (14 days kept) + optional rich console log. Safe to call twice."""
     root_logger = logging.getLogger("ergo_arb")
     for h in list(root_logger.handlers):

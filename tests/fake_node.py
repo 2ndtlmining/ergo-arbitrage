@@ -36,6 +36,18 @@ class FakeSession:
                 return _Resp(*result)
         return _Resp(404, {"error": 404})
 
+    def post(self, url, data=None, json=None, headers=None, timeout=None, **kw):
+        """POST routes are keyed "POST <suffix>"; unknown ones answer 404 (endpoint not on this node)."""
+        self.calls.append("POST " + url)
+        for suffix, result in self.routes.items():
+            if suffix.startswith("POST ") and url.endswith(suffix[5:]):
+                if isinstance(result, Seq):
+                    result = result.next()
+                if isinstance(result, BaseException):
+                    raise result
+                return _Resp(*result)
+        return _Resp(404, {"error": 404})
+
 
 class Seq:
     """A route answering with each (status, body) in turn; the last one repeats."""

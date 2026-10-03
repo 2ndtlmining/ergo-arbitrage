@@ -496,7 +496,7 @@ wallet; SigUSD sells and redeems are capped by the amount you ask for.
 3. **Start small and watch.** `python main.py --live --max-trade-erg 5`. A trade only happens when
    a path shows **GO** for `LIVE_CONFIRM_POLLS` polls; until then the Live panel lists why it is not
    trading. Every trade, success or failure, is sent to Discord with a ping.
-4. **Kill switch.** Create a file named `STOP` in the bot folder (`touch STOP`, or
+4. **Kill switch.** Create a file named `STOP` in the bot folder, the folder with `main.py`, wherever the bot was started from; the path is logged at startup (`touch STOP`, or
    `New-Item STOP` on Windows) and no new trade starts; delete it to resume. Ctrl+C stops the bot.
 5. **If leg 2 fails**, you hold SigUSD and live trading pauses. The Discord message and the Live
    panel give the exact command to finish (`python arb.py redeem --sigusd ... --execute`).
