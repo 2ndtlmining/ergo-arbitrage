@@ -17,7 +17,7 @@ from ergo import chain_state
 from ergo.arb_runner import run_arb
 from ergo.chain import wallet_context
 from ergo.chain_state import prices_from_snapshot, read_snapshot
-from exchanges.ergo_node import MAX_HEADER_LAG
+from exchanges.ergo_node import MAX_HEADER_LAG, parse_wallet_balances
 
 TIMEOUT = aiohttp.ClientTimeout(total=10)
 NETWORK_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, OSError)
@@ -71,6 +71,8 @@ async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) 
                 line("WARN", "discord", f"webhook answered HTTP {status} {detail}".strip()[:110],
                      "the webhook was deleted or DISCORD_WEBHOOK_URL is mistyped; copy it again from the channel settings")
 
+    if warning := config.node_url_warning(config.ERGO_NODE_URL):
+        line("WARN", "node URL", warning[:110], "use an SSH tunnel, WireGuard or a TLS reverse proxy (README: Node setup)")
     log(f"Node {config.ERGO_NODE_URL}")
     later = ("API key", "wallet", "wallet boxes", "chain state", "mempool lookup", "sign check")
 
@@ -130,6 +132,13 @@ async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) 
         boxes, _, _ = await wallet_context(ns)
         erg = sum(int(b["value"]) for b in boxes) / 1e9
         line("OK", "wallet boxes", f"{len(boxes)} boxes, {erg:.2f} ERG")
+        status, raw = await _get(ns, "/wallet/balances")
+        parsed = parse_wallet_balances(raw) if status == 200 else None
+        if parsed is None:
+            line("FAIL", "wallet balances", f"/wallet/balances answered HTTP {status} in a shape the bot does not "
+                                            f"know: {str(raw)[:60]}", "the dashboard, drawdown limit and live mode need it")
+        else:
+            line("OK", "wallet balances", f"{parsed['erg']:.2f} ERG, {len(parsed['tokens'])} token(s)")
     except Exception as e:
         line("FAIL", "wallet boxes", f"{e.__class__.__name__}: {e}"[:110], "the wallet may still be scanning after a restore")
 

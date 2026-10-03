@@ -110,6 +110,8 @@ async def run(args):
     mode = mode_of(args)
     if args.command not in ("balance", "quote", "doctor"):
         log(f"=== {args.command} [{ {'dry': 'DRY RUN', 'check': 'CHECK (no broadcast)', 'execute': 'EXECUTE'}[mode] }] ===")
+    if warning := config.node_url_warning(config.ERGO_NODE_URL):
+        log(f"WARNING: {warning}.")
     headers = {"api_key": config.ERGO_NODE_API_KEY, "Content-Type": "application/json"}
     async with aiohttp.ClientSession(headers=headers) as ns:
         if args.command == "balance":
@@ -127,11 +129,21 @@ async def run(args):
             if not args.erg and not args.sigusd:
                 log("Nothing to send: give --erg and/or --sigusd.")
                 return
-            await actions.send(ns, args.to, args.erg, args.sigusd, mode, log)
+            await actions.send(ns, args.to, args.erg, args.sigusd, mode, log, confirm=confirm_address)
         elif args.command == "arb":
             await actions.arb(ns, args.erg, mode, args.force, log, path=args.path, confirm=confirm_loss)
         elif args.command == "doctor":
             return await doctor.run_doctor(ns, sign=not args.no_sign, log=log)
+
+
+def confirm_address(address: str) -> bool:
+    """--execute send: the last 4 characters of the destination must be typed back (catches a pasted wrong one)."""
+    print(f"Sending to {address}", flush=True)
+    try:
+        typed = input("Type the last 4 characters of the address to send (anything else cancels): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return typed == address[-4:]
 
 
 def confirm_loss(message: str, expected_erg: float) -> bool:

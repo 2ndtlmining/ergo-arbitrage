@@ -37,6 +37,8 @@ class Node:
             return Resp(200, self.info)
         if url.endswith("/wallet/status"):
             return Resp(*self.wallet)
+        if url.endswith("/wallet/balances"):
+            return Resp(200, {"height": 1, "balance": 20_710_000_000, "assets": {}})
         return Resp(404, None)
 
 

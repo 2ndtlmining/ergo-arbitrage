@@ -651,6 +651,8 @@ use. Common messages:
 | `Refusing to --execute with these settings` / `refusing to start --live` | A live setting is outside its safe range (listed with the limit). | Fix it in `.env`; `arb.py config` shows the values in use. |
 | `--max-trade-erg X is above MAX_TRADE_SIZE_ERG` | The flag can only lower the cap. | Raise `MAX_TRADE_SIZE_ERG` in `.env` instead. |
 | `another bot is already running on this database (pid ..., mode ...)` | A second `main.py` (or an `arb.py --execute` next to a `--live` bot). | Stop the other one (`tmux attach -t arb`, or `sudo systemctl stop ergo-arb`); `ps -p <pid>` shows it. `main.py --once` works next to it. |
+| `ERGO_NODE_URL is plain http:// to ...` (warning at start, doctor `WARN node URL`) | The API key, which can unlock the wallet, would cross the network unencrypted. | Reach a remote node through an SSH tunnel, WireGuard or a TLS reverse proxy; a LAN address is fine. |
+| doctor `FAIL wallet balances ... shape` | The node's `/wallet/balances` answer is not in a shape the bot knows; balances would be wrong. | Report it (with the shown answer); the bot treats the wallet as unreadable meanwhile, so nothing trades. |
 | `Refusing to --execute: STOP file present` / `live mode is paused` | `arb.py arb --execute` honours the kill switch and the live pause. | Delete `STOP`, or finish the recovery and run `python arb.py resume`. `redeem`/`swap`/`send` still work. |
 | `X is no longer used; set Y instead` | A setting was renamed. | Rename it in `.env`; `arb.py config` lists them. |
 | `arb.py config`: `unknown ... did you mean ...?` | A typo in `.env`; the setting is silently not used. | Fix the name. |
@@ -710,7 +712,7 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 |---|---|---|
 | `LIVE_CONFIRM_POLLS` | `2` | Chain polls in a row a path must stay profitable before it trades. |
 | `LIVE_TRADE_COOLDOWN_SECONDS` | `300` | Pause after each trade (at least 30). Survives restarts. |
-| `LIVE_MAX_TRADES_PER_DAY` | `10` | Trade attempts per day before live mode stops for the day. Counted from the database, so restarts do not reset it. |
+| `LIVE_MAX_TRADES_PER_DAY` | `10` | Trade attempts per day before live mode stops for the day. Counted from the database, so restarts do not reset it. Days (and the digest hour) follow the machine's time zone: `timedatectl` shows it, `sudo timedatectl set-timezone Europe/Amsterdam` changes it. |
 | `LIVE_MAX_DRAWDOWN_ERG` | `5` | Live mode pauses if the wallet value falls this much. |
 | `LIVE_ERG_RESERVE` | `1` | ERG always left in the wallet. |
 | `LIVE_MAX_PROFIT_PERCENT` | `10` | A profit above this is treated as bad data: nothing trades, a pinged alert is sent. `arb.py --execute` refuses it too (`--force` overrides). |
@@ -768,6 +770,13 @@ the exchanges and are not settings.
 | `SAFETRADE_TRADING_FEE` | `0.002` | SafeTrade taker fee. |
 | `SAFETRADE_ERG_WITHDRAW_FEE` | (read from SafeTrade) | Override SafeTrade's withdrawal fee. |
 | `CEX_USDT_TRANSFER_FEE` | `1.0` | USDT cost of moving the proceeds back after a cross-exchange round. |
+
+**Wallet tool** (`arb.py send`)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SEND_ALLOWED_ADDRESSES` | (any) | Comma-separated addresses `send` may pay; anything else is refused. |
+| `SEND_MAX_SIGUSD` | `100` | Most SigUSD one `send` may move (ERG is capped by `MAX_TRADE_SIZE_ERG`). |
 
 **Housekeeping**
 
@@ -830,7 +839,8 @@ python arb.py quote  --sell sigusd --amount 10          # ...and pool vs bank fo
 python arb.py swap   --sell erg    --amount 5           # direct pool swap, no service fee
 python arb.py swap   --sell sigusd --amount all --execute
 python arb.py redeem --sigusd all --execute             # SigUSD -> ERG at the bank
-python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the guard only allows that payee and amount
+python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the guard only allows that payee and amount;
+                                                        # --execute asks for the address's last 4 characters
 python arb.py arb    --check                            # two-leg pool buy -> bank redeem at the best size
 python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint -> pool sell
 python arb.py doctor                                    # is the node ready for the bot? (see below)
