@@ -12,7 +12,8 @@ LOG_KEEP_S = 48 * 3600  # outages that ended longer ago are dropped (the digest 
 CHAIN_VENUES = {"ErgoDEX pool", "SigmaUSD bank", "Oracle"}  # covered by the "chain" subject
 NAMES = {"chain": "Chain state", "oracle": "Oracle", "wallet": "Wallet", "scan": "Full scan",
          "database": "Database", "live": "Live trading", "live:stop": "Live trading (STOP file)",
-         "live:drawdown": "Live trading (drawdown)", "live:daily": "Live trading (daily cap)"}
+         "live:drawdown": "Live trading (drawdown)", "live:daily": "Live trading (daily cap)",
+         "live:implausible": "Live trading (implausible data)"}
 
 
 @dataclass
@@ -67,6 +68,8 @@ class HealthMonitor:
                 failing["live:drawdown"] = (0.0, True, f"Live trading stopped: {guard}")
             elif "trades per day" in guard:
                 failing["live:daily"] = (0.0, False, f"Live trading done for today: {guard}")
+            elif guard.startswith("implausible") or "LIVE_MAX_ORACLE_DEVIATION_PERCENT" in guard:
+                failing["live:implausible"] = (0.0, True, f"Live trading blocked on implausible data: {guard}")
         return failing
 
     def update(self, now: float, state) -> list[HealthEvent]:
