@@ -78,10 +78,16 @@ def ensure_utf8(stream=None):
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     ensure_utf8(sys.stdout)
     ensure_utf8(sys.stderr)
+    if args.max_trade_erg is not None and args.max_trade_erg > config.MAX_TRADE_SIZE_ERG:
+        parser.error(f"--max-trade-erg {args.max_trade_erg:g} is above MAX_TRADE_SIZE_ERG "
+                     f"({config.MAX_TRADE_SIZE_ERG:g}); it can only lower the cap. Raise it in .env instead.")
     apply_overrides(args)
+    if args.live and (errors := config.live_config_errors()):
+        parser.error("refusing to start --live with these settings (.env):\n  " + "\n  ".join(errors))
     view, mode = view_of(args), mode_of(args)
     logger = setup_logging(args.log_level, console_handler=view == "plain")
     logger.info(f"Files: database {args.db}, log {config.repo_path('arbitrage.log')}, "

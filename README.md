@@ -224,7 +224,7 @@ webhook in the channel settings and create a new one.
 | **⚠️ Chain state unreadable for over 2m: ...** (red) | yes | The node gives no usable pool/bank/oracle data (down, syncing, stalled, extra index missing). Nothing is priced or traded. | Run `python arb.py doctor`; see **Troubleshooting**. |
 | **⚠️ Kucoin down for over 5m: ...** | | A watch-only exchange is not answering. | Nothing; it only affects the CEX watch. |
 | **⚠️ Oracle update pending for over 10m (stuck?)** | | An oracle update is in the mempool and not confirming. Live mode waits. | Usually nothing; it clears when the update confirms. |
-| **⚠️ Live trading paused: ...** | | Live mode stopped trading after a failure. The failure itself was the pinged **LIVE** message. | Read the LIVE message, fix, restart the bot to resume. |
+| **⚠️ Live trading paused: ...** | | Live mode stopped trading after a failure. The failure itself was the pinged **LIVE** message. | Read the LIVE message and fix the cause; then `python arb.py resume` and restart the bot. |
 | **✅ ... recovered after 7m** (green) | | The failure above has ended. | Nothing. |
 | **LIVE**: executed ... / did not execute ... / LEG 2 FAILED ... / UNEXPECTED ERROR ... | yes, except "not profitable" | Result of a live trade attempt. "Nothing was spent" means nothing left the wallet. | On **LEG 2 FAILED** or **UNEXPECTED ERROR** run the command the message gives (e.g. `python arb.py redeem --sigusd all --execute`) and check `python arb.py balance`. |
 | **Bank mint OPEN · RR 412%** (green) | at most once per `MINT_GATE_PING_COOLDOWN_SECONDS` | The SigmaUSD bank lets you mint again, with the room in ERG. | A mint -> pool sell path may open; watch for an OPEN message. |
@@ -546,7 +546,7 @@ StandardOutput=null
 StandardError=journal
 Restart=always
 RestartSec=30
-TimeoutStopSec=60
+TimeoutStopSec=1300
 
 [Install]
 WantedBy=multi-user.target
@@ -554,6 +554,9 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now ergo-arb
 ```
+
+`TimeoutStopSec` is longer than `LEG2_WATCH_TIMEOUT_SECONDS` (1200) plus a minute, so a stop never
+kills the bot while it follows leg 2 of a live trade.
 
 ```bash
 systemctl status ergo-arb             # running? since when?
@@ -629,7 +632,9 @@ use. Common messages:
 | log `Discord queue full: dropped the oldest message` | Discord was unreachable or rate-limiting for a while. | Nothing if it stops by itself; check the network if it repeats. |
 | Venues panel `blocked by Cloudflare` | SafeTrade's API answered with a captcha page. | Normal for SafeTrade; leave `SAFETRADE_ENABLED=false`. |
 | Live panel `STOP file present (...)` | The kill switch is on. | `rm STOP` in the bot folder to allow live trades again. |
-| Live panel `paused after: ... (restart to resume)` | A live trade failed and live mode stopped. | Read the pinged **LIVE** message, fix the cause, restart the bot. |
+| Live panel `paused after: ...` | A live trade failed, or the bot was stopped in the middle of one. The pause survives restarts. | Read the pinged **LIVE** message, check `python arb.py balance` (redeem leftover SigUSD), then `python arb.py resume` and restart the bot. |
+| `Refusing to --execute with these settings` / `refusing to start --live` | A live setting is outside its safe range (listed with the limit). | Fix it in `.env`; `arb.py config` shows the values in use. |
+| `--max-trade-erg X is above MAX_TRADE_SIZE_ERG` | The flag can only lower the cap. | Raise `MAX_TRADE_SIZE_ERG` in `.env` instead. |
 | `X is no longer used; set Y instead` | A setting was renamed. | Rename it in `.env`; `arb.py config` lists them. |
 | `arb.py config`: `unknown ... did you mean ...?` | A typo in `.env`; the setting is silently not used. | Fix the name. |
 | `error: externally-managed-environment` | `pip install` outside the venv. | Use `.venv/bin/pip install -r requirements.txt` (see **Install**). |
@@ -676,9 +681,9 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 | `TRADE_SIZES_UNFUNDED` | `false` | `true` prices the whole grid, not only the sizes the wallet can fund. |
 | `MIN_TRADE_SIZE_ERG` | `1` | Smallest size the best-size search and the doctor's sign check use. |
 | `SIZE_PROFIT_CAPTURE` | `0.95` | Trade the smallest size that earns this share of the best profit; `1.0` = maximise profit. |
-| `SLIPPAGE_TOLERANCE` | `0.01` | Slippage allowed on legs without known depth. |
+| `SLIPPAGE_TOLERANCE` | `0.01` | Leg 2 must return at least the planned ERG minus this; `--live`/`--execute` require 0 < x <= 0.05. |
 | `EXECUTION_BUFFER` | `0.003` | Margin for the pool moving between quote and inclusion. |
-| `MAX_FEE_BUDGET_ERG` | `1.0` | Most service + miner fees the transaction guard allows per signed TX. |
+| `MAX_FEE_BUDGET_ERG` | `1.0` | Most service + miner fees the transaction guard allows per signed TX (0.002 to 2). |
 | `SCAN_INTERVAL_SECONDS` | `15` | Seconds between full scans. `main.py --interval N` overrides it. |
 | `PRICE_STALE_SECONDS` | `60` | A price older than this keeps a path out of the scan-based alerts. |
 
@@ -687,8 +692,8 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 | Setting | Default | Effect |
 |---|---|---|
 | `LIVE_CONFIRM_POLLS` | `2` | Chain polls in a row a path must stay profitable before it trades. |
-| `LIVE_TRADE_COOLDOWN_SECONDS` | `300` | Pause after each trade. |
-| `LIVE_MAX_TRADES_PER_DAY` | `10` | Trades per day before live mode stops for the day. |
+| `LIVE_TRADE_COOLDOWN_SECONDS` | `300` | Pause after each trade (at least 30). Survives restarts. |
+| `LIVE_MAX_TRADES_PER_DAY` | `10` | Trade attempts per day before live mode stops for the day. Counted from the database, so restarts do not reset it. |
 | `LIVE_MAX_DRAWDOWN_ERG` | `5` | Live mode pauses if the wallet value falls this much. |
 | `LIVE_ERG_RESERVE` | `1` | ERG always left in the wallet. |
 | `LIVE_STOP_FILE` | `STOP` | Kill switch: while this file exists nothing trades (relative = in the bot folder). |
@@ -811,6 +816,7 @@ python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint 
 python arb.py doctor                                    # is the node ready for the bot? (see below)
 python arb.py config                                    # settings in use and mistakes in .env
 python arb.py backup                                    # consistent copy of the database (see Backups)
+python arb.py resume                                    # clear a live-mode pause (then restart the bot)
 ```
 
 **`arb.py doctor`** first warns about `.env` mistakes and checks the Discord webhook (a GET that shows
@@ -852,7 +858,7 @@ ratio stays >= 400% after minting:
 | Size capped | `MAX_TRADE_SIZE_ERG`, wallet minus `LIVE_ERG_RESERVE` (1) |
 | Node synced and wallet unlocked | checked before each trade |
 | Kill switch file absent | `LIVE_STOP_FILE` (`STOP`) |
-| Wallet value drawdown since start | `LIVE_MAX_DRAWDOWN_ERG` (5) |
+| Wallet value drawdown since the start of the day | `LIVE_MAX_DRAWDOWN_ERG` (5) |
 | Time since last trade | `LIVE_TRADE_COOLDOWN_SECONDS` (300) |
 | Trades today | `LIVE_MAX_TRADES_PER_DAY` (10) |
 
@@ -864,9 +870,18 @@ nothing trades until it confirms (about one block). Each poll re-runs the exact 
 gate; the tables, SQLite logging and Discord stay on `SCAN_INTERVAL_SECONDS`. If the node cannot be
 read, nothing trades until it can. A `CHAIN` line is printed whenever a contract box changes.
 
-Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 failure or a
-TX-guard refusal pauses live trading until restart and is sent to Discord with the redeem
-command to finish.
+Each scan prints `LIVE: not trading - <reasons>` while any check fails. A leg-2 failure, a
+TX-guard refusal or an unexpected error pauses live trading and is sent to Discord with the redeem
+command to finish. The pause is stored in the database: restarting does not clear it, and a trade
+the bot was in the middle of when it stopped (killed, crashed) also pauses the next start. Check
+`python arb.py balance`, then clear it with `python arb.py resume` and restart. The cooldown, the
+day's trade count and the day's drawdown baseline are also restored from the database.
+
+**Settings checked before trading.** `--live` and every `arb.py ... --execute` refuse to start when a
+setting is outside its safe range: `SLIPPAGE_TOLERANCE` 0-0.05, `MIN_PROFIT_PERCENT` >= 0.1,
+`MAX_TRADE_SIZE_ERG` up to 1000, `LIVE_ERG_RESERVE` >= 0.01, `LIVE_CONFIRM_POLLS` >= 2,
+`LIVE_TRADE_COOLDOWN_SECONDS` >= 30, `LIVE_MAX_DRAWDOWN_ERG` up to `MAX_TRADE_SIZE_ERG`,
+`MAX_FEE_BUDGET_ERG` 0.002-2, `EXECUTION_BUFFER` 0-0.05. `--max-trade-erg` can only lower the cap.
 
 **Leg 2 price floor.** Leg 2 is built again on fresh boxes right before it is signed, and again if it
 drops from the mempool. It must return at least the planned ERG minus `SLIPPAGE_TOLERANCE` (1%);
@@ -893,8 +908,9 @@ wallet; SigUSD sells and redeems are capped by the amount you ask for.
    trading. Every trade, success or failure, is sent to Discord with a ping.
 4. **Kill switch.** Create a file named `STOP` in the bot folder, the folder with `main.py`, wherever the bot was started from; the path is logged at startup (`touch STOP`, or
    `New-Item STOP` on Windows) and no new trade starts; delete it to resume. Ctrl+C stops the bot.
-5. **If leg 2 fails**, you hold SigUSD and live trading pauses. The Discord message and the Live
-   panel give the exact command to finish (`python arb.py redeem --sigusd ... --execute`).
+5. **If leg 2 fails**, you hold SigUSD and live trading pauses, also across restarts. The Discord
+   message and the Live panel give the exact command to finish (`python arb.py redeem --sigusd ...
+   --execute`); afterwards `python arb.py resume` and restart the bot.
 
 
 ### Retired execution scripts

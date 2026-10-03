@@ -57,7 +57,6 @@ ERGO_EXPLORER_API_URL = setting("ERGO_EXPLORER_API_URL", "https://api.ergoplatfo
 SPECTRUM_SIGUSD_POOL_NFT = "9916d75132593c8b07fe18bd8d583bda1652eed7565cf41a4738ddd90fc992ec"
 
 # Token IDs (Ergo mainnet)
-ERG_TOKEN_ID = "0000000000000000000000000000000000000000000000000000000000000000"
 SIGUSD_TOKEN_ID = "03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04"
 SIGRSV_TOKEN_ID = "003bd19d0187117f130b62e1bcab0939929ff5c7709f843c5c4dd158949285d0"
 SIGMAUSD_BANK_NFT = "7d672d1def471720ca5782fd6473e47e796d9ac0c138d9911346f118b2f6d9d9"
@@ -68,7 +67,6 @@ USE_TOKEN_ID = setting("USE_TOKEN_ID", "a55b8735ed1a99e46c2c89f8994aacdf4b1109bd
 # Decimals
 ERG_DECIMALS = 9
 SIGUSD_DECIMALS = 2
-SIGRSV_DECIMALS = 0
 USE_DECIMALS = 3
 
 # Crux Finance (USE / DexyUSD)
@@ -85,13 +83,11 @@ SERVICE_FEE_ERGO_TREES = {
 
 # Ergo network fees
 ERGO_TX_FEE = 0.0011  # ERG
-ERGO_MIN_BOX_VALUE = 0.001  # ERG
 ERG_MIN_BOX_NANO = 1_000_000  # nanoERG kept in a change box that holds tokens
 
 # SigmaUSD Bank fees
 SIGMAUSD_PROTOCOL_FEE = 0.02  # 2% (stays in bank reserve)
 SIGMAUSD_FRONTEND_FEE = 0.00229  # 0.229% UI fee on bc_delta (after protocol fee)
-SIGMAUSD_TOTAL_FEE = SIGMAUSD_PROTOCOL_FEE + SIGMAUSD_FRONTEND_FEE
 SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 
 # Spectrum DEX fees. The real fee is read from the pool box (R4 = 995 -> 0.5%);
@@ -236,6 +232,29 @@ LEG2_MAX_REBUILDS = int(setting("LEG2_MAX_REBUILDS", "5"))
 
 # Tracker: non-profitable scan rows older than this are deleted at startup
 SCAN_RESULTS_RETENTION_DAYS = int(setting("SCAN_RESULTS_RETENTION_DAYS", "14"))
+
+
+HARD_MAX_TRADE_ERG = 1000.0   # no setting can lift the trade cap above this
+
+
+def live_config_errors() -> list[str]:
+    """Settings that are unsafe for signing real trades; --live and arb.py --execute refuse to start on any."""
+    rules = [
+        (0 < SLIPPAGE_TOLERANCE <= 0.05,
+         f"SLIPPAGE_TOLERANCE={SLIPPAGE_TOLERANCE:g}: must be above 0 and at most 0.05 (it sets leg 2's price floor)"),
+        (MIN_PROFIT_PERCENT >= 0.1, f"MIN_PROFIT_PERCENT={MIN_PROFIT_PERCENT:g}: must be at least 0.1"),
+        (0 < MAX_TRADE_SIZE_ERG <= HARD_MAX_TRADE_ERG,
+         f"MAX_TRADE_SIZE_ERG={MAX_TRADE_SIZE_ERG:g}: must be above 0 and at most {HARD_MAX_TRADE_ERG:g}"),
+        (LIVE_ERG_RESERVE >= 0.01, f"LIVE_ERG_RESERVE={LIVE_ERG_RESERVE:g}: must be at least 0.01"),
+        (LIVE_CONFIRM_POLLS >= 2, f"LIVE_CONFIRM_POLLS={LIVE_CONFIRM_POLLS}: must be at least 2"),
+        (LIVE_TRADE_COOLDOWN_SECONDS >= 30, f"LIVE_TRADE_COOLDOWN_SECONDS={LIVE_TRADE_COOLDOWN_SECONDS}: must be at least 30"),
+        (0 < LIVE_MAX_DRAWDOWN_ERG <= MAX_TRADE_SIZE_ERG,
+         f"LIVE_MAX_DRAWDOWN_ERG={LIVE_MAX_DRAWDOWN_ERG:g}: must be above 0 and at most MAX_TRADE_SIZE_ERG "
+         f"({MAX_TRADE_SIZE_ERG:g})"),
+        (0.002 <= MAX_FEE_BUDGET_ERG <= 2, f"MAX_FEE_BUDGET_ERG={MAX_FEE_BUDGET_ERG:g}: must be between 0.002 and 2"),
+        (0 <= EXECUTION_BUFFER <= 0.05, f"EXECUTION_BUFFER={EXECUTION_BUFFER:g}: must be between 0 and 0.05"),
+    ]
+    return [message for ok, message in rules if not ok]
 
 
 def get_recommended_slippage(trade_size_erg: float) -> float:

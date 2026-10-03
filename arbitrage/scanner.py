@@ -66,6 +66,8 @@ logger = logging.getLogger("ergo_arb.scanner")
 LIVE_PATH = "Spectrum buy->Bank redeem"
 # Paths --live can execute (ergo/arb_runner.py), scanner path key -> runner path
 LIVE_PATHS = {"Spectrum buy->Bank redeem": "redeem", "Bank mint->Spectrum sell": "mint"}
+LIVE_PAUSE_KEY = "live_paused"        # tracker meta: why live trading is paused (cleared by arb.py resume)
+LIVE_BASELINE_KEY = "live_baseline"   # tracker meta: {"day", "value"} today's drawdown baseline
 
 # Minimum balance per asset before the wallet analysis is worth showing
 WALLET_MINIMUMS = {"erg": (2, "ERG", ".4f"), "sigusd": (0.5, "SigUSD", ".2f"), "use": (0.01, "USE", ".3f")}
@@ -142,8 +144,11 @@ class ArbitrageScanner:
         self._live_paused: Optional[str] = None
         self._last_trade_time = 0.0
         self._trades_today: tuple[str, int] = ("", 0)
-        self._live_start_value: Optional[float] = None
+        self._live_start_value: Optional[float] = None      # today's drawdown baseline (wallet value, ERG)
+        self._live_baseline_day: str = ""
         self._kucoin_usdt_fee: float = 1.0
+        if self.mode == "live":
+            self._restore_live_state()
 
     @property
     def discord_enabled(self) -> bool:
@@ -1269,6 +1274,58 @@ class ArbitrageScanner:
         """ERG a live trade may use; the runner sizes the trade within this on fresh boxes."""
         return max(0.0, min(config.MAX_TRADE_SIZE_ERG, wallet.get("erg", 0) - config.LIVE_ERG_RESERVE))
 
+    def _restore_live_state(self):
+        """Pause, today's trade count, cooldown and drawdown baseline from the database, so a restart
+        (by hand, systemd, a crash loop) cannot reset the live limits. A trade still marked executing
+        means the bot died mid-trade: leg 1 may be on chain, so live mode starts paused."""
+        try:
+            self._live_paused = self.tracker.get_meta(LIVE_PAUSE_KEY)
+            for row in self.tracker.unfinished_trades():
+                self.tracker.fail_trade(row["id"], "interrupted: the bot stopped while this trade ran",
+                                        notes="leg 1 may be on chain; check arb.py balance")
+                self._pause_live(f"trade #{row['id']} was interrupted when the bot stopped (leg 1 may be on "
+                                 f"chain: check `python arb.py balance`)")
+            today = datetime.now().strftime("%Y-%m-%d")
+            self._trades_today = (today, len(self.tracker.trades_started_on(today)))
+            last = self.tracker.last_trade_started()
+            self._last_trade_time = last.timestamp() if last else 0.0
+        except Exception as e:  # fail closed: without the history we cannot honour the limits
+            logger.error(f"LIVE state could not be read from the database: {e}", exc_info=True)
+            self._live_paused = self._live_paused or f"live state unreadable ({e})"
+
+    def _pause_live(self, reason: str):
+        """Pause live trading until `python arb.py resume`; stored so a restart stays paused."""
+        self._live_paused = reason
+        try:
+            self.tracker.set_meta(LIVE_PAUSE_KEY, reason)
+        except Exception as e:
+            logger.error(f"LIVE pause could not be saved (a restart would resume trading): {e}", exc_info=True)
+
+    def _drawdown_baseline(self, wallet: dict, prices: dict) -> Optional[float]:
+        """Today's starting wallet value, kept in the database so restarts do not reset the drawdown limit."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._live_baseline_day == today:
+            return self._live_start_value
+        try:
+            saved = json.loads(self.tracker.get_meta(LIVE_BASELINE_KEY) or "{}")
+        except (ValueError, TypeError):
+            saved = {}
+        if saved.get("day") == today and saved.get("value") is not None:
+            value = float(saved["value"])
+        else:
+            if not wallet.get("ok", True):
+                return None
+            oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
+            if not oracle and wallet.get("sigusd"):  # held SigUSD needs a price to be valued
+                return None
+            value = self._wallet_value_erg(wallet, prices)
+            try:
+                self.tracker.set_meta(LIVE_BASELINE_KEY, json.dumps({"day": today, "value": value}))
+            except Exception as e:
+                logger.error(f"LIVE drawdown baseline could not be saved: {e}")
+        self._live_start_value, self._live_baseline_day = value, today
+        return value
+
     def _trades_today_count(self) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
         return self._trades_today[1] if self._trades_today[0] == today else 0
@@ -1299,7 +1356,7 @@ class ArbitrageScanner:
         if stop_file.exists():
             blockers.append(f"STOP file present ({stop_file})")
         if self._live_paused:
-            blockers.append(f"paused after: {self._live_paused} (restart to resume)")
+            blockers.append(f"paused after: {self._live_paused} (run `python arb.py resume`, then restart)")
         if wallet is not None and self._live_start_value is not None:
             drop = self._live_start_value - self._wallet_value_erg(wallet, prices)
             if drop > config.LIVE_MAX_DRAWDOWN_ERG:
@@ -1316,11 +1373,7 @@ class ArbitrageScanner:
         blockers = []
         if not wallet.get("ok", True):
             blockers.append("wallet balance unreadable")
-        elif self._live_start_value is None:
-            oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
-            if oracle or not wallet.get("sigusd"):  # held SigUSD needs a price to be valued
-                self._live_start_value = self._wallet_value_erg(wallet, prices)
-        if self._live_start_value is None:
+        if self._drawdown_baseline(wallet, prices) is None:
             blockers.append("no drawdown baseline yet (wallet or oracle price unreadable)")
         blockers += self._sync_global_blockers(wallet, prices)
         health = await self.ergo_node.get_health()
@@ -1401,7 +1454,7 @@ class ArbitrageScanner:
                  "error": f"runner error ({result.message})",
                  "refused": f"TX guard refused ({result.message})"}.get(result.status)
         if pause:
-            self._live_paused = pause
+            self._pause_live(pause)
         self._record_trade(trade_id, result, path, size, profit)
 
         if result.status == "executed":
@@ -1973,7 +2026,7 @@ class ArbitrageScanner:
         if not self.trading_enabled:
             s.set_live("off", [f"{self.mode} mode: no trading"])
         elif self._live_paused:
-            s.set_live("paused", [self._live_paused, "restart to resume"])
+            s.set_live("paused", [self._live_paused, "python arb.py resume, then restart"])
         else:
             # Global reasons first (they block every path), then the closest path's own reasons.
             reasons = self._sync_global_blockers(wallet, prices)
