@@ -82,11 +82,26 @@ def pool_fee_text() -> str:
 
 # NonKYC fees (will be fetched dynamically, these are fallback defaults)
 NONKYC_TRADING_FEE = 0.002  # 0.2% maker/taker (verify via API)
-NONKYC_ERG_WITHDRAW_FEE = 3.3  # ERG (confirmed via /asset/info)
+NONKYC_ERG_WITHDRAW_FEE = 3.1  # ERG, published at /api/v2/asset/getbyticker/ERG (2026-10-03); refreshed live
 
 # Kucoin fees (will be fetched dynamically, these are fallback defaults)
 KUCOIN_TRADING_FEE = 0.001  # 0.1% maker/taker
-KUCOIN_ERG_WITHDRAW_FEE = 0.73  # ERG (confirmed via /api/v1/currencies/ERG)
+KUCOIN_ERG_WITHDRAW_FEE = 2.0  # ERG, published at /api/v1/currencies/ERG (2026-10-03, was 0.73); refreshed live
+
+# Gate.io and MEXC: watch-only price sources (issue #40). Taker fees are refreshed live from their
+# public market data; ERG withdrawal fees are not public there, so these defaults come from
+# third-party fee listings (2026-10-03) and should be checked on the exchange's withdrawal page.
+GATE_TRADING_FEE = float(os.getenv("GATE_TRADING_FEE", "0.002"))
+GATE_ERG_WITHDRAW_FEE = float(os.getenv("GATE_ERG_WITHDRAW_FEE", "0.403"))
+MEXC_TRADING_FEE = float(os.getenv("MEXC_TRADING_FEE", "0.0008"))
+MEXC_ERG_WITHDRAW_FEE = float(os.getenv("MEXC_ERG_WITHDRAW_FEE", "0.1"))
+# SafeTrade (safe.trade): off by default, Cloudflare often blocks scripted clients. Fees unknown until
+# its API answers: the withdrawal fee is then read from it; until then no net spread is computed.
+SAFETRADE_ENABLED = os.getenv("SAFETRADE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+SAFETRADE_TRADING_FEE = float(os.getenv("SAFETRADE_TRADING_FEE", "0.002"))
+SAFETRADE_ERG_WITHDRAW_FEE = float(os.environ["SAFETRADE_ERG_WITHDRAW_FEE"]) if os.getenv("SAFETRADE_ERG_WITHDRAW_FEE") else None
+# Moving the USDT back to the buying exchange after a cross-exchange round (e.g. a TRC-20 transfer)
+CEX_USDT_TRANSFER_FEE = float(os.getenv("CEX_USDT_TRANSFER_FEE", "1.0"))
 
 # Venues. CEX paths (Kucoin/NonKYC) are off by default: on-chain only.
 ENABLE_CEX = os.getenv("ENABLE_CEX", "false").strip().lower() in ("1", "true", "yes")

@@ -324,5 +324,6 @@ class TestCexPaths:
         state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
         cheap_cex = cex_scanner._find_opportunities(self.prices(state, kucoin_mid=0.25))   # oracle $0.3226
         dear_cex = cex_scanner._find_opportunities(self.prices(state, kucoin_mid=0.40))
-        pick = lambda opps: next(o for o in opps if o.path.startswith("Kucoin<>Bank") and o.input_erg == 10)
+        # 100 ERG: Kucoin's 2 ERG withdrawal fee would swamp the price gap at 10 ERG
+        pick = lambda opps: next(o for o in opps if o.path.startswith("Kucoin<>Bank") and o.input_erg == 100)
         assert pick(cheap_cex).profit_erg > 0 and pick(dear_cex).profit_erg < 0
