@@ -3,7 +3,6 @@ import json
 import math
 import re
 import logging
-import os
 import signal
 import sys
 import time
@@ -54,6 +53,7 @@ from notifications.mint_gate import MintGateWatcher, mint_gate_text
 from logging_config import console
 
 MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
+CHAIN_READ_TIMEOUT_SECONDS = 8                # one chain read (all node calls) may take at most this long
 CEX_FEE_REFRESH_SECONDS = 3600            # how often published CEX fees are re-read
 HISTORY_ROWS = 5                          # episodes and trades shown in the History panel
 CEX_STALE_SECONDS = 60                    # a CEX snapshot older than this is shown as stale, not used
@@ -231,7 +231,11 @@ class ArbitrageScanner:
         """Read pool/bank/oracle from the node. On failure keep the last good snapshot
         for display, record the error (which blocks trading) and log once per outage."""
         try:
-            snap = await read_snapshot(self.ergo_node.session, self._http)
+            try:
+                snap = await asyncio.wait_for(read_snapshot(self.ergo_node.session, self._http),
+                                              CHAIN_READ_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"chain read timed out after {CHAIN_READ_TIMEOUT_SECONDS:g}s") from None
             prices = prices_from_snapshot(snap)  # a snapshot only counts if it can be priced
         except Exception as e:  # anything (malformed JSON too) fails closed; CancelledError still propagates
             message = f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__
@@ -1291,8 +1295,9 @@ class ArbitrageScanner:
             blockers.append(f"chain state unavailable ({self._chain_error})")
         elif self._snapshot is not None and "oracle" in self._snapshot.pending:
             blockers.append("oracle update pending (waiting for it to confirm)")
-        if os.path.exists(config.LIVE_STOP_FILE):
-            blockers.append(f"STOP file present ({config.LIVE_STOP_FILE})")
+        stop_file = config.repo_path(config.LIVE_STOP_FILE)
+        if stop_file.exists():
+            blockers.append(f"STOP file present ({stop_file})")
         if self._live_paused:
             blockers.append(f"paused after: {self._live_paused} (restart to resume)")
         if wallet is not None and self._live_start_value is not None:

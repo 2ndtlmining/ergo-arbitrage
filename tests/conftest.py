@@ -51,10 +51,17 @@ TEST_DEFAULTS = {
 @pytest.fixture(autouse=True)
 def fresh_node_api_detection():
     """The chain reader remembers which mempool lookup the node supports; never across tests."""
+    import ergo.chain as chain
     import ergo.chain_state as chain_state
-    chain_state._MEMPOOL_BY_TOKEN_POST = None
+
+    def reset():
+        chain_state._MEMPOOL_BY_TOKEN_POST = None
+        chain_state._TIP.update(height=None, since=None)
+        chain._EXPLORER_BACKOFF.clear()
+
+    reset()
     yield
-    chain_state._MEMPOOL_BY_TOKEN_POST = None
+    reset()
 
 
 @pytest.fixture(autouse=True)

@@ -1,4 +1,7 @@
 """Chain/node reads shared by the execute scripts."""
+import random
+import time
+
 import aiohttp
 
 import config
@@ -76,13 +79,25 @@ async def wait_for_box(ns, box_id: str, timeout: float = 60, interval: float = 1
 
 EXPLORER_ATTEMPTS = 3
 EXPLORER_ATTEMPT_TIMEOUT = aiohttp.ClientTimeout(total=15)
+EXPLORER_BACKOFF_MIN, EXPLORER_BACKOFF_MAX = 2.0, 60.0
+_EXPLORER_BACKOFF: dict[str, tuple[float, float]] = {}   # token id -> (retry not before, current delay)
 
 
-async def find_box_id(token_id: str, ns=None, explorer=None, retry_delay: float = 2.0) -> str:
+def _explorer_failed(token_id: str):
+    """Back off this token's explorer lookups: 2 s, doubling to 60 s, with jitter."""
+    _, delay = _EXPLORER_BACKOFF.get(token_id, (0.0, EXPLORER_BACKOFF_MIN / 2))
+    delay = min(delay * 2, EXPLORER_BACKOFF_MAX)
+    _EXPLORER_BACKOFF[token_id] = (time.monotonic() + delay * random.uniform(0.8, 1.2), delay)
+
+
+async def find_box_id(token_id: str, ns=None, explorer=None, retry_delay: float = 2.0,
+                      attempts: int = EXPLORER_ATTEMPTS, timeout=EXPLORER_ATTEMPT_TIMEOUT) -> str:
     """Id of the unspent box holding `token_id` (pool/bank/oracle NFT).
 
     Tries the node's extra index first (/blockchain/..., needs extraIndex = true),
-    then the public explorer with retries. Raises RuntimeError if both fail.
+    then the public explorer (`attempts` tries). After a failed explorer lookup, further
+    lookups for this token are refused for a growing delay (backoff), so a missing index
+    cannot turn into a request storm. Raises RuntimeError if both fail.
     """
     import asyncio
     if ns is not None:
@@ -96,28 +111,34 @@ async def find_box_id(token_id: str, ns=None, explorer=None, retry_delay: float 
         except (asyncio.TimeoutError, aiohttp.ClientError):
             pass
 
+    retry_at, _ = _EXPLORER_BACKOFF.get(token_id, (0.0, 0.0))
+    if time.monotonic() < retry_at:
+        raise RuntimeError(f"could not find the box for token {token_id[:8]} (node index unavailable, "
+                           f"explorer backing off {retry_at - time.monotonic():.0f}s)")
     own_session = explorer is None
     if own_session:
         explorer = aiohttp.ClientSession()
     last_error = "no response"
     try:
-        for attempt in range(EXPLORER_ATTEMPTS):
+        for attempt in range(attempts):
             try:
                 url = f"{config.ERGO_EXPLORER_API_URL}/boxes/unspent/byTokenId/{token_id}?limit=1"
-                async with explorer.get(url, timeout=EXPLORER_ATTEMPT_TIMEOUT) as r:
+                async with explorer.get(url, timeout=timeout) as r:
                     if r.status == 200:
                         data = await r.json()
                         items = data.get("items", data) if isinstance(data, dict) else data
                         if items:
+                            _EXPLORER_BACKOFF.pop(token_id, None)
                             return items[0]["boxId"]
                         last_error = "no unspent box"
                     else:
                         last_error = f"HTTP {r.status}"
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 last_error = type(e).__name__
-            if attempt < EXPLORER_ATTEMPTS - 1:
+            if attempt < attempts - 1:
                 await asyncio.sleep(retry_delay * (attempt + 1))
     finally:
         if own_session:
             await explorer.close()
+    _explorer_failed(token_id)
     raise RuntimeError(f"could not find the box for token {token_id[:8]} (node index unavailable, explorer: {last_error})")

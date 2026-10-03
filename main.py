@@ -32,7 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-trade-erg", type=positive(float), help="cap on any executed trade (MAX_TRADE_SIZE_ERG)")
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
                    help="log file level (arbitrage.log, rotated daily, 14 days kept)")
-    p.add_argument("--db", default="arbitrage_tracker.db", help="tracker database path")
+    p.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")),
+                   help="tracker database (default: arbitrage_tracker.db in the bot folder)")
     p.add_argument("--no-wallet", action="store_true", help="hide the wallet panel and wallet analysis")
     return p
 
@@ -83,6 +84,8 @@ def main(argv=None):
     apply_overrides(args)
     view, mode = view_of(args), mode_of(args)
     logger = setup_logging(args.log_level, console_handler=view == "plain")
+    logger.info(f"Files: database {args.db}, log {config.repo_path('arbitrage.log')}, "
+                f"kill switch {config.repo_path(config.LIVE_STOP_FILE)}")
     if view == "plain":
         print_banner(mode)
     scanner = ArbitrageScanner(mode=mode, db_path=args.db, view=view, show_wallet=not args.no_wallet)
