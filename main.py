@@ -7,6 +7,7 @@ from rich.live import Live
 import config
 from arbitrage.dashboard_view import render_safe
 from arbitrage.scanner import ArbitrageScanner
+from instance_lock import InstanceLock, LockHeld
 from logging_config import EventLogHandler, console, setup_logging
 
 
@@ -89,6 +90,21 @@ def main(argv=None):
     if args.live and (errors := config.live_config_errors()):
         parser.error("refusing to start --live with these settings (.env):\n  " + "\n  ".join(errors))
     view, mode = view_of(args), mode_of(args)
+    lock = None
+    if args.live or not args.once:      # a one-off scan may run next to the bot; nothing else may
+        try:
+            lock = InstanceLock(args.db, mode).acquire()
+        except LockHeld as e:
+            parser.error(f"{e}. Stop it first (Ctrl+C in its terminal, or sudo systemctl stop ergo-arb); "
+                         f"`python main.py --once` can run next to it.")
+    try:
+        _start(args, view, mode)
+    finally:
+        if lock:
+            lock.release()
+
+
+def _start(args, view: str, mode: str):
     logger = setup_logging(args.log_level, console_handler=view == "plain")
     logger.info(f"Files: database {args.db}, log {config.repo_path('arbitrage.log')}, "
                 f"kill switch {config.repo_path(config.LIVE_STOP_FILE)}")

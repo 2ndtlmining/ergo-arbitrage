@@ -18,12 +18,16 @@ without broadcasting; --execute sends and follows the transaction until it confi
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
 import aiohttp
 
 import config
 import config_check
+from instance_lock import InstanceLock, LockHeld
 from tracker.backup import backup_database
+
+DEFAULT_DB = str(config.repo_path("arbitrage_tracker.db"))
 from ergo import actions, doctor
 from ergo.amounts import parse_amount
 
@@ -42,6 +46,8 @@ def _mode_flags(p: argparse.ArgumentParser):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--check", action="store_true", help="sign and validate on your node, do not broadcast")
     g.add_argument("--execute", action="store_true", help="send it, then follow it until confirmed")
+    p.add_argument("--ignore-lock", action="store_true",
+                   help="--execute even while a --live bot runs on this database (it may spend the same boxes)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,12 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
                                   "settings in .env (secrets masked)")
 
     b = sub.add_parser("backup", help="consistent copy of the tracker database (safe while the bot runs)")
-    b.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")))
+    b.add_argument("--db", default=DEFAULT_DB)
     b.add_argument("--to", default=str(config.repo_path("backups")), help="folder for the copies")
     b.add_argument("--keep", type=int, default=14, help="newest copies to keep (default 14)")
 
     rs = sub.add_parser("resume", help="clear the live-mode pause left by a failed or interrupted trade")
-    rs.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")))
+    rs.add_argument("--db", default=DEFAULT_DB)
     return parser
 
 
@@ -123,9 +129,43 @@ async def run(args):
                 return
             await actions.send(ns, args.to, args.erg, args.sigusd, mode, log)
         elif args.command == "arb":
-            await actions.arb(ns, args.erg, mode, args.force, log, path=args.path)
+            await actions.arb(ns, args.erg, mode, args.force, log, path=args.path, confirm=confirm_loss)
         elif args.command == "doctor":
             return await doctor.run_doctor(ns, sign=not args.no_sign, log=log)
+
+
+def confirm_loss(message: str, expected_erg: float) -> bool:
+    """--force --execute below MIN_PROFIT_PERCENT: the expected result must be typed back exactly."""
+    want = f"{expected_erg:.4f}"
+    print(f"--force: this trade is below MIN_PROFIT_PERCENT, {message}.", flush=True)
+    try:
+        typed = input(f"Type {want} to execute it anyway (anything else cancels): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return typed == want
+
+
+def execute_refusals(args) -> list[str]:
+    """Reasons a manual arbitrage must not run now: the kill switch and a live-mode pause. Single-leg
+    commands (swap, redeem, send) stay allowed: they are how a failed trade is finished by hand."""
+    if args.command != "arb":
+        return []
+    reasons = []
+    stop = config.repo_path(config.LIVE_STOP_FILE)
+    if stop.exists():
+        reasons.append(f"STOP file present ({stop}); delete it to trade")
+    if Path(DEFAULT_DB).exists():
+        from arbitrage.scanner import LIVE_PAUSE_KEY
+        from tracker.profit_tracker import ProfitTracker
+        tracker = ProfitTracker(DEFAULT_DB)
+        try:
+            paused = tracker.get_meta(LIVE_PAUSE_KEY)
+        finally:
+            tracker.close()
+        if paused:
+            reasons.append(f"live mode is paused after: {paused}. Finish the recovery (python arb.py balance), "
+                           f"then python arb.py resume")
+    return reasons
 
 
 def resume(db_path: str):
@@ -159,6 +199,26 @@ def main(argv=None):
     if mode_of(args) == "execute" and (errors := config.live_config_errors()):
         print("Refusing to --execute with these settings (.env):", *[f"  {e}" for e in errors], sep="\n", flush=True)
         sys.exit(2)
+    lock = None
+    if mode_of(args) == "execute":
+        if reasons := execute_refusals(args):
+            print("Refusing to --execute:", *[f"  {r}" for r in reasons], sep="\n", flush=True)
+            sys.exit(2)
+        try:
+            lock = InstanceLock(DEFAULT_DB, f"arb.py {args.command}").acquire()
+        except LockHeld as e:
+            if e.holder.get("mode") == "live" and not args.ignore_lock:
+                print(f"Refusing to --execute: {e}. A live bot may spend the same boxes; stop it, create the STOP "
+                      f"file, or pass --ignore-lock if you are sure.", flush=True)
+                sys.exit(2)
+    try:
+        _dispatch(args)
+    finally:
+        if lock:
+            lock.release()
+
+
+def _dispatch(args):
     if args.command == "backup":
         try:
             print(f"Backed up to {backup_database(args.db, args.to, keep=args.keep)}", flush=True)

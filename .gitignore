@@ -17,3 +17,6 @@ venv/
 *.db-wal
 *.db-journal
 backups/
+*.db.lock
+*.db.lock.json
+arbitrage.log.*

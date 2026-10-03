@@ -514,6 +514,9 @@ python -m pytest -q
 
 Started from an SSH session, the bot stops when the session closes. Use **one** of these, never
 both at once: two copies of the bot would both post to Discord, and in `--live` both would trade.
+The bot enforces this: a second `main.py` on the same database refuses to start (it holds a lock,
+`arbitrage_tracker.db.lock`, that the OS releases when it exits or crashes). `main.py --once` can
+still run next to it.
 
 **tmux** keeps the full dashboard and lets you look at it at any time. It does not survive a reboot.
 
@@ -635,6 +638,8 @@ use. Common messages:
 | Live panel `paused after: ...` | A live trade failed, or the bot was stopped in the middle of one. The pause survives restarts. | Read the pinged **LIVE** message, check `python arb.py balance` (redeem leftover SigUSD), then `python arb.py resume` and restart the bot. |
 | `Refusing to --execute with these settings` / `refusing to start --live` | A live setting is outside its safe range (listed with the limit). | Fix it in `.env`; `arb.py config` shows the values in use. |
 | `--max-trade-erg X is above MAX_TRADE_SIZE_ERG` | The flag can only lower the cap. | Raise `MAX_TRADE_SIZE_ERG` in `.env` instead. |
+| `another bot is already running on this database (pid ..., mode ...)` | A second `main.py` (or an `arb.py --execute` next to a `--live` bot). | Stop the other one (`tmux attach -t arb`, or `sudo systemctl stop ergo-arb`); `ps -p <pid>` shows it. `main.py --once` works next to it. |
+| `Refusing to --execute: STOP file present` / `live mode is paused` | `arb.py arb --execute` honours the kill switch and the live pause. | Delete `STOP`, or finish the recovery and run `python arb.py resume`. `redeem`/`swap`/`send` still work. |
 | `X is no longer used; set Y instead` | A setting was renamed. | Rename it in `.env`; `arb.py config` lists them. |
 | `arb.py config`: `unknown ... did you mean ...?` | A typo in `.env`; the setting is silently not used. | Fix the name. |
 | `error: externally-managed-environment` | `pip install` outside the venv. | Use `.venv/bin/pip install -r requirements.txt` (see **Install**). |
@@ -831,6 +836,14 @@ It exits with 1 when a node check fails. Run it after switching or upgrading the
 environment or default), secrets masked, and flags keys the bot does not read (with the closest real
 name, e.g. `DISCORD_WEBHOOK` -> `DISCORD_WEBHOOK_URL?`), values still holding a `.env.example`
 placeholder (ignored) and renamed settings. It needs no node.
+
+**Guardrails on `--execute`.** Every `arb.py ... --execute` checks the live settings first (see
+**Live mode**) and refuses while a `--live` bot runs on the same database, since both could spend the
+same boxes (`--ignore-lock` overrides it). While it runs it holds the bot's lock, so `--live` cannot
+start in the middle. `arb.py arb --execute` also refuses while the STOP file exists or live mode is
+paused. `swap`, `redeem` and `send` stay allowed then, because they are how you finish a failed trade
+by hand. `arb --force --execute` below `MIN_PROFIT_PERCENT` shows the expected result and only goes
+ahead when you type that amount back (e.g. `-0.0644`).
 
 **Trade size.** `arb.py arb` (without `--erg`, or `--erg best`) and live mode size the trade
 on the exact pool, bank and oracle boxes the transactions will spend (`arbitrage/sizing.py`,

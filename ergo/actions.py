@@ -294,7 +294,9 @@ async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log)
     await _finish(ns, body, send_policy(tree, erg_nano, cents), mode, log)
 
 
-async def arb(ns, erg: Optional[float], mode: str, force: bool, log: Log, path: str = "redeem"):
-    """`erg` None: the runner picks the best size on the boxes it is about to spend."""
+async def arb(ns, erg: Optional[float], mode: str, force: bool, log: Log, path: str = "redeem", confirm=None):
+    """`erg` None: the runner picks the best size on the boxes it is about to spend. `confirm(message,
+    expected_erg)` must say yes before --force executes below MIN_PROFIT_PERCENT."""
     erg_in = None if erg is None else int(round(erg * 1e9))
-    await run_arb(ns, path, erg_in, check=mode == "check", execute=mode == "execute", force=force, log=log)
+    await run_arb(ns, path, erg_in, check=mode == "check", execute=mode == "execute", force=force, log=log,
+                  confirm=confirm)
