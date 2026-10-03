@@ -8,6 +8,7 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py redeem --sigusd all                       --execute
     python arb.py send   --to 9f... --erg 1.5 [--sigusd 2]  --execute
     python arb.py arb    [--erg best|10] [--path redeem|mint] [--check | --execute] [--force]
+    python arb.py doctor [--no-sign]                        (is the node ready for the bot?)
 """
 import argparse
 import asyncio
@@ -19,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import config
-from ergo import actions
+from ergo import actions, doctor
 from ergo.amounts import parse_amount
 
 
@@ -73,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="redeem: pool buy -> bank redeem (default); mint: bank mint -> pool sell")
     a.add_argument("--force", action="store_true", help="execute even below MIN_PROFIT_PERCENT (testing)")
     _mode_flags(a)
+
+    d = sub.add_parser("doctor", help="check the node is ready for the bot (ends with a sign check that is never broadcast)")
+    d.add_argument("--no-sign", action="store_true", help="skip the final sign-and-validate check")
     return parser
 
 
@@ -83,7 +87,7 @@ def mode_of(args) -> str:
 async def run(args):
     log = print
     mode = mode_of(args)
-    if args.command not in ("balance", "quote"):
+    if args.command not in ("balance", "quote", "doctor"):
         log(f"=== {args.command} [{ {'dry': 'DRY RUN', 'check': 'CHECK (no broadcast)', 'execute': 'EXECUTE'}[mode] }] ===")
     headers = {"api_key": config.ERGO_NODE_API_KEY, "Content-Type": "application/json"}
     async with aiohttp.ClientSession(headers=headers) as ns:
@@ -105,17 +109,21 @@ async def run(args):
             await actions.send(ns, args.to, args.erg, args.sigusd, mode, log)
         elif args.command == "arb":
             await actions.arb(ns, args.erg, mode, args.force, log, path=args.path)
+        elif args.command == "doctor":
+            return await doctor.run_doctor(ns, sign=not args.no_sign, log=log)
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     try:
-        asyncio.run(run(args))
+        code = asyncio.run(run(args))
     except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
         print(f"Cannot reach your Ergo node at {config.ERGO_NODE_URL} ({e.__class__.__name__}: {e}). "
               f"Is it running? Check ERGO_NODE_URL in .env.", flush=True)
         sys.exit(1)
+    if code:
+        sys.exit(code)
 
 
 if __name__ == "__main__":

@@ -421,7 +421,15 @@ python arb.py redeem --sigusd all --execute             # SigUSD -> ERG at the b
 python arb.py send   --to 9f... --erg 1.5 --execute     # also --sigusd; the guard only allows that payee and amount
 python arb.py arb    --check                            # two-leg pool buy -> bank redeem at the best size
 python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint -> pool sell
+python arb.py doctor                                    # is the node ready for the bot? (see below)
 ```
+
+**`arb.py doctor`** checks everything the bot needs from your node, one line each (OK / WARN / FAIL
+with a hint / SKIP): reachable and synced, API key accepted, wallet restored and unlocked, wallet
+boxes, the pool/bank/oracle boxes through the extra index, the mempool lookup (the GET form on the
+Scala node, the POST form on the Rust node `arkadianet/ergo`), and finally a 1 ERG pool buy -> bank
+redeem that the node signs and validates but that is **never broadcast** (`--no-sign` skips it).
+It exits with 1 when anything fails. Run it after switching or upgrading the node.
 
 **Trade size.** `arb.py arb` (without `--erg`, or `--erg best`) and live mode size the trade
 on the exact pool, bank and oracle boxes the transactions will spend (`arbitrage/sizing.py`,
