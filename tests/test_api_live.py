@@ -255,6 +255,10 @@ class TestSigmaUSDBank:
         bank = await self._make_bank()
         try:
             await bank.get_full_state()
+            if bank.state is None:
+                # The bank fails closed when the explorer did not return the on-chain oracle box
+                # (bank quotes disabled); that is the designed behaviour, not a fee to measure.
+                pytest.skip("explorer did not return the on-chain oracle box; bank quotes disabled")
             erg = bank.sigusd_to_erg(10)
             raw = 10 / bank._oracle_price
             fee_pct = (1 - (erg + 0.0021) / raw) * 100

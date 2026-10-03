@@ -582,19 +582,25 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
 **Working today**
 - On-chain arbitrage between the ErgoDEX SigUSD/ERG pool and the SigmaUSD bank (pool buy -> bank
   redeem, and bank mint -> pool sell while the reserve ratio allows minting), executed by `--live`
-  with direct pool swaps (no service fee), exact sizing and the TX guard
-- Chain watcher: pool, bank and oracle read from your node every 2 s, mempool aware
-- One-screen dashboard, plus `--plain` and `--json` views
+  with direct pool swaps (no service fee), exact sizing, a leg-2 price floor and the TX guard
+- Chain watcher: pool, bank and oracle read from your node every 2 s, mempool aware (Scala node, and
+  the Rust node `arkadianet/ergo` via its mempool lookup)
 - Wallet tool `arb.py` (balance, quote, swap, redeem, send, arb), dry run by default
-- Discord: one message per opportunity, health alerts, daily digest, wallet analysis
+- One-screen dashboard with health strip, Exchanges and History panels and the mint-gate / reserve-ratio
+  trend, plus `--plain` and `--json` views
+- Discord: one message per opportunity, health alerts, bank mint gate alert, daily digest, wallet analysis
+- CEX prices (Kucoin, NonKYC, Gate, MEXC; SafeTrade opt-in), watch-only, with live fees and the
+  cross-exchange spread after fees; fetched in the background so they never slow the chain poll
 - SQLite tracking of prices, opportunities, episodes and trades
-- CEX prices (Kucoin, NonKYC, Gate, MEXC; SafeTrade opt-in), watch-only, with fees
 
 **Next**
-- First supervised `--live` trade with a small `--max-trade-erg`
-- Alert when the bank mint opens again (reserve ratio back above 400%): issue #39
+- First supervised `--live` trade with a small `--max-trade-erg` (once a path shows GO)
+- Check the bot against the Rust node once it is synced (`pytest -m live`, `arb.py balance`,
+  `arb.py arb --check`)
 
 **Later** (details in the GitHub issues)
-- CEX paths: fix the profit math (#2, #3), then order placement and withdrawals
-- More price sources: Gate.io and MEXC (#40), MachinaFi (#12)
-- Faster scans (#8), a web dashboard with history charts (#16), a venue/leg architecture (#13)
+- A venue/leg quote abstraction with a path graph, once more on-chain venues exist (#13; the
+  script and wallet-analysis duplication from that issue is already gone)
+- MachinaFi as a venue, if it ever gets real liquidity (#12; re-checked 2026-10-03: ~1 ERG fillable)
+- CEX execution (order placement, withdrawals): only worth it at several hundred ERG, because of the
+  withdrawal fees
