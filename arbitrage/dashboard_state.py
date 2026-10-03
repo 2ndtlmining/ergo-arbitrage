@@ -98,6 +98,12 @@ class DashboardState:
         self.health: dict = {}                      # full_scan_ms, discord_queue, data_age_s, cex_ms {name: ms}
         self.exchanges: list[ExchangeRow] = []
         self.spread_text: Optional[str] = None      # best cross-exchange spread after fees
+        self.discord_on = False
+        # silent failures, turned into health alerts (notifications/health.py)
+        self.wallet_locked: Optional[bool] = None   # node reachable but its wallet locked
+        self.scan_error: Optional[str] = None       # the last poll failed with this
+        self.db_error: Optional[str] = None         # tracker writes failing
+        self.live_guards: list[str] = []            # global live blockers (STOP, drawdown, daily cap, ...)
         self.recent_episodes: list[dict] = []       # chain_episodes rows, newest first
         self.recent_trades: list[dict] = []         # trades rows, newest first
         self.rr_history: deque = deque(maxlen=RR_HISTORY)   # (unix time, reserve ratio %)

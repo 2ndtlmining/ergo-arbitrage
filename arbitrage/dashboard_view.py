@@ -101,6 +101,11 @@ def header(s: DashboardState) -> Text:
     t.append(f" {s.read_ms:.0f} ms" if s.read_ms is not None else "")
     t.append("  wallet ")
     t.append_text(_dot(s.wallet_ok))
+    if s.discord_on:
+        t.append("  discord ")
+        t.append_text(_dot(True))
+    else:
+        t.append("  discord off", style="dim")
     t.append(f"  poll {config.CHAIN_POLL_SECONDS:g}s")
     if s.next_full_scan_in is not None:
         t.append(f"  full scan in {s.next_full_scan_in:.0f}s")

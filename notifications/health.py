@@ -1,5 +1,7 @@
 """Health alerts for Discord from the dashboard state: chain unreadable, a venue down, an oracle
-update stuck, live trading paused. One alert per subject per repeat window; a recovery always
+update stuck, live trading paused; and the failures that are otherwise silent: wallet locked, full
+scan failing, database writes failing, live trading held by the STOP file, the drawdown limit or the
+daily cap. One alert per subject per repeat window; a recovery always
 follows an alert. Outages are remembered (since this process started) for the daily digest."""
 from dataclasses import dataclass
 from typing import Optional
@@ -8,6 +10,9 @@ from notifications.embeds import duration
 
 LOG_KEEP_S = 48 * 3600  # outages that ended longer ago are dropped (the digest covers 24 h)
 CHAIN_VENUES = {"ErgoDEX pool", "SigmaUSD bank", "Oracle"}  # covered by the "chain" subject
+NAMES = {"chain": "Chain state", "oracle": "Oracle", "wallet": "Wallet", "scan": "Full scan",
+         "database": "Database", "live": "Live trading", "live:stop": "Live trading (STOP file)",
+         "live:drawdown": "Live trading (drawdown)", "live:daily": "Live trading (daily cap)"}
 
 
 @dataclass
@@ -19,8 +24,10 @@ class HealthEvent:
 
 
 class HealthMonitor:
-    def __init__(self, chain_s: float, venue_s: float, oracle_s: float, repeat_s: float, started_at: float):
+    def __init__(self, chain_s: float, venue_s: float, oracle_s: float, repeat_s: float, started_at: float,
+                 live_s: float = 600):
         self.chain_s, self.venue_s, self.oracle_s, self.repeat_s = chain_s, venue_s, oracle_s, repeat_s
+        self.live_s = live_s
         self.started_at = started_at
         self._since: dict[str, float] = {}
         self._alerted: dict[str, float] = {}
@@ -41,6 +48,25 @@ class HealthMonitor:
         if state.live == "paused":
             # no ping: the live trade alert (notify_live) already pinged for the failure that paused it
             failing["live"] = (0.0, False, f"Live trading paused: {'; '.join(state.live_detail) or 'see console'}")
+        live = getattr(state, "mode", "") == "live"
+        if live and getattr(state, "wallet_locked", False):     # a watch-only bot may keep it locked
+            failing["wallet"] = (self.chain_s, True, f"Node wallet locked for over {duration(self.chain_s)}: live "
+                                                     f"mode cannot trade. Unlock it (POST /wallet/unlock)")
+        if getattr(state, "scan_error", None):
+            failing["scan"] = (self.chain_s, False,
+                               f"Full scan failing for over {duration(self.chain_s)}: {state.scan_error}")
+        if getattr(state, "db_error", None):
+            failing["database"] = (self.chain_s, False,
+                                   f"Database writes failing for over {duration(self.chain_s)}: {state.db_error} "
+                                   f"(scans and episodes are not being recorded)")
+        for guard in getattr(state, "live_guards", None) or []:
+            if guard.startswith("STOP file"):
+                failing["live:stop"] = (self.live_s, False, f"Live trading held for over {duration(self.live_s)}: "
+                                                            f"{guard}")
+            elif guard.startswith("drawdown"):
+                failing["live:drawdown"] = (0.0, True, f"Live trading stopped: {guard}")
+            elif "trades per day" in guard:
+                failing["live:daily"] = (0.0, False, f"Live trading done for today: {guard}")
         return failing
 
     def update(self, now: float, state) -> list[HealthEvent]:
@@ -59,8 +85,7 @@ class HealthMonitor:
             first = self._since.pop(subject)
             if self._alerted.pop(subject, None) is not None:
                 self._log = [(s, a, now if s == subject and b is None and a == first else b) for s, a, b in self._log]
-                name = "Chain state" if subject == "chain" else subject.split(":", 1)[-1].capitalize() \
-                    if subject == "oracle" else subject.split(":", 1)[-1]
+                name = NAMES.get(subject, subject.split(":", 1)[-1])
                 events.append(HealthEvent(subject, "recovered", f"{name} recovered after {duration(now - first)}",
                                           False))
         return events

@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")),
                    help="tracker database (default: arbitrage_tracker.db in the bot folder)")
     p.add_argument("--no-wallet", action="store_true", help="hide the wallet panel and wallet analysis")
+    p.add_argument("--yes", action="store_true",
+                   help="arm --live without the typed confirmation (for systemd and other unattended runs)")
     return p
 
 
@@ -71,6 +73,25 @@ async def run(scanner: ArbitrageScanner, view: str, once: bool):
         await scanner.run(once=once)
 
 
+def arm_live() -> bool:
+    """--live trades real ERG: show the limits in force and require LIVE to be typed."""
+    stop = config.repo_path(config.LIVE_STOP_FILE)
+    print("LIVE TRADING signs and sends transactions from your node wallet with these limits (.env):\n"
+          f"  max trade {config.MAX_TRADE_SIZE_ERG:g} ERG, reserve {config.LIVE_ERG_RESERVE:g} ERG, "
+          f"drawdown {config.LIVE_MAX_DRAWDOWN_ERG:g} ERG per day, {config.LIVE_MAX_TRADES_PER_DAY} trades/day, "
+          f"cooldown {config.LIVE_TRADE_COOLDOWN_SECONDS}s\n"
+          f"  min profit {config.MIN_PROFIT_PERCENT:g}%, slippage {config.SLIPPAGE_TOLERANCE:.1%}, "
+          f"kill switch: create {stop}", flush=True)
+    try:
+        typed = input("Type LIVE to arm it (anything else exits): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        typed = ""
+    if typed != "LIVE":
+        print("Not armed: live mode did not start. (Unattended runs: add --yes.)", flush=True)
+        return False
+    return True
+
+
 def ensure_utf8(stream=None):
     """Piped output on Windows defaults to cp1252, which cannot encode the dashboard's symbols."""
     stream = stream or sys.stdout
@@ -98,6 +119,8 @@ def main(argv=None):
             parser.error(f"{e}. Stop it first (Ctrl+C in its terminal, or sudo systemctl stop ergo-arb); "
                          f"`python main.py --once` can run next to it.")
     try:
+        if args.live and not args.yes and not arm_live():
+            sys.exit(1)
         _start(args, view, mode)
     finally:
         if lock:
