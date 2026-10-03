@@ -88,3 +88,67 @@ def test_old_outages_are_pruned():
     m.update(250, state())
     m.update(250 + 49 * 3600, state())
     assert m._log == []
+
+
+# ---------- silent failures (#71) ----------
+
+def quiet(**kw):
+    s = state()
+    for k, v in kw.items():
+        setattr(s, k, v)
+    return s
+
+
+def test_wallet_locked_alerts_and_pings_in_live_mode():
+    m = monitor()
+    m.update(0, quiet(wallet_locked=True, mode="live"))
+    ev = m.update(120, quiet(wallet_locked=True, mode="live"))
+    assert [(e.subject, e.ping) for e in ev] == [("wallet", True)] and "/wallet/unlock" in ev[0].text
+    ev = m.update(200, quiet(wallet_locked=False, mode="live"))
+    assert [(e.subject, e.kind) for e in ev] == [("wallet", "recovered")] and "Wallet" in ev[0].text
+
+
+def test_wallet_locked_is_not_an_alert_outside_live_mode():
+    m = monitor()                                    # a watch-only bot may run with the wallet locked
+    m.update(0, quiet(wallet_locked=True, mode="notify"))
+    assert m.update(120, quiet(wallet_locked=True, mode="notify")) == []
+
+
+def test_full_scan_failing_alerts_after_the_threshold():
+    m = monitor()
+    assert m.update(0, quiet(scan_error="OperationalError: database is locked")) == []
+    ev = m.update(120, quiet(scan_error="OperationalError: database is locked"))
+    assert [e.subject for e in ev] == ["scan"] and "database is locked" in ev[0].text
+    assert [e.kind for e in m.update(130, quiet())] == ["recovered"]
+
+
+def test_database_writes_failing_alerts():
+    m = monitor()
+    m.update(0, quiet(db_error="disk I/O error"))
+    ev = m.update(120, quiet(db_error="disk I/O error"))
+    assert [e.subject for e in ev] == ["database"] and "not being recorded" in ev[0].text
+
+
+def test_stop_file_alert_after_live_threshold():
+    m = HealthMonitor(chain_s=120, venue_s=300, oracle_s=600, repeat_s=1800, started_at=0, live_s=600)
+    guards = ["STOP file present (/bot/STOP)"]
+    assert m.update(0, quiet(live_guards=guards, mode="live")) == []
+    ev = m.update(600, quiet(live_guards=guards, mode="live"))
+    assert [(e.subject, e.ping) for e in ev] == [("live:stop", False)] and "STOP" in ev[0].text
+
+
+def test_drawdown_alerts_at_once_with_a_ping():
+    ev = monitor().update(0, quiet(live_guards=["drawdown 6.00 ERG > LIVE_MAX_DRAWDOWN_ERG 5"], mode="live"))
+    assert [(e.subject, e.ping) for e in ev] == [("live:drawdown", True)]
+
+
+def test_daily_cap_alerts_at_once_without_a_ping():
+    ev = monitor().update(0, quiet(live_guards=["max 10 trades per day reached"], mode="live"))
+    assert [(e.subject, e.ping) for e in ev] == [("live:daily", False)]
+
+
+def test_cooldown_and_oracle_guards_do_not_alert():
+    m = monitor()
+    guards = ["cooldown 120s", "oracle update pending (waiting for it to confirm)"]
+    assert m.update(0, quiet(live_guards=guards, mode="live")) == []
+    assert m.update(5000, quiet(live_guards=guards, mode="live")) == []

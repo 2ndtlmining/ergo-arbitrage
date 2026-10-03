@@ -66,6 +66,7 @@ logger = logging.getLogger("ergo_arb.scanner")
 LIVE_PATH = "Spectrum buy->Bank redeem"
 # Paths --live can execute (ergo/arb_runner.py), scanner path key -> runner path
 LIVE_PATHS = {"Spectrum buy->Bank redeem": "redeem", "Bank mint->Spectrum sell": "mint"}
+POLL_ERROR_LOG_S = 300   # a repeating poll error is logged once per this (the first time with its traceback)
 LIVE_PAUSE_KEY = "live_paused"        # tracker meta: why live trading is paused (cleared by arb.py resume)
 LIVE_BASELINE_KEY = "live_baseline"   # tracker meta: {"day", "value"} today's drawdown baseline
 
@@ -90,7 +91,7 @@ class ArbitrageScanner:
                                        config.DISCORD_MIN_PROFIT_ERG)
         self.health = HealthMonitor(config.DISCORD_HEALTH_CHAIN_SECONDS, config.DISCORD_HEALTH_VENUE_SECONDS,
                                     config.DISCORD_HEALTH_ORACLE_SECONDS, config.DISCORD_HEALTH_REPEAT_SECONDS,
-                                    started_at=time.time())
+                                    started_at=time.time(), live_s=config.DISCORD_HEALTH_LIVE_SECONDS)
         self._episode_touched: dict[int, float] = {}   # episode db id -> poll time of the last heartbeat
         self._digest_queued_at: Optional[float] = None
         self.mint_gate = MintGateWatcher(config.MINT_GATE_CONFIRM_POLLS, config.MINT_GATE_MIN_ROOM_ERG,
@@ -98,6 +99,10 @@ class ArbitrageScanner:
         self._last_wallet: Optional[dict] = None
         self._last_prices: dict = {}
         self._now = 0.0
+        self._poll_error: Optional[str] = None          # the last poll failed with this (cleared on success)
+        self._logged_error: tuple = ("", -1e18)         # (error key, time) of the last logged poll error
+        self._logged_since = 0.0
+        self._db_error: Optional[str] = None            # tracker writes failing
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
@@ -109,6 +114,7 @@ class ArbitrageScanner:
         self.sigmausd = SigmaUSDBank()
         self.ergo_node = ErgoNodeClient()
         self.calculator = ArbitrageCalculator()
+        self.db_path = db_path
         self.tracker = ProfitTracker(db_path)
         self.discord = DiscordNotifier()
         self._http: Optional[aiohttp.ClientSession] = None  # shared: Crux API + explorer fallback + CEX data
@@ -1861,20 +1867,21 @@ class ArbitrageScanner:
         self.out.rule(f"[header]Scan #{self.scan_count} - {datetime.now().strftime('%H:%M:%S')}[/header]")
 
         prices = await self.fetch_all_prices()
+        await self._refresh_node_health()
         self._record_dashboard_history(prices)
         outage = self._chain_error is not None
         if outage:  # prices below are the last good state: show them, but do not log or alert on them
             self.out.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
                           f"state; nothing is logged, alerted or traded until the node can be read[/bold yellow]")
         else:
-            self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
+            self._last_snapshot_id = self._db_write(self.tracker.log_price_snapshot, prices)
         self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
         self._update_live_streak()
         if not outage:
-            self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
-            self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
+            self._db_write(self.tracker.log_scan_results, opportunities, self.scan_count, self._last_snapshot_id)
+            self._db_write(self.tracker.record_scan, opportunities, self.scan_count, self._last_snapshot_id)
         self._display_opportunities(opportunities, prices)
         if self.cex_watch:
             self._display_cex_watch(prices)
@@ -1912,7 +1919,7 @@ class ArbitrageScanner:
         await self._execute_trades(wallet, prices)
 
         profitable_count = sum(1 for o in opportunities if o.is_profitable and not o.blocked)
-        self.tracker.update_daily_summary(profitable_count)
+        self._db_write(self.tracker.update_daily_summary, profitable_count)
         logger.info(
             f"Scan #{self.scan_count}: {len(opportunities)} paths analyzed, "
             f"{profitable_count} profitable"
@@ -1940,10 +1947,18 @@ class ArbitrageScanner:
         started = time.perf_counter()
         try:
             await self._poll(now)
+            self._poll_error = None
+        except Exception as e:
+            self._poll_error = f"{e.__class__.__name__}: {e}"[:200]
+            raise
         finally:
             if full:
                 self._last_full_scan_ms = (time.perf_counter() - started) * 1000
-            self._refresh_state(now)
+            try:
+                self._refresh_state(now)
+            except Exception as e:  # the Discord tick (health alerts) must still run
+                logger.error(f"Dashboard state refresh failed: {e}", exc_info=True)
+            self.state.scan_error = self._poll_error
             self._discord_tick(now)
         if full and self.view == "json":
             sys.stdout.write(json.dumps(self.state.to_json(), default=str) + "\n")
@@ -2021,6 +2036,11 @@ class ArbitrageScanner:
             oracle = (prices.get("bank") or {}).get("oracle_erg_usd")
             s.wallet = dict(wallet, value_erg=value, value_usd=value * oracle if value and oracle else None)
         s.trades_today = self._trades_today_count()
+        s.discord_on = self.discord_enabled
+        nh = self.node_health or {}
+        s.wallet_locked = (not nh.get("unlocked")) if nh.get("reachable") else None
+        s.scan_error, s.db_error = self._poll_error, self._db_error
+        s.live_guards = []
         if self._live_start_value is not None and wallet is not None and wallet.get("ok", True) and prices:
             s.drawdown = max(0.0, self._live_start_value - self._wallet_value_erg(wallet, prices))
         if not self.trading_enabled:
@@ -2036,6 +2056,7 @@ class ArbitrageScanner:
             if not ready:
                 best = max(LIVE_PATHS, key=lambda k: self._live_streak.get(k, 0))
                 reasons = reasons + self._path_blockers(best, wallet or {})
+            s.live_guards = list(reasons)
             s.set_live("blocked" if reasons else "armed", reasons)
 
     async def _poll(self, now: float):
@@ -2057,6 +2078,70 @@ class ArbitrageScanner:
             wallet = await self._fetch_wallet_balances()
             self._last_wallet = wallet
             await self._execute_trades(wallet, prices, quiet=True)
+
+    def _log_poll_error(self, e: Exception, now: Optional[float] = None):
+        """A failing poll repeats every 2 s: log its first traceback, then one line per POLL_ERROR_LOG_S."""
+        now = time.time() if now is None else now
+        key = f"{e.__class__.__name__}: {e}"
+        last_key, last_at = self._logged_error
+        if key != last_key:
+            logger.error(f"Poll error: {key}", exc_info=e)
+            self._logged_since = now
+        elif now - last_at >= POLL_ERROR_LOG_S:
+            logger.error(f"Poll error repeated for {now - self._logged_since:.0f}s: {key}")
+        else:
+            return
+        self._logged_error = (key, now)
+
+    def _db_write(self, fn, *args):
+        """A tracker write that may fail (locked, full or corrupt database) without stopping the scan."""
+        try:
+            result = fn(*args)
+        except Exception as e:
+            if self._db_error is None:
+                logger.error(f"Database write failed ({getattr(fn, '__name__', fn)}): {e}", exc_info=True)
+            self._db_error = f"{e.__class__.__name__}: {e}"[:200]
+            return None
+        self._db_error = None
+        return result
+
+    async def _refresh_node_health(self):
+        try:
+            self.node_health = await self.ergo_node.get_health()
+        except Exception as e:
+            logger.debug(f"node health check failed: {e}")
+
+    def startup_lines(self) -> list[str]:
+        """What the bot runs with: logged at start so it reaches the log and the Events panel in every view."""
+        stop = config.repo_path(config.LIVE_STOP_FILE)
+        lines = [f"Starting {self.mode.upper()}: node {config.ERGO_NODE_URL}, database {self.db_path}",
+                 f"Limits: max trade {config.MAX_TRADE_SIZE_ERG:g} ERG, min profit {config.MIN_PROFIT_PERCENT:g}%, "
+                 f"slippage {config.SLIPPAGE_TOLERANCE:.1%}, fee budget {config.MAX_FEE_BUDGET_ERG:g} ERG/tx"]
+        if self.mode == "live":
+            lines.append(f"Live: reserve {config.LIVE_ERG_RESERVE:g} ERG, drawdown {config.LIVE_MAX_DRAWDOWN_ERG:g} ERG "
+                         f"per day, {config.LIVE_MAX_TRADES_PER_DAY} trades/day, cooldown "
+                         f"{config.LIVE_TRADE_COOLDOWN_SECONDS}s, {config.LIVE_CONFIRM_POLLS} confirming polls, "
+                         f"kill switch STOP file {stop} ({'PRESENT' if stop.exists() else 'absent'})")
+            if self._live_paused:
+                lines.append(f"Live: PAUSED after {self._live_paused} (python arb.py resume, then restart)")
+        venues = "on-chain + CEX" if self.enable_cex else "on-chain only"
+        lines.append(f"Venues: {venues}{'' if self.enable_use else ', USE off'}"
+                     f"{', CEX watch-only' if self.cex_watch else ''}; chain poll {config.CHAIN_POLL_SECONDS:g}s, "
+                     f"full scan {config.SCAN_INTERVAL_SECONDS}s")
+        if self.discord_enabled:
+            lines.append(f"Discord: on (alerts >= {config.DISCORD_MIN_PROFIT_PERCENT:g}% and "
+                         f">= {config.DISCORD_MIN_PROFIT_ERG:g} ERG, ping >= {config.DISCORD_TIER1_PROFIT_PERCENT:g}%"
+                         f"{', no @mention: DISCORD_USER_ID not set' if not config.DISCORD_USER_ID else ''})")
+        elif self.mode in ("notify", "live"):
+            lines.append("Discord: NOT CONFIGURED (set DISCORD_WEBHOOK_URL in .env): nothing will be posted")
+        else:
+            lines.append("Discord: off in monitor mode (use --notify)")
+        return lines
+
+    def _log_startup(self):
+        for line in self.startup_lines():
+            logger.info(line)
+            self.state.add_event("warn" if "NOT CONFIGURED" in line or "PAUSED" in line else "info", line)
 
     def request_stop(self):
         """Ask the main loop to finish the current scan and shut down cleanly."""
@@ -2092,47 +2177,11 @@ class ArbitrageScanner:
 
     async def run(self, once: bool = False):
         """Main scan loop: fixed-rate scans until request_stop() or SIGINT/SIGTERM."""
-        mode_display = {
-            "monitor": "MONITOR ONLY (console output)",
-            "notify": "NOTIFICATION (console + Discord alerts)",
-            "live": "LIVE TRADING (console + Discord + auto-execute)",
-        }.get(self.mode, self.mode.upper())
-
-        discord_line = ""
-        if self.discord_enabled:
-            discord_line = (
-                f"Discord: ENABLED (min {config.DISCORD_MIN_PROFIT_PERCENT}%/{config.DISCORD_MIN_PROFIT_ERG} ERG, "
-                f"cooldown {config.DISCORD_COOLDOWN_SECONDS}s, confirm {config.DISCORD_CONFIRM_SCANS} scans)\n"
-                f"Tier 1 ping: >={config.DISCORD_TIER1_PROFIT_PERCENT}% + no SigUSD=USDT assumption\n"
-                f"Wallet analysis: every {config.DISCORD_WALLET_COOLDOWN_SECONDS}s | Summary: every {config.DISCORD_SUMMARY_INTERVAL_SECONDS}s"
-            )
-            if config.DISCORD_USER_ID:
-                discord_line += f"\nPinging user: <@{config.DISCORD_USER_ID}>"
-        elif self.mode in ("notify", "live"):
-            discord_line = "Discord: NOT CONFIGURED (set DISCORD_WEBHOOK_URL in .env)"
-        else:
-            discord_line = "Discord: DISABLED (use --notify or --live to enable)"
-
-        self.out.print(Panel(
-            "[bold]Ergo Arbitrage Scanner[/bold]\n"
-            f"Mode: {mode_display}\n"
-            f"Min profit: {config.MIN_PROFIT_PERCENT}%\n"
-            f"Max trade size: {config.MAX_TRADE_SIZE_ERG} ERG\n"
-            f"Chain poll: {config.CHAIN_POLL_SECONDS:g}s (node, mempool-aware) | full scan: {config.SCAN_INTERVAL_SECONDS}s\n"
-            f"Trade sizes: {self._trade_sizes}"
-            f"{' (all priced)' if config.TRADE_SIZES_UNFUNDED else ', priced up to what the wallet can fund'}\n"
-            f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}"
-            f"{'' if self.enable_use else ', USE disabled (ENABLE_USE=false)'}"
-            f"{', CEX watch-only' if self.cex_watch else ''}\n"
-            f"{discord_line}",
-            title="Starting Up",
-            border_style="red" if self.mode == "live" else "magenta",
-        ))
-
         for warning in config.deprecated_settings():
             logger.warning(warning)
         restore = self._install_signal_handlers()
         await self.connect_all()
+        self._log_startup()
 
         pruned = self.tracker.prune_scan_results(config.SCAN_RESULTS_RETENTION_DAYS)
         if pruned:
@@ -2150,7 +2199,7 @@ class ArbitrageScanner:
                 try:
                     await self.poll_once(loop.time())
                 except Exception as e:
-                    logger.error(f"Poll error: {e}", exc_info=True)
+                    self._log_poll_error(e)
                 if once:
                     break
                 next_tick = max(next_tick + config.CHAIN_POLL_SECONDS, loop.time())

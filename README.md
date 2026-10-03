@@ -94,6 +94,7 @@ The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+
 | `--log-level L` | level of `arbitrage.log` (rotated at midnight, 14 days kept) |
 | `--db PATH` | tracker database |
 | `--no-wallet` | hide the wallet panel and wallet analysis |
+| `--yes` | arm `--live` without typing `LIVE` (systemd and other unattended runs) |
 
 ## Arbitrage Strategies
 
@@ -224,6 +225,11 @@ webhook in the channel settings and create a new one.
 | **⚠️ Chain state unreadable for over 2m: ...** (red) | yes | The node gives no usable pool/bank/oracle data (down, syncing, stalled, extra index missing). Nothing is priced or traded. | Run `python arb.py doctor`; see **Troubleshooting**. |
 | **⚠️ Kucoin down for over 5m: ...** | | A watch-only exchange is not answering. | Nothing; it only affects the CEX watch. |
 | **⚠️ Oracle update pending for over 10m (stuck?)** | | An oracle update is in the mempool and not confirming. Live mode waits. | Usually nothing; it clears when the update confirms. |
+| **⚠️ Node wallet locked for over 2m: live mode cannot trade** (`--live` only) | yes | The node restarted and locked its wallet. | Unlock it (`/wallet/unlock`, see **Node setup**). |
+| **⚠️ Live trading stopped: drawdown ...** | yes | The wallet value fell more than `LIVE_MAX_DRAWDOWN_ERG` since the start of the day; nothing trades until tomorrow. | Look at the trades (`History` panel, `python arb.py balance`) before letting it run on. |
+| **⚠️ Live trading done for today: max N trades per day reached** | | `LIVE_MAX_TRADES_PER_DAY` reached. | Nothing; it resumes tomorrow. |
+| **⚠️ Live trading held for over 10m: STOP file present** | | The kill switch is on. | Delete `STOP` when you want it to trade again. |
+| **⚠️ Full scan failing for over 2m: ...** / **⚠️ Database writes failing ...** | | Something keeps failing every poll (see `arbitrage.log`), or the database is locked, full or corrupt; prices still update but nothing is recorded. | Read the error; check the disk (`df -h`) and the database. |
 | **⚠️ Live trading paused: ...** | | Live mode stopped trading after a failure. The failure itself was the pinged **LIVE** message. | Read the LIVE message and fix the cause; then `python arb.py resume` and restart the bot. |
 | **✅ ... recovered after 7m** (green) | | The failure above has ended. | Nothing. |
 | **LIVE**: executed ... / did not execute ... / LEG 2 FAILED ... / UNEXPECTED ERROR ... | yes, except "not profitable" | Result of a live trade attempt. "Nothing was spent" means nothing left the wallet. | On **LEG 2 FAILED** or **UNEXPECTED ERROR** run the command the message gives (e.g. `python arb.py redeem --sigusd all --execute`) and check `python arb.py balance`. |
@@ -246,6 +252,9 @@ The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard an
   - a CEX venue down for 5 min or more
   - an oracle update stuck for 10 min or more
   - live trading paused (no ping: the **LIVE** message for the failure behind it already pinged)
+  - `--live`: the node wallet locked for 2 min or more (ping), the drawdown limit hit (ping), the
+    day's trade cap reached, the STOP file holding trades for `DISCORD_HEALTH_LIVE_SECONDS`
+  - the full scan failing, or database writes failing, for 2 min or more
   - a failure that continues is re-alerted every 30 min
 - **Daily digest** at `DISCORD_DIGEST_HOUR` (local time), once a day, also after a restart. It shows the past 24 h: episodes per path, potential ERG, trades, outages and the wallet.
 - **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting has stayed closed for `MINT_GATE_CLOSE_SECONDS`, so minting the room away and reopening a block later does not post a new pair of messages. If the bot stops while minting is open, the message is marked "bot stopped" (also after a crash, on the next start). The dashboard Bank line and the daily digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
@@ -262,6 +271,7 @@ DISCORD_HEALTH_CHAIN_SECONDS=120       # Chain unreadable -> alert (ping)
 DISCORD_HEALTH_VENUE_SECONDS=300       # CEX venue down -> alert
 DISCORD_HEALTH_ORACLE_SECONDS=600      # Oracle update pending -> alert
 DISCORD_HEALTH_REPEAT_SECONDS=1800     # Re-alert interval while still failing
+DISCORD_HEALTH_LIVE_SECONDS=600        # STOP file holding --live this long -> alert
 DISCORD_DIGEST_HOUR=8                  # Local hour for the daily digest, -1 = off
 MINT_GATE_CONFIRM_POLLS=3              # Agreeing polls before a mint open/close alert
 MINT_GATE_MIN_ROOM_ERG=1               # Smaller mint room counts as closed (default MIN_TRADE_SIZE_ERG)
@@ -571,7 +581,8 @@ sudo systemctl restart ergo-arb       # after an update or a .env change
 
 The bot reads `.env` itself; do not also point the unit's `EnvironmentFile=` at it (systemd parses
 quotes and comments differently). Keep `--notify` in the unit until you have done the **First live
-run** by hand. In `--live`, create the STOP file (`touch STOP`) before stopping or updating, so a
+run** by hand; for `--live` the unit needs `--yes` (`main.py --live --yes --plain`), because there is
+no terminal to type the confirmation in. In `--live`, create the STOP file (`touch STOP`) before stopping or updating, so a
 restart cannot start a trade halfway through your maintenance; delete it afterwards.
 
 ### Updating
@@ -722,6 +733,7 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 | `DISCORD_HEALTH_VENUE_SECONDS` | `300` | An exchange down this long: alert. |
 | `DISCORD_HEALTH_ORACLE_SECONDS` | `600` | Oracle update pending this long: alert. |
 | `DISCORD_HEALTH_REPEAT_SECONDS` | `1800` | A failure that continues is re-alerted this often. |
+| `DISCORD_HEALTH_LIVE_SECONDS` | `600` | The STOP file holding `--live` this long: alert. |
 | `DISCORD_DIGEST_HOUR` | `8` | Local hour of the daily digest; `-1` = off. |
 | `DISCORD_CONFIRM_SCANS` | `3` | Scan-based alerts (CEX/USE paths): scans in a row before posting. |
 | `DISCORD_COOLDOWN_SECONDS` | `300` | Scan-based alerts: per-path cooldown. |
@@ -916,7 +928,9 @@ wallet; SigUSD sells and redeems are capped by the amount you ask for.
 2. **Check the pieces without spending.** `python arb.py balance` shows what the bot will trade
    with. `python arb.py arb --check` builds both legs at the best size, and your node validates
    them without broadcasting.
-3. **Start small and watch.** `python main.py --live --max-trade-erg 5`. A trade only happens when
+3. **Start small and watch.** `python main.py --live --max-trade-erg 5`. It prints the limits in
+   force and asks you to type `LIVE`; anything else exits without trading (`--yes` skips the question
+   for unattended runs). A trade only happens when
    a path shows **GO** for `LIVE_CONFIRM_POLLS` polls; until then the Live panel lists why it is not
    trading. Every trade, success or failure, is sent to Discord with a ping.
 4. **Kill switch.** Create a file named `STOP` in the bot folder, the folder with `main.py`, wherever the bot was started from; the path is logged at startup (`touch STOP`, or

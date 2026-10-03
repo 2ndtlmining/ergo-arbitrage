@@ -164,6 +164,13 @@ def startup_embed(mode: str) -> dict:
         field("Max trade", f"{config.MAX_TRADE_SIZE_ERG:g} ERG"),
         field("Digest", f"{config.DISCORD_DIGEST_HOUR}:00" if config.DISCORD_DIGEST_HOUR >= 0 else "off"),
     ]
+    if mode == "live":
+        fields += [
+            field("Reserve", f"{config.LIVE_ERG_RESERVE:g} ERG"),
+            field("Drawdown", f"{config.LIVE_MAX_DRAWDOWN_ERG:g} ERG per day"),
+            field("Trades/day", f"{config.LIVE_MAX_TRADES_PER_DAY}, cooldown {config.LIVE_TRADE_COOLDOWN_SECONDS}s"),
+            field("Slippage", f"{config.SLIPPAGE_TOLERANCE:.1%}, min profit {config.MIN_PROFIT_PERCENT:g}%"),
+        ]
     return embed(f"Ergo arbitrage started · {mode.upper()}", RED if mode == "live" else BLUE, fields)
 
 
