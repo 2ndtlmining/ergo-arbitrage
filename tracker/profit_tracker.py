@@ -721,5 +721,27 @@ class ProfitTracker:
                           "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
         self.conn.commit()
 
+    # --- live-mode state that must survive a restart (#59) ---
+
+    def trades_started_on(self, day: str) -> list[dict]:
+        """Trade attempts started on a local date (YYYY-MM-DD), oldest first."""
+        rows = self.conn.execute("SELECT * FROM trades WHERE substr(started_at, 1, 10) = ? ORDER BY id",
+                                 (day,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def last_trade_started(self):
+        """Start time (datetime) of the most recent trade attempt, or None."""
+        row = self.conn.execute("SELECT started_at FROM trades ORDER BY id DESC LIMIT 1").fetchone()
+        return datetime.fromisoformat(row[0]) if row else None
+
+    def unfinished_trades(self) -> list[dict]:
+        """Trades still marked executing/pending: the bot stopped while they ran."""
+        rows = self.conn.execute("SELECT * FROM trades WHERE status IN ('executing', 'pending') ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_meta(self, key: str):
+        self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.commit()
+
     def close(self):
         self.conn.close()

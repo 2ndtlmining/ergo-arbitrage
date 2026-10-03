@@ -11,6 +11,9 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py doctor [--no-sign]                        (is the node ready for the bot?)
     python arb.py config                                    (effective settings, mistakes in .env)
     python arb.py backup [--to backups] [--keep 14]         (consistent copy of the tracker database)
+    python arb.py resume                                    (clear a live-mode pause, then restart the bot)
+
+--execute (and main.py --live) refuse to run with dangerous settings, e.g. SLIPPAGE_TOLERANCE above 0.05.
 """
 import argparse
 import asyncio
@@ -86,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")))
     b.add_argument("--to", default=str(config.repo_path("backups")), help="folder for the copies")
     b.add_argument("--keep", type=int, default=14, help="newest copies to keep (default 14)")
+
+    rs = sub.add_parser("resume", help="clear the live-mode pause left by a failed or interrupted trade")
+    rs.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")))
     return parser
 
 
@@ -122,6 +128,24 @@ async def run(args):
             return await doctor.run_doctor(ns, sign=not args.no_sign, log=log)
 
 
+def resume(db_path: str):
+    """Clear the stored live-mode pause. The running bot keeps its pause until it is restarted."""
+    from arbitrage.scanner import LIVE_PAUSE_KEY
+    from tracker.profit_tracker import ProfitTracker
+    tracker = ProfitTracker(db_path)
+    try:
+        reason = tracker.get_meta(LIVE_PAUSE_KEY)
+        if reason is None:
+            print("Live mode is not paused.", flush=True)
+            return
+        tracker.delete_meta(LIVE_PAUSE_KEY)
+    finally:
+        tracker.close()
+    print(f"Cleared the live pause: {reason}\n"
+          "Check `python arb.py balance` first (redeem leftover SigUSD with `python arb.py redeem --sigusd all "
+          "--execute`), then restart the bot to trade again.", flush=True)
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
@@ -129,6 +153,12 @@ def main(argv=None):
     if args.command == "config":
         print("\n".join(config_check.report()), flush=True)
         return
+    if args.command == "resume":
+        resume(args.db)
+        return
+    if mode_of(args) == "execute" and (errors := config.live_config_errors()):
+        print("Refusing to --execute with these settings (.env):", *[f"  {e}" for e in errors], sep="\n", flush=True)
+        sys.exit(2)
     if args.command == "backup":
         try:
             print(f"Backed up to {backup_database(args.db, args.to, keep=args.keep)}", flush=True)

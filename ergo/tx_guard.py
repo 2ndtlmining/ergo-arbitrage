@@ -38,13 +38,25 @@ class TxGuardError(Exception):
     """The transaction does not match what we intended to sign."""
 
 
+def fee_budget_nanoerg() -> int:
+    return int(round(config.MAX_FEE_BUDGET_ERG * 1e9))
+
+
+def check_fee_budget(service_fee: int, miner_fee: int):
+    """Service + miner fees of one signed transaction may not exceed MAX_FEE_BUDGET_ERG."""
+    if service_fee + miner_fee > fee_budget_nanoerg():
+        raise TxGuardError(f"fees {service_fee + miner_fee} nanoERG (service {service_fee} + miner {miner_fee}) "
+                           f"exceed MAX_FEE_BUDGET_ERG={config.MAX_FEE_BUDGET_ERG:g}")
+
+
 @dataclass
 class SignPolicy:
     max_erg_spent: int                                       # nanoERG net leaving the wallet, all fees included
     min_received: dict[str, int] = field(default_factory=dict)     # token id -> min raw amount received
     max_token_spent: dict[str, int] = field(default_factory=dict)  # token id -> max raw amount spent
     min_erg_received: int = 0                                # nanoERG net the wallet must gain (token -> ERG swaps)
-    max_service_fee: int = 1_000_000_000                    # nanoERG to whitelisted service-fee trees
+    # nanoERG to whitelisted service-fee trees; default MAX_FEE_BUDGET_ERG
+    max_service_fee: int = field(default_factory=lambda: fee_budget_nanoerg())
     max_miner_fee: int = 10_000_000                         # 0.01 ERG
     service_fee_trees: frozenset = field(default_factory=lambda: frozenset(config.SERVICE_FEE_ERGO_TREES))
     # Explicit recipients for a send: ErgoTree -> {"ERG": max nanoERG, token id: max raw amount}
@@ -152,9 +164,10 @@ def verify_unsigned_tx(tx: dict, input_boxes: list[dict], wallet_trees: set[str]
         raise TxGuardError(f"miner fee {miner_fee} exceeds {policy.max_miner_fee}")
     if service_fee > policy.max_service_fee:
         raise TxGuardError(f"service fee {service_fee} exceeds {policy.max_service_fee}")
+    check_fee_budget(service_fee, miner_fee)
 
     erg_spent = wallet_in_erg - wallet_out_erg
-    trade_cap = int(config.MAX_TRADE_SIZE_ERG * 1e9) + policy.max_service_fee + policy.max_miner_fee
+    trade_cap = int(config.MAX_TRADE_SIZE_ERG * 1e9) + fee_budget_nanoerg()
     if erg_spent > trade_cap:
         raise TxGuardError(f"wallet spends {erg_spent} nanoERG, over MAX_TRADE_SIZE_ERG={config.MAX_TRADE_SIZE_ERG} + fee budget")
     if erg_spent > policy.max_erg_spent:
