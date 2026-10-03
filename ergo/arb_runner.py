@@ -251,8 +251,12 @@ def choose_size(path: str, pool_box: dict, bank_box: dict, oracle_box: dict, wal
 
 async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, execute: bool = False,
                   force: bool = False, wait_leg2: bool = True, max_erg_in: Optional[int] = None,
-                  log: Callable[[str], None] = print) -> ArbResult:
+                  log: Callable[[str], None] = print,
+                  confirm: Optional[Callable[[str, float], bool]] = None) -> ArbResult:
     """Plan, verify and (optionally) execute one two-leg arbitrage.
+
+    confirm(message, expected_erg): asked before --force executes below MIN_PROFIT_PERCENT; without
+    it, or on no, nothing is signed (status "not_confirmed").
 
     path "redeem": leg 1 pool buy (ERG -> SigUSD), leg 2 bank redeem.
     path "mint":   leg 1 bank mint (ERG -> SigUSD), leg 2 pool sell. `erg_in` is the mint budget.
@@ -312,6 +316,13 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
         log("  Not executing: below MIN_PROFIT_PERCENT (use --check to validate for free).")
         result.status = "not_profitable"
         return result
+    if execute and not profitable:
+        expected = plan["profit_nanoerg"] / 1e9
+        message = f"expected {expected:+.4f} ERG ({plan['profit_percent']:+.2f}%) on {erg_in / 1e9:g} ERG"
+        if confirm is None or not confirm(message, expected):
+            log("  Not executing: the --force trade below MIN_PROFIT_PERCENT was not confirmed.")
+            result.status, result.message = "not_confirmed", message
+            return result
 
     try:
         signed1 = await guarded_sign(ns, node, plan["leg1_tx"], plan["leg1_policy"], execute=execute or check,

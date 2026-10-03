@@ -15,7 +15,7 @@ SCHEMA_VERSION = 3
 class ProfitTracker:
     def __init__(self, db_path: str = "arbitrage_tracker.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, timeout=10)  # another process (backup, arb.py) may hold a write briefly
         self.conn.row_factory = sqlite3.Row
         # WAL lets a dashboard read while the scanner writes
         self.conn.execute("PRAGMA journal_mode=WAL")
