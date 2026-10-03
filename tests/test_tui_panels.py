@@ -2,7 +2,6 @@
 import time
 from types import SimpleNamespace
 
-import pytest
 
 from arbitrage.dashboard_state import DashboardState, ExchangeRow, VenueStatus
 from arbitrage.dashboard_view import (exchanges_panel, health_strip, history_panel, prices_panel, render,

@@ -6,7 +6,6 @@ import pytest
 import arbitrage.scanner as scanner_module
 import config
 from arbitrage.scanner import ArbitrageScanner
-from exchanges import cex_public as cp
 from tests.test_cex_sources import QUOTES
 from tests.test_chain_scanner import HEALTHY, WALLET, Reader, snap
 
