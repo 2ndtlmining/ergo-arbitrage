@@ -10,16 +10,17 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py arb    [--erg best|10] [--path redeem|mint] [--check | --execute] [--force]
     python arb.py doctor [--no-sign]                        (is the node ready for the bot?)
     python arb.py config                                    (effective settings, mistakes in .env)
+    python arb.py backup [--to backups] [--keep 14]         (consistent copy of the tracker database)
 """
 import argparse
 import asyncio
-import io
 import sys
 
 import aiohttp
 
 import config
 import config_check
+from tracker.backup import backup_database
 from ergo import actions, doctor
 from ergo.amounts import parse_amount
 
@@ -80,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("config", help="effective settings and their source; unknown keys, placeholders, renamed "
                                   "settings in .env (secrets masked)")
+
+    b = sub.add_parser("backup", help="consistent copy of the tracker database (safe while the bot runs)")
+    b.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")))
+    b.add_argument("--to", default=str(config.repo_path("backups")), help="folder for the copies")
+    b.add_argument("--keep", type=int, default=14, help="newest copies to keep (default 14)")
     return parser
 
 
@@ -118,9 +124,17 @@ async def run(args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if args.command == "config":
         print("\n".join(config_check.report()), flush=True)
+        return
+    if args.command == "backup":
+        try:
+            print(f"Backed up to {backup_database(args.db, args.to, keep=args.keep)}", flush=True)
+        except FileNotFoundError as e:
+            print(e, flush=True)
+            sys.exit(1)
         return
     try:
         code = asyncio.run(run(args))

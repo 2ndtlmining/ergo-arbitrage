@@ -2,6 +2,11 @@
 
 A Python application that monitors price differences across centralized exchanges (CEX), decentralized exchanges (DEX), and the SigmaUSD bank on the Ergo blockchain. The goal is simple: **end up with more ERG**.
 
+**New here?** Follow [Getting started](#getting-started) from install to the first launch. Keeping it
+running: [Running unattended](#running-unattended), [Updating](#updating), [Backups](#backups),
+[Troubleshooting](#troubleshooting). Discord: [setup](#discord-setup) and
+[messages at a glance](#messages-at-a-glance). Every setting: [Settings reference](#settings-reference).
+
 ## How It Works
 
 The app continuously scans prices from multiple sources and calculates whether an arbitrage opportunity exists after accounting for **all fees, slippage, and transaction costs**. No trade is recommended unless the math shows a net profit in ERG.
@@ -171,58 +176,76 @@ Every opportunity calculation includes ALL of these costs:
 
 ## Discord Notifications
 
-The `--notify` mode sends alerts to a Discord channel via webhook. It includes anti-spam protections:
+`--notify` and `--live` post to a Discord channel through a webhook. The bot never reads Discord;
+it only posts and edits its own messages.
 
-### Notification Flow
+### Discord setup
 
-1. **Streak confirmation**: An opportunity must appear profitable for `DISCORD_CONFIRM_SCANS` consecutive scans (default 3 = 45 seconds) before any notification is sent. Filters out price blips and API glitches.
+1. **Webhook.** In your server, open the channel's settings (gear icon) -> **Integrations** ->
+   **Webhooks** -> **New Webhook**. Name it, then **Copy Webhook URL**. Use a private channel: the
+   messages include your wallet balances.
+2. **Your user ID** (for @mentions on the important alerts): **User Settings** -> **Advanced** ->
+   switch on **Developer Mode**. Then right-click your own name (in the member list or on a message)
+   -> **Copy User ID**. It is a long number such as `123456789012345678`.
+3. Put both in `.env`:
 
-2. **Minimum thresholds**: Must meet BOTH `DISCORD_MIN_PROFIT_PERCENT` (default 1.0%) AND `DISCORD_MIN_PROFIT_ERG` (default 0.5 ERG absolute profit). A 1 ERG trade at "+2%" is only +0.02 ERG - not actionable.
+   ```env
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   DISCORD_USER_ID=123456789012345678
+   ```
 
-3. **Tier system**:
-   - **Tier 1 (ping)**: >= 2% profit AND >= 0.5 ERG AND no SigUSD=USDT assumption. Sends `@user` mention.
-   - **Tier 2 (silent)**: Passes thresholds but below Tier 1. Message without ping.
+   To post into a thread of a forum or text channel, add `?thread_id=<thread id>` to the webhook URL
+   (copy the thread's ID the same way, with Developer Mode on).
+4. Check it: `python arb.py doctor` shows the webhook's name without posting anything
+   (`OK discord webhook "arb-bot" (channel ...)`). Then `python main.py --notify` posts
+   **Ergo arbitrage started · NOTIFY**.
 
-4. **Per-path cooldown**: Same path won't notify again for `DISCORD_COOLDOWN_SECONDS` (default 300s).
+The webhook URL is a password: anyone who has it can post to your channel. If it leaks, delete the
+webhook in the channel settings and create a new one.
 
-5. **Price staleness guard**: If any price source used by a path hasn't been fetched in the last `PRICE_STALE_SECONDS` (default 60s), that path's notification is skipped.
+### Messages at a glance
 
-6. **Wallet analysis**: Sent every `DISCORD_WALLET_COOLDOWN_SECONDS` (default 600s = 10 min), OR when a NEW opportunity just hit confirmation threshold. Not every scan.
+| Message | Ping | Meaning | What to do |
+|---|---|---|---|
+| **Ergo arbitrage started · NOTIFY** (or `· LIVE`, red) | | The bot started; shows the alert thresholds, max trade and digest hour. | Nothing. A `LIVE` you did not start means live mode is running. |
+| **Ergo arbitrage stopped** | | Clean shutdown, with the session's counts. | Nothing, unless you did not stop it (see **Troubleshooting**). |
+| **OPEN · pool→redeem +1.23%** (green) | at or above `DISCORD_TIER1_PROFIT_PERCENT` | An on-chain path has stayed profitable for `DISCORD_CONFIRM_SECONDS` at its best size. Edited while it lasts. | `--notify`: decide whether to trade it by hand (`python arb.py arb --check`, then `--execute`). `--live` trades it by itself when every check passes. |
+| **Closed · pool→redeem after 4m · peak +1.40%** (grey) | | The same message once the path has not qualified for `DISCORD_CLOSE_SECONDS`: duration, peak, last profit, and the live trade result if there was one. | Nothing. |
+| **Closed · pool→redeem · bot restarted** (grey) | | An episode that was open when the bot stopped or crashed, closed at the next start. | Nothing; a new OPEN follows if the path still qualifies. |
+| **⚠️ Chain state unreadable for over 2m: ...** (red) | yes | The node gives no usable pool/bank/oracle data (down, syncing, stalled, extra index missing). Nothing is priced or traded. | Run `python arb.py doctor`; see **Troubleshooting**. |
+| **⚠️ Kucoin down for over 5m: ...** | | A watch-only exchange is not answering. | Nothing; it only affects the CEX watch. |
+| **⚠️ Oracle update pending for over 10m (stuck?)** | | An oracle update is in the mempool and not confirming. Live mode waits. | Usually nothing; it clears when the update confirms. |
+| **⚠️ Live trading paused: ...** | | Live mode stopped trading after a failure. The failure itself was the pinged **LIVE** message. | Read the LIVE message, fix, restart the bot to resume. |
+| **✅ ... recovered after 7m** (green) | | The failure above has ended. | Nothing. |
+| **LIVE**: executed ... / did not execute ... / LEG 2 FAILED ... / UNEXPECTED ERROR ... | yes, except "not profitable" | Result of a live trade attempt. "Nothing was spent" means nothing left the wallet. | On **LEG 2 FAILED** or **UNEXPECTED ERROR** run the command the message gives (e.g. `python arb.py redeem --sigusd all --execute`) and check `python arb.py balance`. |
+| **Bank mint OPEN · RR 412%** (green) | at most once per `MINT_GATE_PING_COOLDOWN_SECONDS` | The SigmaUSD bank lets you mint again, with the room in ERG. | A mint -> pool sell path may open; watch for an OPEN message. |
+| **Bank mint closed · open for 3h** (grey) | | The same message once minting has stayed shut for `MINT_GATE_CLOSE_SECONDS`. | Nothing. |
+| **Bank mint · bot stopped** (grey) | | The bot stopped while minting was open, so it no longer knows. | Nothing; the next start reports the gate again. |
+| **Daily digest · last 24h** (blue) | | Once a day at `DISCORD_DIGEST_HOUR`: episodes per path, potential ERG, trades, outages, wallet. | Read it; it is the quickest way to see if the bot is earning anything. |
+| **Wallet** (blue) | | Wallet balances and value, every `DISCORD_WALLET_COOLDOWN_SECONDS`. | Nothing. |
+| **CEX watch-only: CEX** | | An exchange is far from the pool price, or the cross-exchange spread pays after every fee. At most once per `CEX_WATCH_COOLDOWN_SECONDS`. | Informational: no CEX is connected, nothing can trade it. |
+| **Scan #123 - 12:00:00 \| 0 profitable paths** | | The text summary of all paths, every `DISCORD_SUMMARY_INTERVAL_SECONDS`. | Nothing. |
+| **Arbitrage Opportunity Found** | at or above `DISCORD_TIER1_PROFIT_PERCENT` | Scan-based alert for the CEX/USE paths (both off by default). | See the path text; these paths are not traded automatically. |
 
-7. **Summary heartbeat**: Compact grid of all paths sent every `DISCORD_SUMMARY_INTERVAL_SECONDS` (default 1800s = 30 min).
+### How the on-chain alerts work
 
-### Discord Configuration
-
-```env
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-DISCORD_USER_ID=123456789              # Your Discord user ID for @mentions
-DISCORD_MIN_PROFIT_PERCENT=1.0         # Min % to notify (default 1.0)
-DISCORD_MIN_PROFIT_ERG=0.5             # Min absolute ERG profit (default 0.5)
-DISCORD_TIER1_PROFIT_PERCENT=2.0       # Min % for Tier 1 ping (default 2.0)
-DISCORD_COOLDOWN_SECONDS=300           # Per-path cooldown (default 300)
-DISCORD_CONFIRM_SCANS=3                # Consecutive scans before alerting (default 3)
-DISCORD_WALLET_COOLDOWN_SECONDS=600    # Wallet analysis interval (default 600)
-DISCORD_SUMMARY_INTERVAL_SECONDS=1800  # Summary heartbeat interval (default 1800)
-PRICE_STALE_SECONDS=60                 # Max price age before skipping (default 60)
-```
-
-### Discord messages (on-chain paths)
-
-The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard and the live gate, not the scan streaks above:
+The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard and the live gate:
 
 - **One message per opportunity.** A path that stays GO (and meets both minimums) for `DISCORD_CONFIRM_SECONDS` posts one embed. While it stays open, that same message is edited at most every `DISCORD_EDIT_SECONDS`, and only when profit moves by more than 0.1 percentage points. Once the path has not qualified for `DISCORD_CLOSE_SECONDS`, the message turns grey and shows how long it lasted, the peak and the last profit, plus the live trade result if there was one. Opens at or above the Tier 1 % ping you.
 - **Health alerts**, each followed by a recovery message:
   - chain state unreadable for 2 min or more (ping)
   - a CEX venue down for 5 min or more
   - an oracle update stuck for 10 min or more
-  - live trading paused (ping)
+  - live trading paused (no ping: the **LIVE** message for the failure behind it already pinged)
   - a failure that continues is re-alerted every 30 min
 - **Daily digest** at `DISCORD_DIGEST_HOUR` (local time), once a day, also after a restart. It shows the past 24 h: episodes per path, potential ERG, trades, outages and the wallet.
 - **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting has stayed closed for `MINT_GATE_CLOSE_SECONDS`, so minting the room away and reopening a block later does not post a new pair of messages. If the bot stops while minting is open, the message is marked "bot stopped" (also after a crash, on the next start). The dashboard Bank line and the daily digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
 - Discord is sent from a background queue (bounded, with HTTP 429 retry), so a slow or unreachable Discord never delays the 2 s chain poll.
-- The CEX/USE paths still use the streak/cooldown flow described above.
 
 ```env
+DISCORD_MIN_PROFIT_PERCENT=1.0         # Min % to post (default 1.0)
+DISCORD_MIN_PROFIT_ERG=0.5             # Min absolute ERG profit (default 0.5); both must be met
+DISCORD_TIER1_PROFIT_PERCENT=2.0       # Ping at or above this % (default 2.0)
 DISCORD_CONFIRM_SECONDS=10             # Held this long before a message opens
 DISCORD_CLOSE_SECONDS=10               # Gone this long before it closes
 DISCORD_EDIT_SECONDS=30                # At most one edit per this
@@ -235,6 +258,24 @@ MINT_GATE_CONFIRM_POLLS=3              # Agreeing polls before a mint open/close
 MINT_GATE_MIN_ROOM_ERG=1               # Smaller mint room counts as closed (default MIN_TRADE_SIZE_ERG)
 MINT_GATE_PING_COOLDOWN_SECONDS=3600   # At most one mint-open ping per this
 MINT_GATE_CLOSE_SECONDS=600            # Minting shut this long before the message says closed
+```
+
+### Scan-based alerts (CEX/USE paths only)
+
+The CEX and USE paths (both off by default) still use the older scan flow:
+
+1. **Streak confirmation**: a path must be profitable for `DISCORD_CONFIRM_SCANS` scans in a row (default 3 = 45 seconds) before it posts.
+2. **Minimum thresholds**: both `DISCORD_MIN_PROFIT_PERCENT` and `DISCORD_MIN_PROFIT_ERG`.
+3. **Tiers**: at or above `DISCORD_TIER1_PROFIT_PERCENT` with no SigUSD = USDT assumption pings you; below that it posts silently.
+4. **Per-path cooldown**: `DISCORD_COOLDOWN_SECONDS` (default 300) between posts for the same path.
+5. **Price staleness guard**: a path whose prices are older than `PRICE_STALE_SECONDS` is skipped.
+
+```env
+DISCORD_CONFIRM_SCANS=3                # Scans in a row before posting (CEX/USE paths)
+DISCORD_COOLDOWN_SECONDS=300           # Per-path cooldown (CEX/USE paths)
+DISCORD_WALLET_COOLDOWN_SECONDS=600    # Wallet message interval
+DISCORD_SUMMARY_INTERVAL_SECONDS=1800  # Text summary interval
+PRICE_STALE_SECONDS=60                 # Max price age before skipping
 ```
 
 **Privacy:** the webhook receives your wallet balances and your Discord user id. Post it to a private channel.
@@ -448,18 +489,6 @@ check signs a 1 ERG trade and has the node validate it, without broadcasting it.
 OK, `--notify` is safe to leave running: it never spends anything. Before `--live`, read
 **Live mode** and **First live run** below.
 
-### Updating
-
-```bash
-# stop the bot first (Ctrl+C), then:
-cd ~/ergo-arbitrage
-git pull
-.venv/bin/pip install -r requirements.txt   # only needed when requirements.txt changed
-.venv/bin/python arb.py config              # new settings appear with their defaults
-```
-
-The tracker database (`arbitrage_tracker.db`) is not in git and is upgraded in place on start.
-
 ### Running
 
 ```bash
@@ -471,6 +500,133 @@ python main.py --once --plain   # one scan, classic output
 # Run tests (unit only; add -m live for the tests that call your node and public APIs)
 python -m pytest -q
 ```
+
+### Running unattended
+
+Started from an SSH session, the bot stops when the session closes. Use **one** of these, never
+both at once: two copies of the bot would both post to Discord, and in `--live` both would trade.
+
+**tmux** keeps the full dashboard and lets you look at it at any time. It does not survive a reboot.
+
+```bash
+sudo apt install -y tmux
+tmux new -s arb                                   # a terminal that keeps running
+cd ~/ergo-arbitrage && .venv/bin/python main.py --notify
+# detach: Ctrl+B, then D.  Back later: tmux attach -t arb.  Stop: Ctrl+C inside it.
+```
+
+**systemd** starts the bot at boot and restarts it after a crash. The full-screen dashboard needs a
+terminal, so the service runs `--plain` with its output discarded; the log is `arbitrage.log` in the
+bot folder (rotated at midnight, 14 days kept), and crashes land in the journal. Run this from the
+bot folder; it fills in your user name and folder:
+
+```bash
+cd ~/ergo-arbitrage
+sudo tee /etc/systemd/system/ergo-arb.service > /dev/null <<EOF
+[Unit]
+Description=Ergo arbitrage bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$USER
+WorkingDirectory=$PWD
+ExecStart=$PWD/.venv/bin/python main.py --notify --plain
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=null
+StandardError=journal
+Restart=always
+RestartSec=30
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now ergo-arb
+```
+
+```bash
+systemctl status ergo-arb             # running? since when?
+tail -f ~/ergo-arbitrage/arbitrage.log
+journalctl -u ergo-arb -n 50          # start-up errors and crashes
+sudo systemctl stop ergo-arb          # stop (Ctrl+C equivalent: finishes the scan, posts "stopped")
+sudo systemctl restart ergo-arb       # after an update or a .env change
+```
+
+The bot reads `.env` itself; do not also point the unit's `EnvironmentFile=` at it (systemd parses
+quotes and comments differently). Keep `--notify` in the unit until you have done the **First live
+run** by hand. In `--live`, create the STOP file (`touch STOP`) before stopping or updating, so a
+restart cannot start a trade halfway through your maintenance; delete it afterwards.
+
+### Updating
+
+```bash
+cd ~/ergo-arbitrage
+sudo systemctl stop ergo-arb                 # or Ctrl+C in tmux
+git pull
+.venv/bin/pip install -r requirements.txt    # only needed when requirements.txt changed
+.venv/bin/python arb.py config               # new settings appear with their defaults
+.venv/bin/python arb.py doctor --no-sign     # the node is still fine
+sudo systemctl start ergo-arb                # or start it again in tmux
+```
+
+If `git pull` refuses because you changed a file in the folder, keep your change aside and update:
+`git stash`, `git pull`, then `git stash pop` (or `git stash drop` to discard your change). `.env`, the
+database and the logs are not in git and are never touched.
+
+The tracker database (`arbitrage_tracker.db`) is upgraded in place on start.
+
+### Backups
+
+`arbitrage_tracker.db` holds the history (episodes, trades, scans). It runs in WAL mode, so a plain
+`cp` while the bot runs can miss recent rows. `arb.py backup` takes a consistent copy, safe while the
+bot runs, into `backups/` and keeps the newest 14:
+
+```bash
+.venv/bin/python arb.py backup                           # backups/arbitrage_tracker-2026-10-04-0315.db
+.venv/bin/python arb.py backup --to /mnt/nas/arb --keep 30
+```
+
+Every night at 03:15, from the bot folder:
+
+```bash
+(crontab -l 2>/dev/null; echo "15 3 * * * cd $PWD && .venv/bin/python arb.py backup >> backups.log 2>&1") | crontab -
+crontab -l                                               # check it is there
+```
+
+Copy `backups/` to another machine now and then. To restore: stop the bot, copy a backup over
+`arbitrage_tracker.db`, delete `arbitrage_tracker.db-wal` and `arbitrage_tracker.db-shm`, start the bot.
+
+Back up **`.env`** separately and privately (a password manager is a good place): it holds your node
+API key and webhook. Your wallet's mnemonic is what really matters; the node only holds a copy of it.
+
+### Troubleshooting
+
+`python arb.py doctor` names most problems with a fix; `python arb.py config` shows the settings in
+use. Common messages:
+
+| Message | Meaning | Fix |
+|---|---|---|
+| `Cannot reach your Ergo node at http://...` / doctor `FAIL node reachable` | Nothing answers at `ERGO_NODE_URL`. | Is the node running? Right IP and port (Rust default 9099)? A node on another machine must listen on its LAN address and allow this machine through its firewall (see **Node setup**). |
+| doctor `FAIL API key ... HTTP 401` or `403` | The node refused `ERGO_NODE_API_KEY`. | Put the plain secret in `.env`, and its hash in the node config; restart the node after changing the hash. On the Rust node, no `api_key_hash` at all also gives 403. |
+| doctor `FAIL wallet locked` / dashboard `wallet ●` red / live `node not ready (... unlocked=False)` | The node restarted; its wallet locks on every restart. | Unlock it (`/wallet/unlock`, see **Node setup**). |
+| doctor `FAIL wallet no wallet on this node` | The wallet was never restored on this node (e.g. a new Rust node). | Restore it (see **Node setup**) and wait for the wallet scan. |
+| `node syncing: N blocks behind` / doctor `WARN synced` | The node is still catching up; nothing is priced or traded until it is synced. | Wait. |
+| `no new block for N min ... (node stalled or without peers?)` | The node's height has not moved for `CHAIN_STALL_SECONDS`. | Check the node's peers and its log; restart it. |
+| doctor `FAIL chain state` / `HTTP 404 ... /blockchain/...` | The node's extra index is off or still building. | Scala `extraIndex = true`, Rust `[indexer] enabled = true`, then let it build. |
+| `⚠️ Chain state unreadable` in Discord | Any of the four rows above, for over 2 minutes. | `python arb.py doctor`. |
+| doctor `WARN discord webhook answered HTTP 404 Unknown Webhook` (or 401) / log `Discord POST returned HTTP 404` | The webhook was deleted or the URL is mistyped. | Create a new webhook and copy the URL again (see **Discord setup**). |
+| log `Discord queue full: dropped the oldest message` | Discord was unreachable or rate-limiting for a while. | Nothing if it stops by itself; check the network if it repeats. |
+| Venues panel `blocked by Cloudflare` | SafeTrade's API answered with a captcha page. | Normal for SafeTrade; leave `SAFETRADE_ENABLED=false`. |
+| Live panel `STOP file present (...)` | The kill switch is on. | `rm STOP` in the bot folder to allow live trades again. |
+| Live panel `paused after: ... (restart to resume)` | A live trade failed and live mode stopped. | Read the pinged **LIVE** message, fix the cause, restart the bot. |
+| `X is no longer used; set Y instead` | A setting was renamed. | Rename it in `.env`; `arb.py config` lists them. |
+| `arb.py config`: `unknown ... did you mean ...?` | A typo in `.env`; the setting is silently not used. | Fix the name. |
+| `error: externally-managed-environment` | `pip install` outside the venv. | Use `.venv/bin/pip install -r requirements.txt` (see **Install**). |
+| `Command 'python' not found` | Ubuntu has only `python3` outside the venv. | Use `.venv/bin/python`, or activate the venv first. |
+| `SyntaxError` or `TypeError ... unsupported operand type(s) for \|` at start | Python older than 3.11. | Create the venv with Python 3.11+ (see **Install**). |
+| Windows: `... cannot be loaded because running scripts is disabled on this system` | PowerShell blocks `Activate.ps1`. | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, or skip activation and use `.venv\Scripts\python`. |
 
 ## Settings reference
 
@@ -645,6 +801,7 @@ python arb.py arb    --check                            # two-leg pool buy -> ba
 python arb.py arb    --erg 10 --path mint --check       # fixed size; bank mint -> pool sell
 python arb.py doctor                                    # is the node ready for the bot? (see below)
 python arb.py config                                    # settings in use and mistakes in .env
+python arb.py backup                                    # consistent copy of the database (see Backups)
 ```
 
 **`arb.py doctor`** first warns about `.env` mistakes and checks the Discord webhook (a GET that shows
