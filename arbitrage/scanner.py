@@ -1372,7 +1372,28 @@ class ArbitrageScanner:
             blockers.append(f"cooldown {wait:.0f}s")
         if self._trades_today_count() >= config.LIVE_MAX_TRADES_PER_DAY:
             blockers.append(f"max {config.LIVE_MAX_TRADES_PER_DAY} trades per day reached")
+        blockers += self._implausible(prices)
         return blockers
+
+    def _implausible(self, prices: dict) -> list[str]:
+        """Data too good to be true (a decoding bug, a misread box, an oracle jump): never trade on it."""
+        out = []
+        for key in LIVE_PATHS:
+            choice = self.last_sizing.get(key)
+            if choice is not None and choice.ok and choice.profit_percent > config.LIVE_MAX_PROFIT_PERCENT:
+                out.append(f"implausible profit {choice.profit_percent:+.2f}% on {PATH_LABELS.get(key, key)} > "
+                           f"LIVE_MAX_PROFIT_PERCENT {config.LIVE_MAX_PROFIT_PERCENT:g} (check the data)")
+        oracle = ((prices or {}).get("bank") or {}).get("oracle_erg_usd")
+        mids = sorted((q.bid + q.ask) / 2 for q in ((self._last_prices or {}).get("cex") or {}).values()
+                      if getattr(q, "book", None) is not None and q.bid and q.ask)
+        if oracle and len(mids) >= 2:
+            n = len(mids)
+            median = mids[n // 2] if n % 2 else (mids[n // 2 - 1] + mids[n // 2]) / 2
+            deviation = (oracle / median - 1) * 100
+            if abs(deviation) > config.LIVE_MAX_ORACLE_DEVIATION_PERCENT:
+                out.append(f"oracle ${oracle:.4f} is {deviation:+.1f}% from the exchanges' median ${median:.4f} > "
+                           f"LIVE_MAX_ORACLE_DEVIATION_PERCENT {config.LIVE_MAX_ORACLE_DEVIATION_PERCENT:g}")
+        return out
 
     async def _global_blockers(self, wallet: dict, prices: dict) -> list[str]:
         """Reasons no path would trade right now (kill switch, pause, limits, node)."""

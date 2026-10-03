@@ -227,6 +227,7 @@ webhook in the channel settings and create a new one.
 | **⚠️ Oracle update pending for over 10m (stuck?)** | | An oracle update is in the mempool and not confirming. Live mode waits. | Usually nothing; it clears when the update confirms. |
 | **⚠️ Node wallet locked for over 2m: live mode cannot trade** (`--live` only) | yes | The node restarted and locked its wallet. | Unlock it (`/wallet/unlock`, see **Node setup**). |
 | **⚠️ Live trading stopped: drawdown ...** | yes | The wallet value fell more than `LIVE_MAX_DRAWDOWN_ERG` since the start of the day; nothing trades until tomorrow. | Look at the trades (`History` panel, `python arb.py balance`) before letting it run on. |
+| **⚠️ Live trading blocked on implausible data: ...** | yes | A path shows more profit than `LIVE_MAX_PROFIT_PERCENT`, or the oracle is far from the exchanges' prices: likely bad data, so nothing trades. | Compare the pool, bank and oracle with another source (`python arb.py quote`, an explorer). If it is real, trade it by hand with `arb.py arb --force`. |
 | **⚠️ Live trading done for today: max N trades per day reached** | | `LIVE_MAX_TRADES_PER_DAY` reached. | Nothing; it resumes tomorrow. |
 | **⚠️ Live trading held for over 10m: STOP file present** | | The kill switch is on. | Delete `STOP` when you want it to trade again. |
 | **⚠️ Full scan failing for over 2m: ...** / **⚠️ Database writes failing ...** | | Something keeps failing every poll (see `arbitrage.log`), or the database is locked, full or corrupt; prices still update but nothing is recorded. | Read the error; check the disk (`df -h`) and the database. |
@@ -712,6 +713,8 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 | `LIVE_MAX_TRADES_PER_DAY` | `10` | Trade attempts per day before live mode stops for the day. Counted from the database, so restarts do not reset it. |
 | `LIVE_MAX_DRAWDOWN_ERG` | `5` | Live mode pauses if the wallet value falls this much. |
 | `LIVE_ERG_RESERVE` | `1` | ERG always left in the wallet. |
+| `LIVE_MAX_PROFIT_PERCENT` | `10` | A profit above this is treated as bad data: nothing trades, a pinged alert is sent. `arb.py --execute` refuses it too (`--force` overrides). |
+| `LIVE_MAX_ORACLE_DEVIATION_PERCENT` | `5` | The oracle further than this from the median of the exchanges' prices (at least two, from the CEX watch) blocks live trading, with a pinged alert. |
 | `LIVE_STOP_FILE` | `STOP` | Kill switch: while this file exists nothing trades (relative = in the bot folder). |
 | `LEG2_WATCH_TIMEOUT_SECONDS` | `1200` | How long leg 2 (bank redeem) is followed until confirmed. |
 | `LEG2_WATCH_INTERVAL_SECONDS` | `20` | How often it is checked. |
@@ -886,6 +889,8 @@ ratio stays >= 400% after minting:
 | Wallet value drawdown since the start of the day | `LIVE_MAX_DRAWDOWN_ERG` (5) |
 | Time since last trade | `LIVE_TRADE_COOLDOWN_SECONDS` (300) |
 | Trades today | `LIVE_MAX_TRADES_PER_DAY` (10) |
+| Profit not implausibly high | `LIVE_MAX_PROFIT_PERCENT` (10) |
+| Oracle close to the exchanges' median price | `LIVE_MAX_ORACLE_DEVIATION_PERCENT` (5) |
 
 **Chain watcher.** Pool, bank and oracle boxes come from your node every `CHAIN_POLL_SECONDS`
 (2 s), mempool included: a pending pool or bank transaction is priced right away, and trades chain
@@ -906,7 +911,8 @@ day's trade count and the day's drawdown baseline are also restored from the dat
 setting is outside its safe range: `SLIPPAGE_TOLERANCE` 0-0.05, `MIN_PROFIT_PERCENT` >= 0.1,
 `MAX_TRADE_SIZE_ERG` up to 1000, `LIVE_ERG_RESERVE` >= 0.01, `LIVE_CONFIRM_POLLS` >= 2,
 `LIVE_TRADE_COOLDOWN_SECONDS` >= 30, `LIVE_MAX_DRAWDOWN_ERG` up to `MAX_TRADE_SIZE_ERG`,
-`MAX_FEE_BUDGET_ERG` 0.002-2, `EXECUTION_BUFFER` 0-0.05. `--max-trade-erg` can only lower the cap.
+`MAX_FEE_BUDGET_ERG` 0.002-2, `EXECUTION_BUFFER` 0-0.05, `LIVE_MAX_PROFIT_PERCENT` above
+`MIN_PROFIT_PERCENT` and up to 100, `LIVE_MAX_ORACLE_DEVIATION_PERCENT` 0.5-50. `--max-trade-erg` can only lower the cap.
 
 **Leg 2 price floor.** Leg 2 is built again on fresh boxes right before it is signed, and again if it
 drops from the mempool. It must return at least the planned ERG minus `SLIPPAGE_TOLERANCE` (1%);

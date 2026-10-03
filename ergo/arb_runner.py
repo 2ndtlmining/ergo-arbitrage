@@ -312,6 +312,12 @@ async def run_arb(ns, path: str, erg_in: Optional[int], *, check: bool = False, 
         result.status, result.message = "refused", str(e)
         return result
 
+    if execute and plan["profit_percent"] > config.LIVE_MAX_PROFIT_PERCENT and not force:
+        msg = (f"implausible profit {plan['profit_percent']:+.2f}% > LIVE_MAX_PROFIT_PERCENT "
+               f"{config.LIVE_MAX_PROFIT_PERCENT:g}: check the data (--check), or --force if it is real")
+        log(f"  Not executing: {msg}")
+        result.status, result.message = "implausible", msg
+        return result
     if execute and not profitable and not force:
         log("  Not executing: below MIN_PROFIT_PERCENT (use --check to validate for free).")
         result.status = "not_profitable"

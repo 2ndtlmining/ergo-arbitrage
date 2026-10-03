@@ -222,6 +222,8 @@ LIVE_CONFIRM_POLLS = int(setting("LIVE_CONFIRM_POLLS", "2"))            # profit
 LIVE_TRADE_COOLDOWN_SECONDS = int(setting("LIVE_TRADE_COOLDOWN_SECONDS", "300"))
 LIVE_MAX_TRADES_PER_DAY = int(setting("LIVE_MAX_TRADES_PER_DAY", "10"))
 LIVE_MAX_DRAWDOWN_ERG = float(setting("LIVE_MAX_DRAWDOWN_ERG", "5"))     # stop if wallet value falls this much
+LIVE_MAX_PROFIT_PERCENT = float(setting("LIVE_MAX_PROFIT_PERCENT", "10"))       # more is implausible: blocked
+LIVE_MAX_ORACLE_DEVIATION_PERCENT = float(setting("LIVE_MAX_ORACLE_DEVIATION_PERCENT", "5"))  # oracle vs CEX median
 LIVE_ERG_RESERVE = float(setting("LIVE_ERG_RESERVE", "1"))               # ERG always kept in the wallet
 LIVE_STOP_FILE = setting("LIVE_STOP_FILE", "STOP")                      # kill switch: no trades while it exists (relative = in the bot folder)
 CHAIN_STALL_SECONDS = float(setting("CHAIN_STALL_SECONDS", "1200"))       # no new block for this long = node stalled
@@ -254,6 +256,11 @@ def live_config_errors() -> list[str]:
          f"({MAX_TRADE_SIZE_ERG:g})"),
         (0.002 <= MAX_FEE_BUDGET_ERG <= 2, f"MAX_FEE_BUDGET_ERG={MAX_FEE_BUDGET_ERG:g}: must be between 0.002 and 2"),
         (0 <= EXECUTION_BUFFER <= 0.05, f"EXECUTION_BUFFER={EXECUTION_BUFFER:g}: must be between 0 and 0.05"),
+        (MIN_PROFIT_PERCENT < LIVE_MAX_PROFIT_PERCENT <= 100,
+         f"LIVE_MAX_PROFIT_PERCENT={LIVE_MAX_PROFIT_PERCENT:g}: must be above MIN_PROFIT_PERCENT "
+         f"({MIN_PROFIT_PERCENT:g}) and at most 100"),
+        (0.5 <= LIVE_MAX_ORACLE_DEVIATION_PERCENT <= 50,
+         f"LIVE_MAX_ORACLE_DEVIATION_PERCENT={LIVE_MAX_ORACLE_DEVIATION_PERCENT:g}: must be between 0.5 and 50"),
     ]
     return [message for ok, message in rules if not ok]
 
