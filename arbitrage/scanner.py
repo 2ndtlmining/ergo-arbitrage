@@ -541,6 +541,7 @@ class ArbitrageScanner:
             opp.blocked = True
             opp.blocked_reason = f"Bank mint blocked (RR={rr_str}, post-mint RR would drop below 400%)"
             opp.is_profitable = False
+        opp.sources = ("spectrum", "bank")
         return opp
 
     def _path_pool_buy_redeem(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
@@ -573,6 +574,7 @@ class ArbitrageScanner:
             f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
             f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
         ]
+        opp.sources = ("spectrum", "bank")
         return opp
 
     def _optimize_sizes(self, prices: dict) -> dict[str, ArbitrageOpportunity]:
@@ -681,6 +683,7 @@ class ArbitrageScanner:
                         f"END RESULT: USDT on {cex}",
                         f"WATCH-ONLY: {opp.assumption}; no SigUSD<->USDT venue to close the loop",
                     ]
+                opp.sources = (cex.lower(), "spectrum")
                 opportunities.append(opp)
 
             # Path 5: NonKYC vs Kucoin (CEX to CEX): buy at the ask on one, sell at the bid on the other
@@ -707,6 +710,7 @@ class ArbitrageScanner:
                         f"Sell ERG on {sell_on} at bid ${quotes[sell_on][1]:.4f} USDT ({fees_by[sell_on][0]*100:.1f}% fee)",
                         f"END RESULT: ~${o.output_erg * quotes[sell_on][1]:.2f} USDT on {sell_on}",
                     ]
+                    o.sources = (buy_on.lower(), sell_on.lower())
                     options.append(o)
                 opportunities.append(max(options, key=lambda o: o.profit_erg))
 
@@ -730,6 +734,7 @@ class ArbitrageScanner:
                     f"Withdraw ERG to wallet (-{withdraw_fee} ERG)",
                     f"WATCH-ONLY: {opp.assumption}",
                 ]
+                opp.sources = (cex.lower(), "bank")
                 opportunities.append(opp)
 
             # ---- USE (DexyUSD) Paths ----
@@ -747,6 +752,7 @@ class ArbitrageScanner:
                 oracle_use_erg = use_box_state["oracle_rate"] / 1e9  # ERG per USE at the oracle
 
                 opportunities.append(ArbitrageOpportunity(
+                    sources=("use",),
                     path=f"Crux mint+sell USE [{trade_size} ERG]",
                     input_erg=trade_size,
                     output_erg=erg_out,
@@ -1063,10 +1069,11 @@ class ArbitrageScanner:
             sources.append("use")
         return sources
 
-    def _is_price_stale(self, path_key: str) -> bool:
-        """Check if any price source used by this path is stale."""
+    def _is_price_stale(self, opp: ArbitrageOpportunity) -> bool:
+        """Check if any price source this opportunity depends on is stale. Uses its declared sources;
+        guessing from the path name is only a fallback for an opportunity that declares none."""
         now = time.time()
-        for source in self._get_path_sources(path_key):
+        for source in opp.sources or self._get_path_sources(opp.path_key):
             last = self._price_timestamps.get(source, 0)
             if (now - last) > config.PRICE_STALE_SECONDS:
                 return True
@@ -1221,7 +1228,7 @@ class ArbitrageScanner:
             if streak < config.DISCORD_CONFIRM_SCANS:
                 logger.debug(f"Streak {streak}/{config.DISCORD_CONFIRM_SCANS}: {path_key}")
                 continue
-            if self._is_price_stale(path_key):
+            if self._is_price_stale(opp):
                 logger.debug(f"Stale price, skipping notification: {path_key}")
                 continue
             confirmed.append(opp)
