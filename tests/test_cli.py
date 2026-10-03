@@ -33,6 +33,9 @@ class TestParser:
     def test_other_commands(self, argv):
         assert self.parse(*argv).command == argv[0]
 
+    def test_doctor(self):
+        assert self.parse("doctor").no_sign is False and self.parse("doctor", "--no-sign").no_sign is True
+
 
 class TestSend:
     def test_payment_request_erg_only(self):
