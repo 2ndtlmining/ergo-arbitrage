@@ -88,7 +88,8 @@ def _cex(name: str, price_key: str, ts_key: str) -> Callable[[VenueContext], Ven
             return VenueStatus(name, "CEX", "down", error=(full.error if full is not None and full.error
                                                             else "no quote"))
         ts = q.timestamp if isinstance(q.timestamp, (int, float)) else q.timestamp.timestamp()
-        return VenueStatus(name, "CEX", "watch", f"${q.bid:.4f} / ${q.ask:.4f}", c.now - ts)
+        return VenueStatus(name, "CEX", "watch", f"${q.bid:.4f} / ${q.ask:.4f}", c.now - ts,
+                           getattr(q, "latency_ms", None))
     return describe
 
 

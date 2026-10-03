@@ -124,6 +124,7 @@ class CexQuote:
     book: Optional[OrderBook]
     error: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
+    latency_ms: Optional[float] = None    # how long the exchange took to answer
 
     @property
     def bid(self) -> Optional[float]:
@@ -154,13 +155,16 @@ async def fetch_quote(venue: Venue, session, enabled: Optional[bool] = None) -> 
     """The venue's ERG/USDT order book, or a quote carrying the reason there is none."""
     if not (venue.enabled() if enabled is None else enabled):
         return CexQuote(venue.name, None, error=f"disabled: {venue.disabled_reason}")
+    started = time.perf_counter()
     data, error = await _get_json(session, venue.book_url)
+    ms = (time.perf_counter() - started) * 1000
+    logger.debug(f"{venue.name} order book: {ms:.0f} ms{f' ({error})' if error else ''}")
     if error:
-        return CexQuote(venue.name, None, error=error)
+        return CexQuote(venue.name, None, error=error, latency_ms=ms)
     try:
-        return CexQuote(venue.name, venue.parse_book(data))
+        return CexQuote(venue.name, venue.parse_book(data), latency_ms=ms)
     except (KeyError, IndexError, TypeError, ValueError) as e:
-        return CexQuote(venue.name, None, error=f"unexpected order book ({e.__class__.__name__})")
+        return CexQuote(venue.name, None, error=f"unexpected order book ({e.__class__.__name__})", latency_ms=ms)
 
 
 async def fetch_all_quotes(session, names=None) -> dict[str, CexQuote]:

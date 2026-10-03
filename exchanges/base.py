@@ -134,17 +134,18 @@ class RateLimiter:
         self.max_calls = max_calls
         self.period = period_seconds
         self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()   # one caller at a time, so waiters can't all pass at once after waking
 
     async def acquire(self):
         """Wait if necessary to stay within rate limits."""
-        now = time.monotonic()
-        # Remove timestamps outside the window
-        self._timestamps = [t for t in self._timestamps if now - t < self.period]
-        if len(self._timestamps) >= self.max_calls:
-            sleep_time = self._timestamps[0] + self.period - now
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-        self._timestamps.append(time.monotonic())
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < self.period]
+                if len(self._timestamps) < self.max_calls:
+                    break
+                await asyncio.sleep(self._timestamps[0] + self.period - now)
+            self._timestamps.append(time.monotonic())
 
 
 class ExchangeBase(ABC):
