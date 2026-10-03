@@ -1,6 +1,6 @@
 # Discord: episode messages, health alerts, daily digest (issue #15)
 
-Date: 2026-10-02. Status: approved in chat, pending spec review.
+Date: 2026-10-02. Status: implemented (PR #41). Design record; the README is authoritative.
 
 ## Goal
 

@@ -1,6 +1,6 @@
 # Chain watcher: event-driven on-chain scanning (issues #9, #8 on-chain part)
 
-Date: 2026-10-02. Status: approved in chat, pending spec review.
+Date: 2026-10-02. Status: implemented (PR #36, follow-ups #37). Design record; the README is authoritative.
 
 ## Goal
 
