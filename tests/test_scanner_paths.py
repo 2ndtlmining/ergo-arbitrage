@@ -80,8 +80,9 @@ class TestWalletAnalysis:
         assert f"{expected:.2f} ERG" in redeem["result"]
 
     def test_erg_mint_option_runs_with_bank_state(self, scanner):
-        state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
-        analysis = scanner._build_wallet_analysis({"erg": 50, "sigusd": 0, "use": 0}, make_prices(state, 0.31))
+        # exact sizing needs the pool reserves, as the live gate does (always read from the chain)
+        from tests.test_optimizer import discount_prices
+        analysis = scanner._build_wallet_analysis({"erg": 50, "sigusd": 0, "use": 0}, discount_prices(pool_erg=2_000))
         names = {o["name"]: o for o in analysis["erg"]["options"]}
         assert not names["Bank mint -> Spectrum sell"]["blocked"]
         assert not names["Spectrum buy -> Bank redeem"]["blocked"]
