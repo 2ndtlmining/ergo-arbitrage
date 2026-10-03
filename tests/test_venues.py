@@ -66,4 +66,5 @@ def test_a_failing_venue_does_not_take_the_others_down(monkeypatch):
 
 
 def test_registry_fits_the_panel():
-    assert len(VENUES) <= 7
+    from arbitrage.dashboard_state import MAX_VENUES
+    assert len(VENUES) <= MAX_VENUES

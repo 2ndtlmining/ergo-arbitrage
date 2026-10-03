@@ -228,6 +228,36 @@ MINT_GATE_CLOSE_SECONDS=600            # Minting shut this long before the messa
 
 **Privacy:** the webhook receives your wallet balances and your Discord user id. Post it to a private channel.
 
+## CEX prices (watch-only)
+
+With `CEX_WATCH=true` (the default) the bot reads the public ERG/USDT order books of **Kucoin,
+NonKYC, Gate.io and MEXC** in one go each full scan (no API keys) and shows them in the dashboard's
+Venues panel. **SafeTrade** (safe.trade) is listed too but off by default
+(`SAFETRADE_ENABLED=true` to try it): from many connections Cloudflare answers its API with a
+captcha page, shown as "blocked by Cloudflare".
+
+- **Fees.** Each exchange's taker fee and ERG withdrawal fee come from what it publishes (refreshed
+  hourly: Kucoin and NonKYC withdrawal fees, Gate and MEXC taker fees) or else from the settings
+  below. Gate's and MEXC's ERG withdrawal fees are not public; check them on the exchange.
+- **Cross-exchange spread.** A `WATCH spread` line shows the best "buy on one exchange, withdraw the
+  ERG, sell on another" at the size your wallet can fund, after the taker fee on both trades, the ERG
+  withdrawal fee and `CEX_USDT_TRANSFER_FEE` to move the USDT back. A gap smaller than those fees is
+  never shown as profitable. At a ~20 ERG wallet the withdrawal fees alone are several percent.
+- **Discord.** At most one combined watch message per `CEX_WATCH_COOLDOWN_SECONDS`: every exchange's
+  gap to the pool, plus the best spread.
+- **Nothing here trades.** All CEX paths are watch-only (no SigUSD<->USDT venue to close the loop).
+
+```env
+GATE_TRADING_FEE=0.002        GATE_ERG_WITHDRAW_FEE=0.403
+MEXC_TRADING_FEE=0.0008       MEXC_ERG_WITHDRAW_FEE=0.1
+KUCOIN_ERG_WITHDRAW_FEE=2.0   NONKYC_ERG_WITHDRAW_FEE=3.1      # fallbacks; read live when published
+SAFETRADE_ENABLED=false       SAFETRADE_TRADING_FEE=0.002      # SAFETRADE_ERG_WITHDRAW_FEE=
+CEX_USDT_TRANSFER_FEE=1.0     TRADE_SIZES_UNFUNDED=false
+```
+
+The analysis grid (`TRADE_SIZES`) only prices sizes your wallet can fund, plus that funded size
+itself; `TRADE_SIZES_UNFUNDED=true` prices the whole grid again (marked `*` above `MAX_TRADE_SIZE_ERG`).
+
 ## Setup
 
 ### Prerequisites
@@ -569,7 +599,7 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
 - Wallet tool `arb.py` (balance, quote, swap, redeem, send, arb), dry run by default
 - Discord: one message per opportunity, health alerts, daily digest, wallet analysis
 - SQLite tracking of prices, opportunities, episodes and trades
-- CEX prices (Kucoin, NonKYC), watch-only
+- CEX prices (Kucoin, NonKYC, Gate, MEXC; SafeTrade opt-in), watch-only, with fees
 
 **Next**
 - First supervised `--live` trade with a small `--max-trade-erg`

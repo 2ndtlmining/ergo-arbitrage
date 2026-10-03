@@ -12,7 +12,7 @@ from arbitrage.sizing import SizeChoice
 
 HISTORY = 30
 MAX_EVENTS = 200
-MAX_VENUES = 7
+MAX_VENUES = 10
 PATH_LABELS = {"Spectrum buy->Bank redeem": "pool→redeem", "Bank mint->Spectrum sell": "mint→pool sell"}
 
 
