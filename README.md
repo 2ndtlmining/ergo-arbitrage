@@ -773,7 +773,7 @@ the exchanges and are not settings.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `SCAN_RESULTS_RETENTION_DAYS` | `14` | Non-profitable scan rows older than this are deleted at startup. |
+| `SCAN_RESULTS_RETENTION_DAYS` | `14` | Non-profitable scan rows, and price snapshots nothing refers to, older than this are deleted at startup and once a day. |
 
 Command-line flags of `main.py` (`--interval`, `--max-trade-erg`, `--db`, ...) are in the table
 under [Modes](#modes).
@@ -971,7 +971,11 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 - **daily_summary** - Aggregated daily stats
 - **opportunity_episodes** - Continuous runs of a profitable path, from the 15 s full scans
 - **chain_episodes** - The on-chain opportunities sent to Discord (opened, closed, peak, trade)
-- **meta** - Small key/value state, e.g. the date the last daily digest was sent
+- **meta** - Small key/value state, e.g. the date the last daily digest was sent, the live pause
+
+Once a day (and at start) rows older than `SCAN_RESULTS_RETENTION_DAYS` are pruned and the WAL file is
+checkpointed, so a bot that runs for months stays small; freed space is reused. Profitable rows,
+opportunities, episodes and trades are kept.
 
 ## Key Token IDs (Ergo Mainnet)
 

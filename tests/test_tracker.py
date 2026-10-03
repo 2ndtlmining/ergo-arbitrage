@@ -93,6 +93,6 @@ class TestSchema:
                 (old, profitable),
             )
         tracker.log_scan_results([opp("A", 10, 0.1)], 2)
-        deleted = tracker.prune_scan_results(days=7)
+        deleted, _ = tracker.prune(days=7)
         assert deleted == 1
         assert tracker.conn.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0] == 2
