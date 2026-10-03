@@ -186,6 +186,13 @@ class CexFees:
         wd = "withdrawal unknown" if self.erg_withdraw is None else             f"withdrawal {self.erg_withdraw:g} ERG ({tag('erg_withdraw')})"
         return f"taker {self.taker:.2%} ({tag('taker')}), {wd}"
 
+    def compact(self) -> str:
+        """Short form for the dashboard: "0.10% · 2 ERG*", where * = published by the exchange."""
+        def star(f):
+            return "*" if f in self.live_fields else ""
+        wd = "? ERG" if self.erg_withdraw is None else f"{self.erg_withdraw:g} ERG{star('erg_withdraw')}"
+        return f"{self.taker:.2%}{star('taker')} · {wd}"
+
 
 class FeeBook:
     """Per-exchange fees: configured defaults, replaced by what the exchange publishes when it can."""

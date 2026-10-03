@@ -4,7 +4,7 @@ It also turns changes into events: an opportunity opening or closing, a venue go
 or recovering, an oracle update pending/confirmed, live trading armed/blocked/paused.
 """
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -13,7 +13,21 @@ from arbitrage.sizing import SizeChoice
 HISTORY = 30
 MAX_EVENTS = 200
 MAX_VENUES = 10
+RR_HISTORY = 1440           # reserve-ratio samples kept (6 h at one per 15 s full scan)
 PATH_LABELS = {"Spectrum buy->Bank redeem": "pool→redeem", "Bank mint->Spectrum sell": "mint→pool sell"}
+
+
+@dataclass
+class ExchangeRow:
+    """One exchange in the Exchanges panel (watch-only CEX data)."""
+    name: str
+    state: str                      # live | down | disabled
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    vs_oracle_percent: Optional[float] = None   # mid price vs the SigmaUSD oracle ERG/USD price
+    fees: str = ""                  # e.g. "taker 0.10% (default), withdrawal 2 ERG (live)"
+    latency_ms: Optional[float] = None
+    error: str = ""
 
 
 @dataclass
@@ -81,6 +95,12 @@ class DashboardState:
         self.drawdown = 0.0
         self.wallet: Optional[dict] = None
         self.events: deque = deque(maxlen=MAX_EVENTS)
+        self.health: dict = {}                      # full_scan_ms, discord_queue, data_age_s, cex_ms {name: ms}
+        self.exchanges: list[ExchangeRow] = []
+        self.spread_text: Optional[str] = None      # best cross-exchange spread after fees
+        self.recent_episodes: list[dict] = []       # chain_episodes rows, newest first
+        self.recent_trades: list[dict] = []         # trades rows, newest first
+        self.rr_history: deque = deque(maxlen=RR_HISTORY)   # (unix time, reserve ratio %)
 
     def add_event(self, level: str, text: str):
         """level: info | good | warn | error | trade"""
@@ -149,8 +169,13 @@ class DashboardState:
             "prices": {"pool_sigusd_per_erg": self.prices.get("spectrum_erg_sigusd"),
                        "oracle_usd_per_erg": bank.get("oracle_erg_usd"),
                        "reserve_ratio": bank.get("reserve_ratio"),
-                       "can_mint": bank.get("can_mint_sigusd")},
+                       "can_mint": bank.get("can_mint_sigusd"),
+                       "mint": self.mint_text},
             "paths": paths,
             "venues": [{"name": v.name, "kind": v.kind, "state": v.state, "quote": v.quote} for v in self.venues],
             "wallet": self.wallet,
+            "exchanges": [asdict(e) for e in self.exchanges],
+            "spread": self.spread_text,
+            "health": self.health,
+            "history": {"episodes": self.recent_episodes, "trades": self.recent_trades},
         }

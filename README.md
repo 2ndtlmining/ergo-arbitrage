@@ -45,6 +45,17 @@ executes the trade with your ERG. Start live mode with a small `--max-trade-erg`
 
 The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+C quits):
 
+- **Header + health strip:** node, wallet, poll timing; then each source's response time (chain read,
+  every exchange), the full-scan time, the Discord send queue and the age of the chain data. Slow,
+  stale or backed-up items turn yellow, then red.
+- **Prices:** pool, oracle and bank, with the mint gate (`mint ✗ needs ERG $0.393 (+21.7%)`) and a
+  reserve-ratio trend over the last 6 hours (kept in memory, so it starts empty after a restart).
+- **Live / Wallet / Paths:** what live mode would do and why not, the wallet, every path with its best size.
+- **Events | History:** recent events, and the last opportunity episodes and live trades from the database.
+- **Venues | Exchanges:** the on-chain venues; and every exchange's bid/ask, gap to the oracle, fees
+  (`*` = published by the exchange, otherwise the configured default), response time and the best
+  cross-exchange spread after fees.
+
 ```
  ERGO ARB  MONITOR   h1885748  node ● 2 ms  wallet ●  poll 2s  full scan in 3s  confirm 2  19:38:12
 ┌──────────── Prices ────────────┐┌──────────────── Live ────────────────┐
