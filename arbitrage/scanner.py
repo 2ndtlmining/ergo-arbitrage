@@ -44,7 +44,7 @@ from arbitrage.calculator import (
 )
 from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
-from exchanges.cex_public import FeeBook, best_spread, fetch_all_quotes
+from exchanges.cex_public import CexQuote, FeeBook, best_spread, fetch_all_quotes
 from notifications import embeds
 from notifications.digest import build_digest, digest_due, mark_digest_sent
 from notifications.episodes import EpisodeTracker
@@ -54,6 +54,8 @@ from logging_config import console
 
 MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
 CEX_FEE_REFRESH_SECONDS = 3600            # how often published CEX fees are re-read
+CEX_STALE_SECONDS = 60                    # a CEX snapshot older than this is shown as stale, not used
+CEX_FIRST_WAIT_SECONDS = 10               # the first scan waits this long for the first CEX snapshot
 EPISODE_HEARTBEAT_S = 60                 # how often an open episode's last-seen time is saved
 DIGEST_RETRY_S = 600                     # a digest not confirmed by Discord is queued again after this
 
@@ -107,6 +109,9 @@ class ArbitrageScanner:
         self.discord = DiscordNotifier()
         self._http: Optional[aiohttp.ClientSession] = None  # shared: Crux API + explorer fallback + CEX data
         self.cex_fees = FeeBook()                 # per-exchange fees: defaults, then what each exchange publishes
+        self._cex_quotes: dict = {}               # latest CEX books, filled by the background feed
+        self._cex_ready: Optional[asyncio.Event] = None
+        self._cex_task: Optional[asyncio.Task] = None
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
         self._chain_prices: Optional[dict] = None           # its price entries
         self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
@@ -151,6 +156,8 @@ class ArbitrageScanner:
             venues += [self.nonkyc.connect(), self.kucoin.connect()]
         await asyncio.gather(*venues)
         self._http = aiohttp.ClientSession()
+        if self.enable_cex or self.cex_watch:
+            self._start_cex_feed()
 
         self.node_health = await self.ergo_node.get_health()
         if not self.node_health["reachable"]:
@@ -180,6 +187,7 @@ class ArbitrageScanner:
         logger.info(f"Kucoin USDT withdrawal fee: {kucoin_usdt_fee} USDT")
 
     async def disconnect_all(self):
+        await self._stop_cex_feed()
         if self._http:
             await self._http.close()
             self._http = None
@@ -246,7 +254,7 @@ class ArbitrageScanner:
 
         snap, cex, use_lp, use_mint = await asyncio.gather(
             self._read_chain(),
-            self._fetch_cex() if (self.enable_cex or self.cex_watch) else _none(),
+            self._cex_data() if (self.enable_cex or self.cex_watch) else _none(),
             self._fetch_use_lp() if self.enable_use else _none(),
             self._fetch_use_mint_status() if self.enable_use else _none(),
             return_exceptions=True,
@@ -308,6 +316,56 @@ class ArbitrageScanner:
             except Exception as e:  # fees fall back to the configured defaults
                 logger.warning(f"CEX fee refresh failed: {e}")
         return await fetch_all_quotes(self._http)
+
+    def _start_cex_feed(self):
+        """Refresh the CEX books in the background every SCAN_INTERVAL_SECONDS, so a slow or hanging
+        exchange never holds up the 2 s chain poll or the live gate."""
+        if self._cex_task is not None and not self._cex_task.done():
+            return
+        if self._cex_ready is None:
+            self._cex_ready = asyncio.Event()
+        self._cex_task = asyncio.get_running_loop().create_task(self._cex_feed_loop())
+
+    async def _cex_feed_loop(self):
+        while True:
+            try:
+                self._cex_quotes = await self._fetch_cex()
+            except Exception as e:  # keep the last snapshot; it turns stale on its own
+                logger.warning(f"CEX feed error: {e}")
+            self._cex_ready.set()
+            await asyncio.sleep(config.SCAN_INTERVAL_SECONDS)
+
+    async def _stop_cex_feed(self):
+        if self._cex_task is not None:
+            self._cex_task.cancel()
+            try:
+                await self._cex_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._cex_task = None
+
+    def _cex_snapshot(self) -> dict:
+        """The latest CEX books; one older than CEX_STALE_SECONDS is reported as stale instead."""
+        now, out = time.time(), {}
+        for name, q in self._cex_quotes.items():
+            age = now - q.timestamp
+            if q.book is not None and age > CEX_STALE_SECONDS:
+                q = CexQuote(name, None, error=f"stale ({age:.0f}s old)", timestamp=q.timestamp,
+                             latency_ms=q.latency_ms)
+            out[name] = q
+        return out
+
+    async def _cex_data(self) -> dict:
+        """CEX books for this scan: the background feed's latest snapshot (waiting only for the very
+        first one, at most CEX_FIRST_WAIT_SECONDS), or a direct fetch when no feed is running."""
+        if self._cex_task is None:
+            return await self._fetch_cex()
+        if not self._cex_ready.is_set():
+            try:
+                await asyncio.wait_for(self._cex_ready.wait(), CEX_FIRST_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("CEX feed: no snapshot yet, scanning without CEX prices")
+        return self._cex_snapshot()
 
     def _cex_spread(self, prices: dict):
         """Best buy-here-sell-there across the exchanges at the funded size, every fee counted."""
