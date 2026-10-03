@@ -62,6 +62,10 @@ def healthy(monkeypatch):
     monkeypatch.setattr(doctor, "read_snapshot", chain)
     monkeypatch.setattr(doctor.chain_state, "_mempool_outputs_by_token", mempool)
     monkeypatch.setattr(doctor, "run_arb", arb)
+    monkeypatch.setattr(doctor.config, "DISCORD_WEBHOOK_URL", "")
+    monkeypatch.setattr(doctor.config, "DISCORD_ENABLED", False)
+    monkeypatch.setattr(doctor.config, "PLACEHOLDERS", [])
+    monkeypatch.setattr(doctor, "unknown_settings", lambda: [])
     return calls
 
 
@@ -126,3 +130,45 @@ def test_extra_index_missing_is_explained(healthy, monkeypatch):
     monkeypatch.setattr(doctor, "read_snapshot", no_index)
     code, out = run(Node())
     assert code == 1 and "extra index" in out.lower()
+
+
+# ---------- settings and Discord (#84) ----------
+
+@pytest.fixture
+def webhook(monkeypatch, healthy):
+    seen = {}
+
+    def use(status, body):
+        async def info(url):
+            seen["url"] = url
+            return status, body
+        monkeypatch.setattr(doctor, "webhook_info", info)
+        monkeypatch.setattr(doctor.config, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/tok")
+        monkeypatch.setattr(doctor.config, "DISCORD_ENABLED", True)
+    return use, seen
+
+
+def test_discord_webhook_name_is_reported_without_posting(webhook):
+    use, seen = webhook
+    use(200, {"name": "arb-bot", "channel_id": "42"})
+    code, out = run(Node())
+    assert code == 0 and "arb-bot" in out and seen["url"].endswith("/webhooks/1/tok")
+
+
+def test_a_deleted_webhook_is_a_warning_not_a_node_failure(webhook):
+    use, _ = webhook
+    use(404, {"message": "Unknown Webhook"})
+    code, out = run(Node())
+    assert code == 0 and "WARN" in out and "Unknown Webhook" in out
+
+
+def test_no_webhook_says_notify_posts_nothing(healthy):
+    code, out = run(Node())
+    assert code == 0 and "DISCORD_WEBHOOK_URL" in out
+
+
+def test_placeholders_and_unknown_settings_are_warned(healthy, monkeypatch):
+    monkeypatch.setattr(doctor.config, "PLACEHOLDERS", ["DISCORD_USER_ID"])
+    monkeypatch.setattr(doctor, "unknown_settings", lambda: [("DISCORD_WEBHOOK", "DISCORD_WEBHOOK_URL")])
+    code, out = run(Node())
+    assert code == 0 and "DISCORD_USER_ID" in out and "DISCORD_WEBHOOK_URL?" in out and "arb.py config" in out

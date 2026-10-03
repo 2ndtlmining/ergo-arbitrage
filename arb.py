@@ -9,6 +9,7 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py send   --to 9f... --erg 1.5 [--sigusd 2]  --execute
     python arb.py arb    [--erg best|10] [--path redeem|mint] [--check | --execute] [--force]
     python arb.py doctor [--no-sign]                        (is the node ready for the bot?)
+    python arb.py config                                    (effective settings, mistakes in .env)
 """
 import argparse
 import asyncio
@@ -16,10 +17,9 @@ import io
 import sys
 
 import aiohttp
-from dotenv import load_dotenv
-load_dotenv()
 
 import config
+import config_check
 from ergo import actions, doctor
 from ergo.amounts import parse_amount
 
@@ -77,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="check the node is ready for the bot (ends with a sign check that is never broadcast)")
     d.add_argument("--no-sign", action="store_true", help="skip the final sign-and-validate check")
+
+    sub.add_parser("config", help="effective settings and their source; unknown keys, placeholders, renamed "
+                                  "settings in .env (secrets masked)")
     return parser
 
 
@@ -116,6 +119,9 @@ async def run(args):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if args.command == "config":
+        print("\n".join(config_check.report()), flush=True)
+        return
     try:
         code = asyncio.run(run(args))
     except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:

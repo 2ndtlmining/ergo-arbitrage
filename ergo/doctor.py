@@ -1,6 +1,7 @@
 """`python arb.py doctor`: is this node ready for the bot? (written for the move to the Rust node)
 
-Checks, in order, everything the bot needs from the node and prints one line per check:
+First the settings (.env mistakes) and the Discord webhook, which only warn; then, in order,
+everything the bot needs from the node, one line per check:
 OK, WARN, FAIL (with a hint) or SKIP (an earlier check failed). The last check signs a 1 ERG
 pool buy -> bank redeem and has the node validate it; that transaction is never broadcast.
 Returns 1 when any check fails, 0 otherwise.
@@ -11,6 +12,7 @@ from typing import Callable
 import aiohttp
 
 import config
+from config_check import unknown_settings
 from ergo import chain_state
 from ergo.arb_runner import run_arb
 from ergo.chain import wallet_context
@@ -24,6 +26,13 @@ NETWORK_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, OSError)
 async def _get(ns, path: str):
     async with ns.get(f"{config.ERGO_NODE_URL}{path}", timeout=TIMEOUT) as r:
         return r.status, (await r.json(content_type=None) if r.status in (200, 400, 401, 403) else None)
+
+
+async def webhook_info(url: str):
+    """GET on a Discord webhook returns its name and channel and posts nothing. Own session: the node's
+    API key header must never reach Discord."""
+    async with aiohttp.ClientSession() as s, s.get(url, timeout=TIMEOUT) as r:
+        return r.status, await r.json(content_type=None)
 
 
 async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) -> int:
@@ -40,6 +49,28 @@ async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) 
         for n in names:
             line("SKIP", n, "an earlier check failed")
 
+    # settings and Discord: warnings only, they do not stop the node checks
+    notes = [f"{key} is not a setting" + (f" ({close}?)" if close else "") for key, close in unknown_settings()]
+    notes += [f"{name} placeholder ignored" for name in config.PLACEHOLDERS]
+    if notes:
+        line("WARN", "settings", "; ".join(notes)[:110], "python arb.py config shows every setting and its source")
+    else:
+        line("OK", "settings", "no unknown or placeholder values in .env")
+    if not config.DISCORD_ENABLED:
+        line("OK", "discord", "DISCORD_WEBHOOK_URL not set: --notify posts nothing")
+    else:
+        try:
+            status, hook = await webhook_info(config.DISCORD_WEBHOOK_URL)
+        except NETWORK_ERRORS as e:
+            line("WARN", "discord", f"{e.__class__.__name__}: {e}"[:110], "is discord.com reachable from here?")
+        else:
+            if status == 200 and isinstance(hook, dict):
+                line("OK", "discord", f"webhook \"{hook.get('name', '?')}\" (channel {hook.get('channel_id', '?')})")
+            else:
+                detail = hook.get("message", "") if isinstance(hook, dict) else ""
+                line("WARN", "discord", f"webhook answered HTTP {status} {detail}".strip()[:110],
+                     "the webhook was deleted or DISCORD_WEBHOOK_URL is mistyped; copy it again from the channel settings")
+
     log(f"Node {config.ERGO_NODE_URL}")
     later = ("API key", "wallet", "wallet boxes", "chain state", "mempool lookup", "sign check")
 
@@ -48,8 +79,9 @@ async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) 
         status, info = await _get(ns, "/info")
     except NETWORK_ERRORS as e:
         line("FAIL", "node reachable", f"{e.__class__.__name__}: {e}"[:110],
-             "is the node running? Is its REST API bound to this address and not only 127.0.0.1? "
-             "Is ERGO_NODE_URL right?")
+             "is the node running? Is ERGO_NODE_URL right (the Rust node's default port is 9099)? A node on "
+             "another machine must listen on its LAN address, not 127.0.0.1 (Scala bindAddress; Rust [api] bind "
+             "+ public_bind = true), and its firewall must allow this machine. README: Node setup")
         skip("synced", *later)
         return 1
     if status != 200 or not info:
