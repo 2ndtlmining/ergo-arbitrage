@@ -21,28 +21,28 @@ All available swap flows, their status, and test results.
 |---|--------|-------|------|-------------|-------|
 | 1 | Mew Finance batcher | ERG -> SigUSD | `archive/execute_swap_sigusd.py` (archived) | YES (1 ERG) | One-off; replaced pubkey in ErgoTree, not guarded |
 | 2 | SigmaUSD Bank mint | ERG -> SigUSD | Not yet | BLOCKED | Same issue as #5 - needs bank contract TX builder. Currently RR=262% so also blocked by reserve ratio. |
-| 3 | Spectrum DEX swap | ERG -> SigUSD | `execute_pool_swap.py` / `arb.py swap` | LIVE | 0.5% LP fee, direct pool swap: miner fee only (~0.785 ERG Crux service only with POOL_SWAP_ROUTE=crux) |
+| 3 | Spectrum DEX swap | ERG -> SigUSD | `arb.py swap` | LIVE | 0.5% LP fee, direct pool swap: miner fee only (~0.785 ERG Crux service only with POOL_SWAP_ROUTE=crux) |
 
 ### SigUSD -> ERG
 
 | # | Method | Route | Code | Tested Live | Notes |
 |---|--------|-------|------|-------------|-------|
-| 4 | Crux Finance DEX | SigUSD -> ERG | `execute_swap_sigusd_to_erg.py` | YES (1 SigUSD) | Uses /dex/swap via Spectrum pool, 0.782 ERG service fee |
-| 5 | SigmaUSD Bank redeem | SigUSD -> ERG | `execute_bank_redeem.py` | YES (1 SigUSD) | Direct EIP-15 contract TX. TX c7a08cda confirmed. Got 3.065 ERG net for 1 SigUSD (oracle rate 3.136, -2% protocol, -0.23% UI fee, -0.0011 ERG miner). |
-| 6 | Spectrum DEX swap | SigUSD -> ERG | `execute_pool_swap.py` / `arb.py swap` | LIVE | 0.5% LP fee, direct pool swap: miner fee only (~0.785 ERG Crux service only with POOL_SWAP_ROUTE=crux) |
+| 4 | Crux Finance DEX | SigUSD -> ERG | `archive/execute_swap_sigusd_to_erg.py` | YES (1 SigUSD) | Uses /dex/swap via Spectrum pool, 0.782 ERG service fee |
+| 5 | SigmaUSD Bank redeem | SigUSD -> ERG | `archive/execute_bank_redeem.py` (now `arb.py redeem`) | YES (1 SigUSD) | Direct EIP-15 contract TX. TX c7a08cda confirmed. Got 3.065 ERG net for 1 SigUSD (oracle rate 3.136, -2% protocol, -0.23% UI fee, -0.0011 ERG miner). |
+| 6 | Spectrum DEX swap | SigUSD -> ERG | `arb.py swap` | LIVE | 0.5% LP fee, direct pool swap: miner fee only (~0.785 ERG Crux service only with POOL_SWAP_ROUTE=crux) |
 
 ### ERG -> USE
 
 | # | Method | Route | Code | Tested Live | Notes |
 |---|--------|-------|------|-------------|-------|
-| 7 | Crux Finance free_mint | ERG -> USE (bank) | `execute_swap_use.py` | YES (1 ERG) | Uses /dexy/build_mint_tx |
-| 8 | Crux Finance LP swap | ERG -> USE (pool) | `execute_swap_erg_to_use_lp.py` | YES (1 ERG) | Uses /dex/swap endpoint, 0.785 ERG service fee, TX e2582256 confirmed |
+| 7 | Crux Finance free_mint | ERG -> USE (bank) | `archive/execute_swap_use.py` | YES (1 ERG) | Uses /dexy/build_mint_tx |
+| 8 | Crux Finance LP swap | ERG -> USE (pool) | `archive/execute_swap_erg_to_use_lp.py` | YES (1 ERG) | Uses /dex/swap endpoint, 0.785 ERG service fee, TX e2582256 confirmed |
 
 ### USE -> ERG
 
 | # | Method | Route | Code | Tested Live | Notes |
 |---|--------|-------|------|-------------|-------|
-| 9 | Crux Finance LP swap | USE -> ERG (pool) | `execute_swap_use_to_erg.py` | YES (0.3 USE) | Uses /dex/swap endpoint, 0.784 ERG service fee |
+| 9 | Crux Finance LP swap | USE -> ERG (pool) | `archive/execute_swap_use_to_erg.py` | YES (0.3 USE) | Uses /dex/swap endpoint, 0.784 ERG service fee |
 
 ### ERG <-> USDT (CEX)
 

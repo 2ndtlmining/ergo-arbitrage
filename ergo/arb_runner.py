@@ -1,4 +1,4 @@
-"""Run the two-leg pool buy -> bank redeem arbitrage (used by execute_arb.py and the --live scanner)."""
+"""Run the two-leg on-chain arbitrage (used by `arb.py arb` and the --live scanner)."""
 import asyncio
 from dataclasses import dataclass
 from typing import Callable, Optional

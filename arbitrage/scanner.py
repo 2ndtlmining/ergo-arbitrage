@@ -544,7 +544,7 @@ class ArbitrageScanner:
         return opp
 
     def _path_pool_buy_redeem(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
-        """Path 2: ERG -> SigUSD (pool buy) -> ERG (bank redeem). Executable by execute_arb.py."""
+        """Path 2: ERG -> SigUSD (pool buy) -> ERG (bank redeem). Executable by arb.py arb and --live."""
         bank = prices.get("bank", {})
         bank_state: Optional[BankState] = bank.get("state")
         spectrum_price = prices.get("spectrum_erg_sigusd")
