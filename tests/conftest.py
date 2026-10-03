@@ -49,6 +49,15 @@ TEST_DEFAULTS = {
 
 
 @pytest.fixture(autouse=True)
+def fresh_node_api_detection():
+    """The chain reader remembers which mempool lookup the node supports; never across tests."""
+    import ergo.chain_state as chain_state
+    chain_state._MEMPOOL_BY_TOKEN_POST = None
+    yield
+    chain_state._MEMPOOL_BY_TOKEN_POST = None
+
+
+@pytest.fixture(autouse=True)
 def default_config(monkeypatch):
     for name, value in TEST_DEFAULTS.items():
         monkeypatch.setattr(config, name, value)

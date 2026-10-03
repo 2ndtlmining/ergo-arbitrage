@@ -12,6 +12,8 @@ a pending oracle update is only reported (pending=True): the live gate waits for
 to confirm, since a bank TX on the old oracle box would be dropped once it does.
 """
 import asyncio
+import json
+import logging
 import time
 from dataclasses import dataclass
 
@@ -24,6 +26,12 @@ from exchanges.sigmausd import BankState, can_mint_sigusd
 from exchanges.spectrum import parse_n2t_pool_box
 
 CHAIN_TIMEOUT = aiohttp.ClientTimeout(total=5)
+logger = logging.getLogger("ergo_arb.chain_state")
+
+# Mempool outputs by token: the Scala node answers GET /transactions/unconfirmed/outputs/byTokenId/{id};
+# the Rust node (arkadianet/ergo) only has POST /transactions/unconfirmed/byTokenId (body: the token id as a
+# JSON string, answer: pool transactions). None = not known yet; True once the GET form answered 404.
+_MEMPOOL_BY_TOKEN_POST = None
 PENDING_OK = frozenset({config.SPECTRUM_SIGUSD_POOL_NFT, config.SIGMAUSD_BANK_NFT})  # spent as inputs
 _BOX_IDS: dict[str, str] = {}  # NFT -> last confirmed box id (saves an index/explorer lookup per poll)
 CONTRACTS = (("pool", config.SPECTRUM_SIGUSD_POOL_NFT), ("bank", config.SIGMAUSD_BANK_NFT),
@@ -36,11 +44,32 @@ async def _get(ns, path: str):
         return r.status, (await r.json() if r.status == 200 else None)
 
 
+async def _mempool_outputs_by_token(ns, nft: str) -> list[dict]:
+    """Every mempool output holding `nft`, from whichever form of the lookup this node supports."""
+    global _MEMPOOL_BY_TOKEN_POST
+    if not _MEMPOOL_BY_TOKEN_POST:
+        status, outputs = await _get(ns, f"/transactions/unconfirmed/outputs/byTokenId/{nft}")
+        if status != 404:
+            _MEMPOOL_BY_TOKEN_POST = False
+            return outputs or [] if status == 200 else []
+        if _MEMPOOL_BY_TOKEN_POST is None:
+            logger.info("Node has no GET /transactions/unconfirmed/outputs/byTokenId; "
+                        "using POST /transactions/unconfirmed/byTokenId (Rust node API)")
+        _MEMPOOL_BY_TOKEN_POST = True
+    async with ns.post(f"{config.ERGO_NODE_URL}/transactions/unconfirmed/byTokenId", data=json.dumps(nft),
+                       headers={"Content-Type": "application/json"}, timeout=CHAIN_TIMEOUT) as r:
+        if r.status == 404:            # neither form here: try the GET form again next time
+            _MEMPOOL_BY_TOKEN_POST = None
+            return []
+        txs = await r.json() if r.status == 200 else []
+    return [o for tx in txs or [] for o in tx.get("outputs", [])
+            if any(a.get("tokenId") == nft for a in o.get("assets", []))]
+
+
 async def _pending_outputs(ns, nft: str) -> list[dict]:
     """Mempool outputs holding `nft` that no other mempool TX has spent yet."""
-    status, outputs = await _get(ns, f"/transactions/unconfirmed/outputs/byTokenId/{nft}")
     live = []
-    for out in (outputs or []) if status == 200 else []:
+    for out in await _mempool_outputs_by_token(ns, nft):
         st, b = await _get(ns, f"/utxo/withPool/byId/{out['boxId']}")
         if st == 200 and b:
             live.append(b)
