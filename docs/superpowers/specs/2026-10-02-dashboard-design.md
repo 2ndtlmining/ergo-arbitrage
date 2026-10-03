@@ -1,6 +1,6 @@
 # Live terminal dashboard (issue #14)
 
-Date: 2026-10-02. Status: approved in chat, pending spec review.
+Date: 2026-10-02. Status: implemented (PR #38, extended in #54). Design record; the README is authoritative.
 
 ## Goal
 

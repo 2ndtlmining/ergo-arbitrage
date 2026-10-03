@@ -1,6 +1,6 @@
 # Bank mint gate: alert when SigUSD minting reopens (issue #39, lean)
 
-Date: 2026-10-03. Status: design approved in chat ("lean" scope), pending spec review.
+Date: 2026-10-03. Status: implemented, "lean" scope (PR #45). Design record; the README is authoritative.
 
 ## Goal
 

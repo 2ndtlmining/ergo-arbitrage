@@ -13,14 +13,13 @@ The app continuously scans prices from multiple sources and calculates whether a
 
 ### Price Sources
 
-| Source | Type | Pairs | Notes |
-|--------|------|-------|-------|
-| **NonKYC** | CEX | ERG/USDT | Order book based, HMAC-SHA256 auth, 10 req/s |
-| **Kucoin** | CEX | ERG/USDT | HMAC-SHA256 v2 auth, 25 req/s |
-| **Spectrum Finance** | DEX (AMM) | ERG/SigUSD | On-chain liquidity pool, 0.5% pool fee |
-| **SigmaUSD Bank** | Protocol | ERG/SigUSD | Oracle-priced, ~2.2% combined fee, reserve ratio restrictions |
-| **Crux Finance** | DEX (Atomic LP) | ERG/USE | LP pool swap + FreeMint/ArbMint for USE |
-| **Oracle** | Price feed | ERG/USD | erg-oracle-ergusd.spirepools.com |
+| Source | Type | Pair | Notes |
+|--------|------|------|-------|
+| **ErgoDEX (Spectrum) pool** | AMM pool | ERG/SigUSD | Pool box read from your node every 2 s; 0.5% pool fee; traded with direct pool swaps |
+| **SigmaUSD bank** | Protocol | ERG/SigUSD | Oracle-priced, ~2.23% fee; minting closes when the reserve ratio would fall below 400% |
+| **Oracle** | Price feed | ERG/USD | The SigmaUSD oracle pool box, read from your node |
+| **Crux Finance / Dexy** | LP + mint | ERG/USE | Off (`ENABLE_USE=false`): the USE LP was drained, a token migration is expected |
+| **Kucoin, NonKYC, Gate, MEXC** (SafeTrade opt-in) | CEX | ERG/USDT | Public order books, watch-only, no API keys |
 
 ### Ergo Node
 
@@ -78,8 +77,11 @@ The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+
 │ SigmaUSD bank  on-chain  ● live          RR 330%, mint ✗                 │
 │ Oracle         on-chain  ● live          $0.3238/ERG                     │
 │ Dexy USE       on-chain  – disabled      ENABLE_USE=false                │
-│ Kucoin         CEX       ○ watch only    $0.3238 / $0.3242               │
-│ NonKYC         CEX       ○ watch only    $0.3261 / $0.3267               │
+┌──── Exchanges (watch-only, * = fee published by the exchange) ───────────┐
+│ exchange      bid     ask  vs oracle  taker · withdrawal              ms │
+│ Kucoin     0.3238  0.3242     +0.06%  0.10% · 2.0 ERG*               180 │
+│ NonKYC     0.3261  0.3267     +0.80%  0.20% · 3.1 ERG*               240 │
+│ best spread: buy on Kucoin (ask $0.3242), sell on NonKYC (bid $0.3261) … │
 ```
 
 | Flag | Effect |
@@ -107,9 +109,9 @@ When the bank's oracle price values ERG higher than the DEX pool price:
           Receive: 10 * $0.32 * (1 - 2.2% fee) = 3.13 SigUSD
   Step 2: Swap 3.13 SigUSD -> ERG on Spectrum
           Receive: 3.13 / $0.29 * (1 - 0.5% pool) - miner fee = ~10.7 ERG (direct pool swap)
-  Result:  10 ERG -> ~9.9 ERG (fees eat the spread in this example)
+  Result:  10 ERG -> ~10.7 ERG before price impact (a 10% price gap; fees take ~2.7% of it)
 
-  RESTRICTION: Bank minting requires reserve ratio > 400%
+  RESTRICTION: minting is refused if the bank's reserve ratio after the mint would be below 400%
 ```
 
 ### Strategy 2: DEX Buy -> SigmaUSD Bank Redeem
@@ -121,23 +123,29 @@ When the DEX pool prices ERG higher than the bank's oracle rate:
   Oracle:   1 ERG = $0.32
 
   Step 1: Swap 10 ERG -> SigUSD on Spectrum (-0.5% pool, direct swap: miner fee only)
-  Step 2: Redeem SigUSD at Bank (-2.2% bank fee, -0.002 ERG receipt)
-  Result:  Depends on spread vs fees
+          Receive: 10 * 0.35 * (1 - 0.5%) = 3.48 SigUSD
+  Step 2: Redeem 3.48 SigUSD at the bank (-2.23% bank fee, -0.0021 ERG receipt box + miner fee)
+          Receive: 3.48 / $0.32 * (1 - 2.23%) = ~10.6 ERG
+  Result:  10 ERG -> ~10.6 ERG before price impact; with a gap under ~2.7% fees eat it all
 
   NOTE: SigUSD redeem has no reserve-ratio restriction (pro-rata payout if RR < 100%)
 ```
 
 ### Strategy 3: CEX <> DEX (Cross-Venue)
 
-When NonKYC/Kucoin prices ERG differently than Spectrum. **Assumes SigUSD ~ 1 USDT** (currently NOT true - SigUSD is depegged at ~$1.23).
+When an exchange prices ERG differently than the pool. **Watch-only**, and it assumes 1 SigUSD = 1 USDT,
+which is usually not true (SigUSD trades off its peg), so a gap is a signal, not a trade.
 
 ### Strategy 4: CEX <> CEX
 
-When ERG is priced differently on NonKYC vs Kucoin. Buy on the cheaper exchange, sell on the more expensive one.
+When ERG is priced differently on two exchanges: buy on the cheaper one, withdraw, sell on the other.
+**Watch-only:** the `WATCH spread` line shows it after both taker fees, the ERG withdrawal fee and
+`CEX_USDT_TRANSFER_FEE`.
 
 ### Strategy 5: USE (DexyUSD) Mint -> LP Sell
 
-When USE can be minted at oracle rate and sold via Crux LP at a higher effective rate:
+**Off** (`ENABLE_USE=false`) since the USE LP was drained; kept for after the USE migration. When USE
+can be minted at the oracle rate and sold via the Crux LP at a higher effective rate:
 
 ```
   Step 1: Mint USE via Crux Finance (oracle rate, ~0.79 ERG flat fee)
@@ -151,21 +159,22 @@ Every opportunity calculation includes ALL of these costs:
 
 | Fee | Amount | Applies To |
 |-----|--------|-----------|
-| NonKYC trading fee | 0.2% | CEX buy/sell |
-| NonKYC ERG withdrawal | 3.3 ERG | Moving ERG off NonKYC |
-| Kucoin trading fee | 0.1% | CEX buy/sell |
-| Kucoin ERG withdrawal | 0.73 ERG | Moving ERG off Kucoin |
-| Spectrum pool fee | 0.5% | SigUSD/ERG pool swaps |
-| Spectrum service fee | none (direct pool swap) | ~0.785 ERG only with `POOL_SWAP_ROUTE=crux` |
-| Mew Finance fee | ~0.55 ERG flat | 0.54 batcher + 0.002 protocol + 0.007 overhead + 0.001 miner |
-| Crux Finance LP (USE) | 0.3% pool fee + ~0.785 ERG | LP swap service fee |
-| Crux Finance mint (USE) | ~0.79 ERG flat | Mint transaction fee |
+| Fee | Amount | Applies To |
+|-----|--------|-----------|
+| Pool fee | 0.5% (read from the pool box) | SigUSD/ERG pool swaps |
+| Pool service fee | none (direct pool swap) | ~0.785 ERG per leg only with `POOL_SWAP_ROUTE=crux` |
+| Price impact | exact, from the pool reserves, plus `EXECUTION_BUFFER` (0.3%) | Pool swaps |
 | SigmaUSD protocol fee | 2.0% | Bank mint/redeem (stays in reserve) |
 | SigmaUSD frontend fee | 0.229% | Bank mint/redeem |
-| Ergo transaction fee | ~0.0011 ERG | Every on-chain tx |
-| Slippage (estimated) | 0.5-3% | DEX swaps (size dependent) |
+| Bank redeem receipt box | 0.001 ERG | Bank redeem |
+| Ergo miner fee | 0.0011 ERG | Every on-chain transaction |
+| Crux LP / mint (USE, off) | 0.3% + ~0.785 ERG / ~0.79 ERG | USE paths |
+| CEX taker fee (watch-only) | Kucoin 0.1%, NonKYC 0.2%, Gate 0.2%, MEXC 0.08% (refreshed live where published) | CEX paths |
+| CEX ERG withdrawal (watch-only) | Kucoin 2.0, NonKYC 3.1 (read live), Gate 0.403, MEXC 0.1 ERG | Moving ERG off an exchange |
 
 ### Slippage Tiers
+
+Only for legs without a known order depth (the CEX legs). Pool legs use the exact reserves.
 
 | Trade Size | Estimated Slippage |
 |-----------|-------------------|
@@ -928,46 +937,20 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 ## Important Notes
 
 - **Never commit `.env`** - it contains your API keys and is gitignored
-- **NonKYC ERG withdrawal fee is 3.3 ERG** - makes small CEX trades unprofitable
+- **CEX ERG withdrawal fees are large** (NonKYC 3.1 ERG, Kucoin 2.0 ERG) - they make small CEX rounds unprofitable
 - **SigmaUSD Bank has restrictions** - SigUSD minting is blocked if the post-mint RR would fall below 400%; SigUSD redeem is always allowed (the 800% cap only applies to SigRSV minting)
-- **SigUSD is currently depegged** - trading at ~$1.23 instead of $1.00 (makes CEX<>DEX paths unreliable)
-- **USE (DexyUSD) is well-pegged** - trading at ~$0.99, more predictable for arb paths
+- **SigUSD trades off its peg** - so a CEX (USDT) vs pool (SigUSD) price gap is not a trade by itself
+- **USE paths are off** - the USE LP was drained (Oct 2026); a token migration is expected (`USE_TOKEN_ID`, `DEXY_USE_LP_NFT`)
 - **Crux service fee is ~0.785 ERG flat** - only paid on Crux-routed swaps (USE LP, or SigUSD with `POOL_SWAP_ROUTE=crux`); SigUSD pool swaps go direct and pay only the miner fee
 - **Ergo TX fees are EXPLICIT** - must be an output box, not implicit (inputs must equal outputs)
 - **Node must be fully synced** for wallet operations to work correctly
 
 ---
 
-## Swap Flow Testing Status
+## Swap legs and paths
 
-See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
-
-### Individual Swap Legs
-
-| # | Route | Status | Notes |
-|---|-------|--------|-------|
-| 1 | ERG -> SigUSD (Mew batcher) | TESTED LIVE | Template-based, replaces pubkey |
-| 2 | ERG -> SigUSD (Bank mint) | BLOCKED | RR < 400% |
-| 3 | ERG -> SigUSD (Spectrum via Crux) | QUOTE TESTED | Script ready |
-| 4 | SigUSD -> ERG (Crux/Spectrum) | TESTED LIVE | 0.782 ERG service fee |
-| 5 | SigUSD -> ERG (Bank redeem) | TESTED LIVE | Direct EIP-15 contract TX |
-| 6 | SigUSD -> ERG (Spectrum via Crux) | QUOTE TESTED | Script ready |
-| 7 | ERG -> USE (Crux free mint) | TESTED LIVE | /dexy/build_mint_tx |
-| 8 | ERG -> USE (Crux LP swap) | TESTED LIVE | /dex/swap endpoint |
-| 9 | USE -> ERG (Crux LP swap) | TESTED LIVE | /dex/swap endpoint |
-| 10 | NonKYC buy/sell ERG | MONITOR ONLY | No execution code |
-| 11 | Kucoin buy/sell ERG | MONITOR ONLY | No execution code |
-
-### Arbitrage Paths (Full Round-Trips)
-
-| Path | Route | Status | Blocker |
-|------|-------|--------|---------|
-| **E** | Crux mint USE -> Crux LP sell | BOTH LEGS WORK | Free mint availability |
-| **B** | Pool buy SigUSD -> Bank redeem | Executed by `--live` (direct pool swap, then bank redeem) | First live trade pending
-| **C** | Mew buy SigUSD -> Crux sell | Both legs tested separately | High round-trip fees (~1.7 ERG) |
-| **A** | Bank mint SigUSD -> Spectrum sell | Neither leg executable | RR < 400% blocks mint |
-| **G** | CEX <> DEX cross-venue | Monitor only | SigUSD depeg, no exec code |
-| **H** | CEX <> CEX | Monitor only | No execution code |
+[FLOWS.md](FLOWS.md) lists every swap leg and round trip, the command that runs it, what has been
+tested on mainnet and its fees.
 
 ---
 
@@ -979,7 +962,8 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
   with direct pool swaps (no service fee), exact sizing, a leg-2 price floor and the TX guard
 - Chain watcher: pool, bank and oracle read from your node every 2 s, mempool aware (Scala node, and
   the Rust node `arkadianet/ergo` via its mempool lookup)
-- Wallet tool `arb.py` (balance, quote, swap, redeem, send, arb), dry run by default
+- Wallet tool `arb.py` (balance, quote, swap, redeem, send, arb), dry run by default, plus `doctor`
+  (is the node ready?), `config` (settings in use, mistakes in `.env`) and `backup`
 - One-screen dashboard with health strip, Exchanges and History panels and the mint-gate / reserve-ratio
   trend, plus `--plain` and `--json` views
 - Discord: one message per opportunity, health alerts, bank mint gate alert, daily digest, wallet analysis
@@ -987,10 +971,11 @@ See [FLOWS.md](FLOWS.md) for the full detailed reference. Summary:
   cross-exchange spread after fees; fetched in the background so they never slow the chain poll
 - SQLite tracking of prices, opportunities, episodes and trades
 
-**Next**
-- First supervised `--live` trade with a small `--max-trade-erg` (once a path shows GO)
-- Check the bot against the Rust node once it is synced (`pytest -m live`, `arb.py balance`,
-  `arb.py arb --check`)
+**Next** (plan: issue #90)
+- Check the bot against the Rust node once it is synced (`arb.py doctor`, `pytest -m live`)
+- Guardrails that must land before any `--live` trade: limits that survive a restart, validated live
+  settings, a single-instance lock, a visible arming step, alerts for silent failures (#59-#66, #71)
+- Then the first supervised `--live` trade with a small `--max-trade-erg` (once a path shows GO)
 
 **Later** (details in the GitHub issues)
 - A venue/leg quote abstraction with a path graph, once more on-chain venues exist (#13; the
