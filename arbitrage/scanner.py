@@ -44,6 +44,7 @@ from arbitrage.calculator import (
 )
 from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
+from exchanges.cex_public import FeeBook, best_spread, fetch_all_quotes
 from notifications import embeds
 from notifications.digest import build_digest, digest_due, mark_digest_sent
 from notifications.episodes import EpisodeTracker
@@ -52,6 +53,7 @@ from notifications.mint_gate import MintGateWatcher, mint_gate_text
 from logging_config import console
 
 MINT_MESSAGE_KEY = "mint_gate_message"   # tracker meta: the open mint message, for after a crash
+CEX_FEE_REFRESH_SECONDS = 3600            # how often published CEX fees are re-read
 EPISODE_HEARTBEAT_S = 60                 # how often an open episode's last-seen time is saved
 DIGEST_RETRY_S = 600                     # a digest not confirmed by Discord is queued again after this
 
@@ -103,7 +105,8 @@ class ArbitrageScanner:
         self.calculator = ArbitrageCalculator()
         self.tracker = ProfitTracker(db_path)
         self.discord = DiscordNotifier()
-        self._http: Optional[aiohttp.ClientSession] = None  # shared: Crux API + explorer fallback
+        self._http: Optional[aiohttp.ClientSession] = None  # shared: Crux API + explorer fallback + CEX data
+        self.cex_fees = FeeBook()                 # per-exchange fees: defaults, then what each exchange publishes
         self._snapshot: Optional[ChainSnapshot] = None      # last good node snapshot
         self._chain_prices: Optional[dict] = None           # its price entries
         self._last_blocked: Optional[tuple] = None          # last printed live blocker lines
@@ -241,21 +244,25 @@ class ArbitrageScanner:
         async def _none():
             return None
 
-        snap, nonkyc_price, kucoin_price, use_lp, use_mint = await asyncio.gather(
+        snap, cex, use_lp, use_mint = await asyncio.gather(
             self._read_chain(),
-            self.nonkyc.fetch_erg_usdt_price() if self.enable_cex else _none(),
-            self.kucoin.fetch_erg_usdt_price() if self.enable_cex else _none(),
+            self._fetch_cex() if (self.enable_cex or self.cex_watch) else _none(),
             self._fetch_use_lp() if self.enable_use else _none(),
             self._fetch_use_mint_status() if self.enable_use else _none(),
             return_exceptions=True,
         )
 
-        if isinstance(nonkyc_price, Exception):
-            logger.error(f"NonKYC price fetch failed: {nonkyc_price}")
-            nonkyc_price = None
-        if isinstance(kucoin_price, Exception):
-            logger.error(f"Kucoin price fetch failed: {kucoin_price}")
-            kucoin_price = None
+        if isinstance(cex, Exception):
+            logger.error(f"CEX data fetch failed: {cex}")
+            cex = None
+        cex = cex or {}
+        live = {n: q for n, q in cex.items() if q.book is not None}
+
+        def mid(name):
+            q = live.get(name) if self.enable_cex else None
+            return (q.bid + q.ask) / 2 if q else None
+
+        nonkyc_price, kucoin_price = mid("NonKYC"), mid("Kucoin")
         if isinstance(snap, BaseException):  # _read_chain catches everything; fail closed regardless
             logger.error(f"Chain read failed: {snap}")
             self._chain_error = str(snap) or snap.__class__.__name__
@@ -282,25 +289,55 @@ class ArbitrageScanner:
         if use_lp is not None:
             self._price_timestamps["use"] = now
 
+        results["cex"] = cex                  # every exchange, with the error when it has no book
         if self.cex_watch:
-            watch = await asyncio.gather(
-                self.kucoin.get_price("ERG/USDT"), self.nonkyc.get_price("ERG/USDT"), return_exceptions=True
-            )
-            results["cex_watch"] = {
-                name: q for name, q in zip(("Kucoin", "NonKYC"), watch) if q and not isinstance(q, Exception)
-            }
-
-        nonkyc_ob = kucoin_ob = None
-        if self.enable_cex:
-            nonkyc_ob, kucoin_ob = await asyncio.gather(
-                self.nonkyc.get_orderbook("ERG/USDT", depth=20),
-                self.kucoin.get_orderbook("ERG/USDT", depth=20),
-            )
-        results["nonkyc_orderbook"] = nonkyc_ob
-        results["kucoin_orderbook"] = kucoin_ob
+            results["cex_watch"] = live       # quotes with bid/ask/timestamp, watch-only
+        results["nonkyc_orderbook"] = live["NonKYC"].book if self.enable_cex and "NonKYC" in live else None
+        results["kucoin_orderbook"] = live["Kucoin"].book if self.enable_cex and "Kucoin" in live else None
 
         self._last_prices = results
         return results
+
+    async def _fetch_cex(self) -> dict:
+        """Order books of every CEX in one go (public data, shared session); fees refreshed hourly."""
+        if self._http is None:
+            return {}
+        if time.time() - self.cex_fees.refreshed_at > CEX_FEE_REFRESH_SECONDS:
+            try:
+                await self.cex_fees.refresh(self._http)
+            except Exception as e:  # fees fall back to the configured defaults
+                logger.warning(f"CEX fee refresh failed: {e}")
+        return await fetch_all_quotes(self._http)
+
+    def _cex_spread(self, prices: dict):
+        """Best buy-here-sell-there across the exchanges at the funded size, every fee counted."""
+        return best_spread(prices.get("cex") or {}, self.cex_fees, self._funded_size(),
+                           config.CEX_USDT_TRANSFER_FEE)
+
+    def _analysis_sizes(self) -> list:
+        """Grid sizes to price: those the wallet can fund, plus the funded size itself (TRADE_SIZES_UNFUNDED
+        keeps the whole grid). Pricing 1000 ERG for a 20 ERG wallet only produced rows nobody can trade."""
+        sizes = list(self._trade_sizes)
+        if config.TRADE_SIZES_UNFUNDED:
+            return sizes
+        funded = self._funded_size()
+        out = [s for s in sizes if s <= funded]
+        if not out or funded > out[-1]:
+            out.append(funded)
+        return out
+
+    def _funded_size(self) -> float:
+        """The largest trade the wallet could fund now (MAX_TRADE_SIZE_ERG when the wallet is unknown)."""
+        cap = config.MAX_TRADE_SIZE_ERG
+        if self._last_wallet is not None and self._last_wallet.get("ok", True):
+            cap = min(cap, self._last_wallet.get("erg", 0) - config.LIVE_ERG_RESERVE)
+        return max(round(cap, 2), config.MIN_TRADE_SIZE_ERG)
+
+    @staticmethod
+    def _spread_text(s) -> str:
+        return (f"buy on {s.buy} (ask ${s.buy_price:.4f}), sell on {s.sell} (bid ${s.sell_price:.4f}) at "
+                f"{s.size_erg:g} ERG: {s.gross_percent:+.2f}% gross, {s.net_percent:+.2f}% "
+                f"({s.net_usdt:+.2f} USDT) after fees")
 
     def _display_prices(self, prices: dict):
         """Display current prices in a rich table."""
@@ -515,6 +552,11 @@ class ArbitrageScanner:
             return None
         return book.effective_buy_price(erg) if side == "buy" else book.effective_sell_price(erg)
 
+    def _fees_of(self, cex: str) -> tuple[float, float]:
+        """(taker fee, ERG withdrawal fee) for the CEX paths; an unknown withdrawal fee counts as the default."""
+        f = self.cex_fees.get(cex)
+        return f.taker, f.erg_withdraw if f.erg_withdraw is not None else self.cex_fees.default(cex).erg_withdraw or 0.0
+
     def _find_opportunities(self, prices: dict) -> list[ArbitrageOpportunity]:
         """Analyze prices and find all arbitrage opportunities (grid sizes); best sizes go to last_optima."""
         opportunities = []
@@ -533,7 +575,7 @@ class ArbitrageScanner:
         use_box_state = mint_box_state(use_mint)
 
 
-        for trade_size in self._trade_sizes:
+        for trade_size in self._analysis_sizes():
             slippage = config.get_recommended_slippage(trade_size)  # legs without known depth (CEX)
 
             # ---- SigUSD Paths ----
@@ -547,8 +589,8 @@ class ArbitrageScanner:
             # Watch-only: nothing converts SigUSD and USDT (WATCH_ONLY_REASON).
             pool = prices.get("spectrum_pool")
             for cex, mid, trading_fee, withdraw_fee in (
-                    ("NonKYC", nonkyc_price, config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE),
-                    ("Kucoin", kucoin_price, config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE)):
+                    ("NonKYC", nonkyc_price, *self._fees_of("NonKYC")),
+                    ("Kucoin", kucoin_price, *self._fees_of("Kucoin"))):
                 if not (mid and spectrum_price):
                     continue
                 ask = self._cex_side_price(prices, cex, trade_size, "buy") or mid
@@ -585,8 +627,7 @@ class ArbitrageScanner:
                 quotes = {name: (self._cex_side_price(prices, name, trade_size, "buy") or mid,
                                  self._cex_side_price(prices, name, trade_size, "sell") or mid)
                           for name, mid in (("NonKYC", nonkyc_price), ("Kucoin", kucoin_price))}
-                fees_by = {"NonKYC": (config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE),
-                           "Kucoin": (config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE)}
+                fees_by = {"NonKYC": self._fees_of("NonKYC"), "Kucoin": self._fees_of("Kucoin")}
                 options = []
                 for buy_on, sell_on in (("Kucoin", "NonKYC"), ("NonKYC", "Kucoin")):
                     o = self.calculator.calc_cex_to_cex(
@@ -610,8 +651,8 @@ class ArbitrageScanner:
 
             # Paths 6-7: bank mint -> (SigUSD -> USDT: no venue) -> buy ERG on a CEX. Watch-only.
             for cex, mid, trading_fee, withdraw_fee, minutes in (
-                    ("Kucoin", kucoin_price, config.KUCOIN_TRADING_FEE, config.KUCOIN_ERG_WITHDRAW_FEE, 60),
-                    ("NonKYC", nonkyc_price, config.NONKYC_TRADING_FEE, config.NONKYC_ERG_WITHDRAW_FEE, 40)):
+                    ("Kucoin", kucoin_price, *self._fees_of("Kucoin"), 60),
+                    ("NonKYC", nonkyc_price, *self._fees_of("NonKYC"), 40)):
                 if not (mid and bank_state is not None):
                     continue
                 ask = self._cex_side_price(prices, cex, trade_size, "buy") or mid
@@ -683,8 +724,8 @@ class ArbitrageScanner:
         gaps = []
         if not pool:
             return gaps
-        withdraw = {"Kucoin": config.KUCOIN_ERG_WITHDRAW_FEE, "NonKYC": config.NONKYC_ERG_WITHDRAW_FEE}
         for name, q in (prices.get("cex_watch") or {}).items():
+            wd = self.cex_fees.get(name).erg_withdraw
             buy_cex = (pool - q.ask) / q.ask * 100 if q.ask else 0   # ERG cheaper on the CEX
             sell_cex = (q.bid - pool) / pool * 100 if pool else 0    # ERG dearer on the CEX
             if buy_cex >= sell_cex:
@@ -696,7 +737,7 @@ class ArbitrageScanner:
                 "gap_percent": gap,
                 "alert": gap >= config.CEX_WATCH_ALERT_PERCENT,
                 "text": (f"{how}: {gap:+.2f}%. watch-only, assumes 1 SigUSD ~ $1, ignores the "
-                         f"{withdraw.get(name, 0)} ERG withdrawal fee and trading fees"),
+                         f"{'unknown' if wd is None else f'{wd:g}'} ERG withdrawal fee and trading fees"),
             })
         return gaps
 
@@ -705,6 +746,22 @@ class ArbitrageScanner:
             style = "bold yellow" if g["alert"] else "dim"
             hint = " -> worth connecting?" if g["alert"] else ""
             self.out.print(f"  [{style}]WATCH {g['exchange']}: {g['text']}{hint}[/{style}]")
+        spread = self._cex_spread(prices)
+        if spread is not None:
+            style = "bold yellow" if spread.profitable else "dim"
+            self.out.print(f"  [{style}]WATCH spread: {self._spread_text(spread)}[/{style}]")
+
+    async def _notify_cex_watch(self, prices: dict):
+        """One combined Discord watch message (at most once per CEX_WATCH_COOLDOWN_SECONDS), sent when an
+        exchange is far from the pool or the cross-exchange spread pays after every fee."""
+        gaps = self._cex_watch_gaps(prices)
+        spread = self._cex_spread(prices)
+        if not (any(g["alert"] for g in gaps) or (spread is not None and spread.profitable)):
+            return
+        lines = [f"{g['exchange']}: {g['text']}" for g in gaps]
+        if spread is not None:
+            lines.append(f"Best spread: {self._spread_text(spread)}")
+        await self.discord.notify_watch("CEX", "\n".join(lines))
 
     @staticmethod
     def _sigusd_premium_percent(prices: dict) -> Optional[float]:
@@ -1821,9 +1878,7 @@ class ArbitrageScanner:
         if not outage:
             await self._notify_discord(opportunities)
         if self.discord_enabled and self.cex_watch:
-            for g in self._cex_watch_gaps(prices):
-                if g["alert"]:
-                    await self.discord.notify_watch(g["exchange"], g["text"])
+            await self._notify_cex_watch(prices)
 
         # Send wallet analysis to Discord (rate limited)
         if self.discord_enabled and self._should_send_wallet_analysis(opportunities):
@@ -2004,7 +2059,8 @@ class ArbitrageScanner:
             f"Min profit: {config.MIN_PROFIT_PERCENT}%\n"
             f"Max trade size: {config.MAX_TRADE_SIZE_ERG} ERG\n"
             f"Chain poll: {config.CHAIN_POLL_SECONDS:g}s (node, mempool-aware) | full scan: {config.SCAN_INTERVAL_SECONDS}s\n"
-            f"Trade sizes monitored: {self._trade_sizes}\n"
+            f"Trade sizes: {self._trade_sizes}"
+            f"{' (all priced)' if config.TRADE_SIZES_UNFUNDED else ', priced up to what the wallet can fund'}\n"
             f"Venues: {'on-chain + CEX' if self.enable_cex else 'on-chain only (ENABLE_CEX=false)'}"
             f"{'' if self.enable_use else ', USE disabled (ENABLE_USE=false)'}"
             f"{', CEX watch-only' if self.cex_watch else ''}\n"

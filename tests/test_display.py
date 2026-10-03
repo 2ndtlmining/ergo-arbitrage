@@ -27,6 +27,7 @@ class TestTradeSizes:
         from exchanges.sigmausd import BankState
         monkeypatch.setattr(config, "TRADE_SIZES", [10, 100])
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 10.0)
+        monkeypatch.setattr(config, "TRADE_SIZES_UNFUNDED", True)   # unfunded sizes are only priced on request
         s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
         try:
             state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)

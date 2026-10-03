@@ -128,6 +128,9 @@ def parse_sizes(text: str) -> list[float]:
 # Trade sizes the scanner analyses (grid columns). Sizes above MAX_TRADE_SIZE_ERG are shown
 # for analysis only and never executed.
 TRADE_SIZES = parse_sizes(os.getenv("TRADE_SIZES", ""))
+# By default only sizes the wallet can fund are priced (plus the funded size itself); true keeps the
+# whole grid, e.g. to compare against history.
+TRADE_SIZES_UNFUNDED = os.getenv("TRADE_SIZES_UNFUNDED", "false").strip().lower() in ("1", "true", "yes")
 MIN_TRADE_SIZE_ERG = float(os.getenv("MIN_TRADE_SIZE_ERG", "1"))  # lower bound of the best-size search
 # Trade the smallest size that still earns this share of the best possible profit: near the
 # peak, extra size adds little profit but all of its risk. 1.0 = maximise profit outright.

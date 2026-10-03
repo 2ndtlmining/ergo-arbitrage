@@ -192,3 +192,10 @@ def test_unknown_withdrawal_fee_means_no_net_figure():
 def test_no_spread_without_two_live_books():
     assert cp.best_spread(quotes(A=book(0.29, 0.30)), fees(A=(0.001, 1.0)), size_erg=10,
                           usdt_transfer_fee=1.0) is None
+
+
+def test_fee_book_records_which_fees_are_published():
+    book = cp.FeeBook()
+    run(book.refresh(FakeSession({"currency_pairs/ERG_USDT": FakeResp(200, GATE_PAIR)}), names=("Gate",)))
+    gate = book.get("Gate")
+    assert gate.live_fields == ("taker",) and gate.describe() == "taker 0.20% (live), withdrawal 0.403 ERG (default)"

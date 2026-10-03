@@ -80,15 +80,21 @@ def _cex(name: str, price_key: str, ts_key: str) -> Callable[[VenueContext], Ven
             if not price:
                 return VenueStatus(name, "CEX", "down", error="no quote")
             return VenueStatus(name, "CEX", "live", f"${price:.4f}", _age(c, ts_key))
+        full = (c.prices.get("cex") or {}).get(name)
+        if full is not None and full.error and full.error.startswith("disabled"):
+            return VenueStatus(name, "CEX", "disabled", full.error.split(": ", 1)[-1])
         q = (c.prices.get("cex_watch") or {}).get(name)
         if q is None:
-            return VenueStatus(name, "CEX", "down", error="no quote")
-        return VenueStatus(name, "CEX", "watch", f"${q.bid:.4f} / ${q.ask:.4f}", c.now - q.timestamp.timestamp())
+            return VenueStatus(name, "CEX", "down", error=(full.error if full is not None and full.error
+                                                            else "no quote"))
+        ts = q.timestamp if isinstance(q.timestamp, (int, float)) else q.timestamp.timestamp()
+        return VenueStatus(name, "CEX", "watch", f"${q.bid:.4f} / ${q.ask:.4f}", c.now - ts)
     return describe
 
 
 VENUES: tuple = (pool, bank, oracle, dexy_use, _cex("Kucoin", "kucoin_erg_usdt", "kucoin"),
-                 _cex("NonKYC", "nonkyc_erg_usdt", "nonkyc"))
+                 _cex("NonKYC", "nonkyc_erg_usdt", "nonkyc"), _cex("Gate", "gate_erg_usdt", "gate"),
+                 _cex("MEXC", "mexc_erg_usdt", "mexc"), _cex("SafeTrade", "safetrade_erg_usdt", "safetrade"))
 
 
 def describe_all(c: VenueContext) -> list[VenueStatus]:

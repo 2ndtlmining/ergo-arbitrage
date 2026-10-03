@@ -174,6 +174,13 @@ class CexFees:
     taker: float                      # fraction of the traded amount
     erg_withdraw: Optional[float]     # ERG per withdrawal; None = unknown (no net figure is computed)
     source: str = "default"           # default (config) | live (published by the exchange)
+    live_fields: tuple = ()           # which of "taker", "erg_withdraw" the exchange published
+
+    def describe(self) -> str:
+        def tag(f):
+            return "live" if f in self.live_fields else "default"
+        wd = "withdrawal unknown" if self.erg_withdraw is None else             f"withdrawal {self.erg_withdraw:g} ERG ({tag('erg_withdraw')})"
+        return f"taker {self.taker:.2%} ({tag('taker')}), {wd}"
 
 
 class FeeBook:
@@ -210,9 +217,11 @@ class FeeBook:
                 logger.debug(f"{name} fee refresh: unexpected answer ({e.__class__.__name__})")
                 return
             base = self.get(name)
+            live = tuple(dict.fromkeys(base.live_fields + tuple(k for k in ("taker", "erg_withdraw")
+                                                                  if k in published)))
             self._fees[name] = CexFees(taker=published.get("taker", base.taker),
                                        erg_withdraw=published.get("erg_withdraw", base.erg_withdraw),
-                                       source="live")
+                                       source="live", live_fields=live)
 
         await asyncio.gather(*(one(n) for n in names))
         self.refreshed_at = time.time()

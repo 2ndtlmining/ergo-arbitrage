@@ -1,7 +1,7 @@
 """DashboardState: what every view shows, plus the events it generates (spec: dashboard)."""
 import json
 
-from arbitrage.dashboard_state import MAX_EVENTS, DashboardState, VenueStatus, path_status
+from arbitrage.dashboard_state import MAX_EVENTS, MAX_VENUES, DashboardState, VenueStatus, path_status
 from arbitrage.sizing import SizeChoice
 
 POOL = "Spectrum buy->Bank redeem"
@@ -73,10 +73,10 @@ def test_pool_pending_is_not_an_event():
     assert texts(s) == []
 
 
-def test_at_most_seven_venues():
+def test_at_most_max_venues():
     s = DashboardState()
-    s.update_venues([VenueStatus(f"v{i}", "CEX", "live") for i in range(9)])
-    assert len(s.venues) == 7
+    s.update_venues([VenueStatus(f"v{i}", "CEX", "live") for i in range(MAX_VENUES + 2)])
+    assert len(s.venues) == MAX_VENUES
 
 
 def test_live_category_change_is_an_event_detail_change_is_not():
