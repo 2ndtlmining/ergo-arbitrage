@@ -49,6 +49,7 @@ class ArbitrageOpportunity:
     price_risk_percent: float = 0  # Estimated price risk during execution
     profit_usd: float = 0  # Profit in USD terms
     details: dict = field(default_factory=dict)  # Exact leg amounts (e.g. sigusd_cents, bank_erg)
+    sources: tuple = ()  # price sources this path depends on (staleness guard): spectrum, bank, kucoin, ...
     timestamp: datetime = field(default_factory=datetime.now)
 
     @property

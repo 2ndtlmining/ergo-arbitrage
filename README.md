@@ -402,8 +402,7 @@ ergo_arbitrage/
 ├── tracker/
 │   └── profit_tracker.py   # SQLite: snapshots, opportunities, episodes, trades, stats
 ├── tests/                  # pytest (unit by default; -m live for node/API tests)
-├── execute_*.py            # standalone swap scripts (dry run unless --execute)
-└── archive/                # retired scripts, kept for reference
+└── archive/                # retired scripts (old execute_*.py, one-off recoveries), reference only
 ```
 
 ### Wallet tool (`python arb.py ...`)
@@ -494,41 +493,20 @@ wallet; SigUSD sells and redeems are capped by the amount you ask for.
 5. **If leg 2 fails**, you hold SigUSD and live trading pauses. The Discord message and the Live
    panel give the exact command to finish (`python arb.py redeem --sigusd ... --execute`).
 
-### Execution Scripts
 
-Every script builds the transaction, checks it with the TX guard (`ergo/tx_guard.py`) and
-stops there unless you pass `--execute`. The guard resolves all inputs from your own node
-and refuses to sign if any output goes somewhere other than your wallet, the recreated
-pool/bank box, the miner fee or a whitelisted service-fee address, or if the wallet would
-spend more / receive less than the quote allows (`SLIPPAGE_TOLERANCE`, `MAX_FEE_BUDGET_ERG`,
-`MAX_TRADE_SIZE_ERG`).
+### Retired execution scripts
 
-```bash
-python execute_bank_redeem.py --sigusd 1.0            # dry run: build + verify
-python execute_bank_redeem.py --sigusd 1.0 --execute  # sign and submit
-python execute_swap_sigusd_to_erg.py --execute
-```
+The standalone `execute_*.py` scripts and `verify_opportunity.py` now live in `archive/`. Each
+had its own copy of the quote, sign and monitor code. Everything they did is in the wallet tool,
+on the shared, TX-guarded code in `ergo/`:
 
-`execute_pool_swap.py` swaps directly against the ErgoDEX pool box, with no Crux service
-fee (~0.76 ERG saved per swap). `--check` signs the TX and has your node validate it,
-including the pool contract, without broadcasting:
-
-```bash
-python execute_pool_swap.py --sell erg --amount 1 --check
-python execute_pool_swap.py --sell sigusd --amount 0.5 --execute
-```
-
-| Script | Direction | Status | TX Proof |
-|--------|-----------|--------|----------|
-| `execute_arb.py` | Full loop: pool buy -> bank redeem (two chained TXs) | NEW: dry run / `--check` first; executes only if profitable | - |
-| `execute_pool_swap.py` | ERG <-> SigUSD (direct pool spend, no Crux fee) | NEW: dry run / `--check` first | - |
-| `execute_swap_use.py` | ERG -> USE (Crux mint) | TESTED LIVE | Confirmed on-chain |
-| `execute_swap_use_to_erg.py` | USE -> ERG (Crux LP) | TESTED LIVE | TX `bf544106...` |
-| `execute_swap_erg_to_use_lp.py` | ERG -> USE (Crux LP) | TESTED LIVE | TX `e2582256...` |
-| `execute_swap_sigusd_to_erg.py` | SigUSD -> ERG (Crux/Spectrum) | TESTED LIVE | TX `863979a5...` |
-| `execute_bank_redeem.py` | SigUSD -> ERG (Bank redeem) | TESTED LIVE | TX `c7a08cda...` |
-| `execute_swap_erg_to_sigusd_spectrum.py` | ERG -> SigUSD (Spectrum) | QUOTE ONLY | Not live tested |
-| `execute_swap_sigusd_to_erg_spectrum.py` | SigUSD -> ERG (Spectrum) | QUOTE ONLY | Not live tested |
+| Old script | Now |
+|---|---|
+| `execute_arb.py` | `python arb.py arb [--path redeem\|mint] [--erg N] --check / --execute` |
+| `execute_pool_swap.py`, `execute_swap_sigusd_to_erg*.py`, `execute_swap_erg_to_sigusd_spectrum.py` | `python arb.py swap --sell erg\|sigusd --amount N\|all` (direct pool swap, no Crux fee) |
+| `execute_bank_redeem.py` | `python arb.py redeem --sigusd N\|all` |
+| `execute_swap_use*.py`, `execute_swap_erg_to_use_lp.py` | none while USE is disabled (its LP was drained); kept in `archive/` for reference |
+| `verify_opportunity.py` | the bot's own exact sizing (`python arb.py quote`) |
 
 ## Data Tracking
 

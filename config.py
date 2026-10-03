@@ -67,7 +67,7 @@ SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 SPECTRUM_POOL_FEE = 0.005  # 0.5% (995/1000) for SigUSD/ERG pool
 SPECTRUM_EXECUTION_FEE = 0.785  # ERG service fee (via Crux Finance routing)
 
-# How SigUSD pool legs are executed: "direct" = our own pool-box swap (execute_pool_swap.py,
+# How SigUSD pool legs are executed: "direct" = our own pool-box swap (arb.py swap / ergo/pool_swap.py,
 # miner fee only), "crux" = Crux /dex/swap (adds SPECTRUM_EXECUTION_FEE per leg).
 POOL_SWAP_ROUTE = os.getenv("POOL_SWAP_ROUTE", "direct").strip().lower()
 
