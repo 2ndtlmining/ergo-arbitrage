@@ -20,21 +20,46 @@ def positive(kind):
     return parse
 
 
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keeps the examples' line breaks and adds "(default: X)" to options that have a real default."""
+
+    def _get_help_string(self, action):
+        text = action.help or ""
+        if "%(default)" not in text and action.default not in (None, False, argparse.SUPPRESS) \
+                and action.option_strings:
+            text += " (default: %(default)s)"
+        return text
+
+
+EPILOG = """examples:
+  python main.py --once --plain            one full scan, printed, then exit
+  python main.py --notify                  dashboard + Discord alerts; never trades
+  python main.py --notify --plain          for systemd / small terminals
+  python main.py --live --max-trade-erg 5  first live run: small cap, asks you to type LIVE
+
+Settings are read from .env in the bot folder (python arb.py config lists them).
+Before the first run: python arb.py doctor (is the node ready?). Wallet actions: python arb.py --help."""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Ergo Arbitrage Monitor (live dashboard by default)")
+    p = argparse.ArgumentParser(description="Ergo arbitrage monitor: watches the ErgoDEX pool and the SigmaUSD bank "
+                                            "on your node (live dashboard by default).",
+                                epilog=EPILOG, formatter_class=HelpFormatter)
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--notify", action="store_true", help="monitor + Discord alerts (no trades)")
-    mode.add_argument("--live", action="store_true", help="monitor + Discord alerts + auto-execute trades")
+    mode.add_argument("--live", action="store_true",
+                      help="monitor + Discord alerts + auto-execute trades; start with a small --max-trade-erg")
     view = p.add_mutually_exclusive_group()
     view.add_argument("--plain", action="store_true", help="scrolling output instead of the dashboard")
     view.add_argument("--json", action="store_true", help="one JSON line per full scan on stdout")
     p.add_argument("--once", action="store_true", help="one full scan, then exit")
-    p.add_argument("--interval", type=positive(int), help="seconds between full scans (SCAN_INTERVAL_SECONDS)")
-    p.add_argument("--max-trade-erg", type=positive(float), help="cap on any executed trade (MAX_TRADE_SIZE_ERG)")
+    p.add_argument("--interval", type=positive(int),
+                   help=f"seconds between full scans (default: SCAN_INTERVAL_SECONDS = {config.SCAN_INTERVAL_SECONDS})")
+    p.add_argument("--max-trade-erg", type=positive(float),
+                   help=f"cap on any executed trade; can only lower MAX_TRADE_SIZE_ERG ({config.MAX_TRADE_SIZE_ERG:g})")
     p.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
                    help="log file level (arbitrage.log, rotated daily, 14 days kept)")
-    p.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")),
-                   help="tracker database (default: arbitrage_tracker.db in the bot folder)")
+    p.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")), help="tracker database")
     p.add_argument("--no-wallet", action="store_true", help="hide the wallet panel and wallet analysis")
     p.add_argument("--yes", action="store_true",
                    help="arm --live without the typed confirmation (for systemd and other unattended runs)")
@@ -68,7 +93,8 @@ async def run(scanner: ArbitrageScanner, view: str, once: bool):
     if view != "dashboard":
         await scanner.run(once=once)
         return
-    with Live(get_renderable=lambda: render_safe(scanner.state), console=console, refresh_per_second=2,
+    with Live(get_renderable=lambda: render_safe(scanner.state, console.size.width, console.size.height),
+              console=console, refresh_per_second=2,
               screen=not once, redirect_stdout=False, redirect_stderr=False):
         await scanner.run(once=once)
 

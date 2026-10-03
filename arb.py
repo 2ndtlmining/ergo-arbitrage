@@ -45,59 +45,111 @@ def parse_size(text: str):
 def _mode_flags(p: argparse.ArgumentParser):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--check", action="store_true", help="sign and validate on your node, do not broadcast")
-    g.add_argument("--execute", action="store_true", help="send it, then follow it until confirmed")
+    g.add_argument("--execute", action="store_true", help="send it, then follow it until confirmed (without "
+                                                           "--check or --execute: dry run)")
     p.add_argument("--ignore-lock", action="store_true",
                    help="--execute even while a --live bot runs on this database (it may spend the same boxes)")
 
 
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keeps the examples' line breaks and adds "(default: X)" to options that have a real default."""
+
+    def _get_help_string(self, action):
+        text = action.help or ""
+        if "%(default)" not in text and action.default not in (None, False, argparse.SUPPRESS) \
+                and action.option_strings:
+            text += " (default: %(default)s)"
+        return text
+
+
+DRY = "Dry run by default (shows what it would do); --check signs and validates it on your node without " \
+      "broadcasting; --execute sends it."
+
+
+def _sub(sub, name: str, help: str, description: str, examples: list[str]):
+    return sub.add_parser(name, help=help, description=f"{description}\n\n{DRY}" if "--check" in "".join(examples)
+                          else description, epilog="examples:\n" + "\n".join(f"  python arb.py {e}" for e in examples),
+                          formatter_class=HelpFormatter)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="arb.py", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(prog="arb.py", description=__doc__, formatter_class=HelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
-    sub.add_parser("balance", help="wallet balances, value, pending changes, bank/pool state")
+    _sub(sub, "balance", "wallet balances, value, pending changes, bank/pool state",
+         "Wallet balances (confirmed and pending), their value at the oracle price, and the pool and bank state.",
+         ["balance"])
 
-    q = sub.add_parser("quote", help="best arbitrage sizes now, and pool vs bank for an amount (no transaction)")
-    q.add_argument("--sell", choices=["erg", "sigusd"])
-    q.add_argument("--amount", type=float)
+    q = _sub(sub, "quote", "best arbitrage sizes now, and pool vs bank for an amount (no transaction)",
+             "The best arbitrage sizes on the current pool and bank, and (with --sell and --amount) what the pool "
+             "and the bank give for that amount. Never builds a transaction.",
+             ["quote", "quote --sell sigusd --amount 10", "quote --sell erg --amount 5"])
+    q.add_argument("--sell", choices=["erg", "sigusd"], help="what you would sell (give --amount too)")
+    q.add_argument("--amount", type=float, help="how much of it")
 
-    s = sub.add_parser("swap", help="swap ERG <-> SigUSD directly against the pool (no service fee)")
-    s.add_argument("--sell", choices=["erg", "sigusd"], required=True)
+    s = _sub(sub, "swap", "swap ERG <-> SigUSD directly against the pool (no service fee)",
+             "Swap against the ErgoDEX SigUSD/ERG pool with a transaction the bot builds itself: 0.5% pool fee plus "
+             "the miner fee, no service fee.",
+             ["swap --sell erg --amount 5", "swap --sell erg --amount 5 --check", "swap --sell sigusd --amount all --execute"])
+    s.add_argument("--sell", choices=["erg", "sigusd"], required=True, help="what to sell")
     s.add_argument("--amount", type=parse_amount, required=True, help="number or 'all'")
     _mode_flags(s)
 
-    r = sub.add_parser("redeem", help="redeem SigUSD for ERG at the SigmaUSD bank")
+    r = _sub(sub, "redeem", "redeem SigUSD for ERG at the SigmaUSD bank",
+             "Redeem SigUSD for ERG at the SigmaUSD bank at the oracle price (2.229% fee). Always allowed, whatever "
+             "the reserve ratio; it is also how a failed live trade is finished.",
+             ["redeem --sigusd 10 --check", "redeem --sigusd all --execute"])
     r.add_argument("--sigusd", type=parse_amount, required=True, help="number or 'all'")
     _mode_flags(r)
 
-    se = sub.add_parser("send", help="send ERG and/or SigUSD to another address")
+    se = _sub(sub, "send", "send ERG and/or SigUSD to another address",
+              "Send ERG and/or SigUSD from the node wallet. The TX guard only lets that payee receive that amount; "
+              "SEND_ALLOWED_ADDRESSES and SEND_MAX_SIGUSD (.env) limit it further, and --execute asks for the last "
+              "4 characters of the address.",
+              ["send --to 9f... --erg 1.5", "send --to 9f... --erg 1.5 --sigusd 2 --check", "send --to 9f... --erg 1.5 --execute"])
     se.add_argument("--to", required=True, help="destination Ergo address")
-    se.add_argument("--erg", type=float, default=0.0)
-    se.add_argument("--sigusd", type=float, default=0.0)
+    se.add_argument("--erg", type=float, default=0.0, help="ERG to send")
+    se.add_argument("--sigusd", type=float, default=0.0, help="SigUSD to send")
     _mode_flags(se)
 
-    a = sub.add_parser("arb", help="two-leg arbitrage: pool buy -> bank redeem, or bank mint -> pool sell")
+    a = _sub(sub, "arb", "two-leg arbitrage: pool buy -> bank redeem, or bank mint -> pool sell",
+             "One two-leg arbitrage on the current pool, bank and oracle boxes, sized for the best profit unless "
+             "--erg is given. Refuses --execute while the STOP file exists or live mode is paused.",
+             ["arb", "arb --check", "arb --erg 10 --path mint --check", "arb --execute"])
     a.add_argument("--erg", type=parse_size, default=None,
                    help="ERG for leg 1 (the mint budget for --path mint), or 'best' (default): the size "
                         "with the best profit on the current pool and bank, capped by wallet and MAX_TRADE_SIZE_ERG")
     a.add_argument("--path", choices=["redeem", "mint"], default="redeem",
-                   help="redeem: pool buy -> bank redeem (default); mint: bank mint -> pool sell")
-    a.add_argument("--force", action="store_true", help="execute even below MIN_PROFIT_PERCENT (testing)")
+                   help="redeem: pool buy -> bank redeem; mint: bank mint -> pool sell")
+    a.add_argument("--force", action="store_true",
+                   help="go ahead below MIN_PROFIT_PERCENT (asks you to type the expected result) or above "
+                        "LIVE_MAX_PROFIT_PERCENT, and while an oracle update is pending (testing)")
     _mode_flags(a)
 
-    d = sub.add_parser("doctor", help="check the node is ready for the bot (ends with a sign check that is never broadcast)")
+    d = _sub(sub, "doctor", "check the node is ready for the bot (ends with a sign check that is never broadcast)",
+             "Checks .env, the Discord webhook (without posting) and everything the bot needs from your node: "
+             "reachable, synced, API key, wallet, balances, extra index, mempool lookup, and finally a 1 ERG trade "
+             "the node signs and validates but never broadcasts. Exits 1 when a node check fails.",
+             ["doctor", "doctor --no-sign"])
     d.add_argument("--no-sign", action="store_true", help="skip the final sign-and-validate check")
 
-    sub.add_parser("config", help="effective settings and their source; unknown keys, placeholders, renamed "
-                                  "settings in .env (secrets masked)")
+    _sub(sub, "config", "effective settings and their source; unknown keys, placeholders, renamed settings in .env",
+         "Every setting with the value in use and where it comes from (.env, environment, default), secrets masked; "
+         "then keys in .env the bot does not read, leftover .env.example placeholders and renamed settings. "
+         "Needs no node.", ["config"])
 
-    b = sub.add_parser("backup", help="consistent copy of the tracker database (safe while the bot runs)")
-    b.add_argument("--db", default=DEFAULT_DB)
+    b = _sub(sub, "backup", "consistent copy of the tracker database (safe while the bot runs)",
+             "A consistent copy of the tracker database, taken with SQLite's backup API (a plain cp can miss rows "
+             "while the bot runs); keeps the newest --keep copies.",
+             ["backup", "backup --to /mnt/nas/arb --keep 30"])
+    b.add_argument("--db", default=DEFAULT_DB, help="the database to copy")
     b.add_argument("--to", default=str(config.repo_path("backups")), help="folder for the copies")
-    b.add_argument("--keep", type=int, default=14, help="newest copies to keep (default 14)")
+    b.add_argument("--keep", type=int, default=14, help="newest copies to keep")
 
-    rs = sub.add_parser("resume", help="clear the live-mode pause left by a failed or interrupted trade")
-    rs.add_argument("--db", default=DEFAULT_DB)
+    rs = _sub(sub, "resume", "clear the live-mode pause left by a failed or interrupted trade",
+              "Clears the stored live-mode pause. Check `arb.py balance` first; the running bot keeps its pause "
+              "until it is restarted.", ["resume"])
+    rs.add_argument("--db", default=DEFAULT_DB, help="the bot's database")
     return parser
 
 

@@ -1,6 +1,7 @@
 """Render DashboardState as one screen (rich Layout). Pure: reads the state, never changes it
 (except render_safe, which records a render error as an event)."""
 from datetime import datetime
+from typing import Optional
 
 from rich.console import Group
 from rich.layout import Layout
@@ -161,30 +162,43 @@ def wallet_panel(s: DashboardState) -> Panel:
     return Panel(line, title="Wallet")
 
 
-def paths_panel(s: DashboardState) -> Panel:
+COMPACT_WIDTH = 100    # narrower: fewer columns, the path status wraps, venues and exchanges in one table
+COMPACT_HEIGHT = 32    # shorter: no Events/History and no GO steps, so every path and venue still fits
+PATH_COLUMNS = (("path", "left", 14), ("size", "right", 7), ("profit", "right", 8), ("%", "right", 7),
+                ("b/even", "right", 6), ("conf", "right", 4), ("status", "left", 8), ("last 30", "left", 8))
+COMPACT_DROPS = {"b/even", "last 30"}
+
+
+def _status_text(row) -> str:
+    ok = bool(row.choice and row.choice.ok)
+    return row.status if ok or not row.detail else f"{row.status}: {row.detail}"
+
+
+def paths_panel(s: DashboardState, compact: bool = False, steps: bool = True) -> Panel:
     if not s.paths:
         return Panel(Text("waiting for the first scan…", style="dim"), title="Paths")
     t = Table(expand=True, box=None, pad_edge=False)
-    # Fixed minimums keep the numbers whole on narrow terminals; only the status reason shrinks.
-    for col, justify, width in (("path", "left", 14), ("size", "right", 7), ("profit", "right", 8),
-                                ("%", "right", 7), ("b/even", "right", 6), ("conf", "right", 4),
-                                ("status", "left", 8), ("last 30", "left", 8)):
-        t.add_column(col, justify=justify, no_wrap=True, overflow="ellipsis", min_width=width,
-                     ratio=1 if col == "status" else None)
+    # Fixed minimums keep the numbers whole on narrow terminals; only the status reason shrinks (or, compact,
+    # wraps so the reason stays readable).
+    columns = [c for c in PATH_COLUMNS if not (compact and c[0] in COMPACT_DROPS)]
+    for col, justify, width in columns:
+        t.add_column(col, justify=justify, no_wrap=col != "status", overflow="fold" if col == "status" else "ellipsis",
+                     min_width=width, ratio=1 if col == "status" else None)
     go_steps = []
     for row in s.paths.values():
         c = row.choice
         ok = bool(c and c.ok)
-        t.add_row(row.label,
-                  f"{c.size_erg:.2f}" if ok else "—",
-                  f"{c.profit_erg:+.4f}" if ok else (f"{c.max_profit_erg:+.4f}" if c and c.max_profit_size_erg else "—"),
-                  f"{c.profit_percent:+.2f}%" if ok else "—",
-                  f"{c.break_even_erg:.2f}" if c and c.break_even_erg else "—",
-                  f"{row.streak}/{config.LIVE_CONFIRM_POLLS}" if c else "—",
-                  Text(row.status if ok or not row.detail else f"{row.status}: {row.detail}",
-                       style=STATUS_STYLE.get(row.status, "")),
-                  sparkline(row.history))
-        if ok and row.steps and not go_steps:
+        cells = {"path": row.label,
+                 "size": f"{c.size_erg:.2f}" if ok else "—",
+                 "profit": f"{c.profit_erg:+.4f}" if ok else (f"{c.max_profit_erg:+.4f}" if c and c.max_profit_size_erg
+                                                             else "—"),
+                 "%": f"{c.profit_percent:+.2f}%" if ok else "—",
+                 "b/even": f"{c.break_even_erg:.2f}" if c and c.break_even_erg else "—",
+                 "conf": f"{row.streak}/{config.LIVE_CONFIRM_POLLS}" if c else "—",
+                 "status": Text(_status_text(row), style=STATUS_STYLE.get(row.status, "")),
+                 "last 30": sparkline(row.history)}
+        t.add_row(*[cells[col] for col, _, _ in columns])
+        if steps and ok and row.steps and not go_steps:
             go_steps = [f"  {i}. {step}" for i, step in enumerate(row.steps, 1)]
     body = Group(t, Text("\n".join(go_steps), style="green")) if go_steps else t
     return Panel(body, title="Paths")
@@ -290,36 +304,114 @@ def venues_panel(s: DashboardState) -> Panel:
     return Panel(t, title="Venues")
 
 
-def render(s: DashboardState) -> Layout:
+def exchanges_line(s: DashboardState) -> Text:
+    """Short terminals: every exchange in one (wrapping) line: mid price and gap to the oracle."""
+    parts = []
+    for e in s.exchanges:
+        if e.state == "live":
+            gap = f" {e.vs_oracle_percent:+.2f}%" if e.vs_oracle_percent is not None else ""
+            parts.append(f"{e.name} {(e.bid + e.ask) / 2:.4f}{gap}")
+        else:
+            parts.append(f"{e.name} {e.state}")
+    return Text("CEX (watch-only): " + " · ".join(parts), style="cyan")
+
+
+def venues_compact_panel(s: DashboardState, short: bool = False) -> Panel:
+    """Narrow terminals: on-chain venues and exchanges in one three-column table (short: exchanges in one line)."""
+    if not s.venues:
+        return Panel(Text("waiting for the first scan…", style="dim"), title="Venues")
+    t = Table(expand=True, box=None, pad_edge=False, show_header=not short)
+    for col in ("venue", "status", "quote"):
+        t.add_column(col, no_wrap=True, overflow="ellipsis", ratio=1 if col == "quote" else None)
+    on_chain = [v for v in s.venues if v.kind != "CEX"] if s.exchanges else s.venues
+    for v in on_chain:
+        symbol, style = VENUE_STYLE.get(v.state, ("?", ""))
+        label = "update pending" if v.state == "pending" and v.name == "Oracle" else v.state.replace("watch", "watch only")
+        t.add_row(v.name, Text(f"{symbol} {label}", style=style), v.quote if v.state != "down" else (v.error or "no data"),
+                  style="dim" if v.state == "disabled" else None)
+    for e in ([] if short else s.exchanges):
+        if e.state == "live":
+            gap = f" ({e.vs_oracle_percent:+.2f}%)" if e.vs_oracle_percent is not None else ""
+            t.add_row(e.name, Text("○ watch only", style="cyan"), f"{e.bid:.4f} / {e.ask:.4f}{gap}")
+        else:
+            t.add_row(e.name, Text(e.state, style=EXCHANGE_STYLE.get(e.state, "")), e.error or "",
+                      style="dim" if e.state == "disabled" else None)
+    body = Group(t, exchanges_line(s)) if short and s.exchanges else t
+    return Panel(body, title="Venues and exchanges (watch-only)" if s.exchanges else "Venues")
+
+
+def _paths_rows(s: DashboardState, width: int, compact: bool, steps: bool) -> int:
+    rows = 4      # the status column gets what the fixed columns leave; long reasons wrap onto more lines
+    drops = COMPACT_DROPS if compact else set()
+    fixed = sum(w + 1 for col, _, w in PATH_COLUMNS if col not in drops | {"status"}) + 4
+    room = max(8, int((width - fixed) * 0.8))   # the table gives some columns more than their minimum
+    rows += sum(-(-len(_status_text(r)) // room) for r in (s.paths or {}).values())
+    if steps:
+        rows += max((len(r.steps) for r in (s.paths or {}).values() if r.choice and r.choice.ok), default=0)
+    return max(rows, 5)
+
+
+def render(s: DashboardState, width: Optional[int] = None, height: Optional[int] = None) -> Layout:
+    """width/height: the terminal size (None = a large one). Small terminals get the compact layout."""
+    compact = width is not None and width < COMPACT_WIDTH
+    short = height is not None and height < COMPACT_HEIGHT
+    if compact or short:
+        return _render_compact(s, width or 200, short)
+    return _render_full(s, width or 200)
+
+
+def _top(s: DashboardState) -> tuple[Layout, int]:
+    trend_rows = 1 if rr_trend(s.rr_history, datetime.now().timestamp()) else 0
+    top = Layout(name="top", size=max(7 + trend_rows, 6 + min(len(s.live_detail), LIVE_REASONS_SHOWN + 1)))
+    right = Layout()
+    right.split_column(Layout(live_panel(s), ratio=3), Layout(wallet_panel(s), size=3))
+    top.split_row(Layout(prices_panel(s)), right)
+    return top, top.size
+
+
+def _render_compact(s: DashboardState, width: int, short: bool) -> Layout:
     layout = Layout()
-    paths_rows = len(s.paths or {}) + 4 + max((len(r.steps) for r in (s.paths or {}).values()
-                                               if r.choice and r.choice.ok), default=0)
+    top, _ = _top(s)
+    venue_rows = (len([v for v in s.venues if v.kind != "CEX"] if s.exchanges else s.venues)
+                  + len(s.exchanges) + 3) if s.venues else 3
+    parts = [Layout(header(s), size=1)] + ([] if short else [Layout(health_strip(s), size=1)]) + [
+        top, Layout(paths_panel(s, compact=True, steps=not short), size=_paths_rows(s, width, True, not short))]
+    if short:
+        parts.append(Layout(venues_compact_panel(s, short=True)))     # takes what is left
+    else:
+        middle = Layout(name="middle", minimum_size=4)
+        middle.split_row(Layout(events_panel(s), ratio=3), Layout(history_panel(s), ratio=2))
+        parts += [middle, Layout(venues_compact_panel(s), size=venue_rows)]
+    layout.split_column(*parts)
+    return layout
+
+
+def _render_full(s: DashboardState, width: int) -> Layout:
+    layout = Layout()
+    paths_rows = _paths_rows(s, width, False, True)
     on_chain = [v for v in s.venues if v.kind != "CEX"] if s.exchanges else s.venues
     bottom_rows = max(len(on_chain), len(s.exchanges) + (2 if s.spread_text else 0)) + 3 if s.venues else 3
-    trend_rows = 1 if rr_trend(s.rr_history, datetime.now().timestamp()) else 0
+    top, _ = _top(s)
     layout.split_column(
         Layout(header(s), size=1),
         Layout(health_strip(s), size=1),
-        Layout(name="top", size=max(7 + trend_rows, 6 + min(len(s.live_detail), LIVE_REASONS_SHOWN + 1))),
+        top,
         Layout(paths_panel(s), size=paths_rows),
         Layout(name="middle", minimum_size=4),
         Layout(name="bottom", size=bottom_rows),
     )
-    right = Layout()
-    right.split_column(Layout(live_panel(s), ratio=3), Layout(wallet_panel(s), size=3))
-    layout["top"].split_row(Layout(prices_panel(s)), right)
     layout["middle"].split_row(Layout(events_panel(s), ratio=3), Layout(history_panel(s), ratio=2))
     if s.exchanges:
-        layout["bottom"].split_row(Layout(venues_panel(s), ratio=2), Layout(exchanges_panel(s), ratio=3))
+        layout["bottom"].split_row(Layout(venues_panel(s), ratio=1), Layout(exchanges_panel(s), ratio=1))
     else:
         layout["bottom"].update(venues_panel(s))
     return layout
 
 
-def render_safe(s: DashboardState):
+def render_safe(s: DashboardState, width: Optional[int] = None, height: Optional[int] = None):
     """Never raises: a renderer bug shows as an event instead of killing the dashboard (or the bot)."""
     try:
-        return render(s)
+        return render(s, width, height)
     except Exception as e:
         try:
             s.add_event("error", f"dashboard render error: {e.__class__.__name__}: {e}")
