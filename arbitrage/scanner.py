@@ -149,7 +149,7 @@ class ArbitrageScanner:
         # --live state
         self._live_streak: dict[str, int] = {}
         self._live_paused: Optional[str] = None
-        self._last_trade_time = 0.0
+        self._last_trade_time: Optional[float] = None   # time.monotonic() of the last trade attempt
         self._trades_today: tuple[str, int] = ("", 0)
         self._live_start_value: Optional[float] = None      # today's drawdown baseline (wallet value, ERG)
         self._live_baseline_day: str = ""
@@ -1198,11 +1198,17 @@ class ArbitrageScanner:
     def _tick_episodes(self, now: float):
         for event in self.episodes.update(now, self.state.paths):
             self._handle_episode(event)
+        open_ids = set()
         for ep in list(self.episodes.open.values()):
-            if ep.db_id and now - self._episode_touched.get(ep.db_id, now) >= EPISODE_HEARTBEAT_S:
+            if not ep.db_id:
+                continue
+            open_ids.add(ep.db_id)
+            if now - self._episode_touched.get(ep.db_id, now) >= EPISODE_HEARTBEAT_S:
                 self.tracker.touch_chain_episode(ep.db_id)
                 self._episode_touched[ep.db_id] = now
             self._episode_touched.setdefault(ep.db_id, now)
+        for closed in [i for i in self._episode_touched if i not in open_ids]:
+            del self._episode_touched[closed]
 
     def _tick_health(self, now: float):
         for h in self.health.update(time.time(), self.state):
@@ -1295,7 +1301,8 @@ class ArbitrageScanner:
             today = datetime.now().strftime("%Y-%m-%d")
             self._trades_today = (today, len(self.tracker.trades_started_on(today)))
             last = self.tracker.last_trade_started()
-            self._last_trade_time = last.timestamp() if last else 0.0
+            # on the monotonic clock, so an NTP step cannot shorten (or lengthen) the cooldown
+            self._last_trade_time = time.monotonic() - (time.time() - last.timestamp()) if last else None
         except Exception as e:  # fail closed: without the history we cannot honour the limits
             logger.error(f"LIVE state could not be read from the database: {e}", exc_info=True)
             self._live_paused = self._live_paused or f"live state unreadable ({e})"
@@ -1368,8 +1375,9 @@ class ArbitrageScanner:
             drop = self._live_start_value - self._wallet_value_erg(wallet, prices)
             if drop > config.LIVE_MAX_DRAWDOWN_ERG:
                 blockers.append(f"drawdown {drop:.2f} ERG > LIVE_MAX_DRAWDOWN_ERG {config.LIVE_MAX_DRAWDOWN_ERG:g}")
-        wait = config.LIVE_TRADE_COOLDOWN_SECONDS - (time.time() - self._last_trade_time)
-        if self._last_trade_time and wait > 0:
+        wait = (config.LIVE_TRADE_COOLDOWN_SECONDS - (time.monotonic() - self._last_trade_time)
+                if self._last_trade_time is not None else 0)
+        if wait > 0:
             blockers.append(f"cooldown {wait:.0f}s")
         if self._trades_today_count() >= config.LIVE_MAX_TRADES_PER_DAY:
             blockers.append(f"max {config.LIVE_MAX_TRADES_PER_DAY} trades per day reached")
@@ -1475,7 +1483,7 @@ class ArbitrageScanner:
         size = result.erg_in / 1e9
         profit = result.profit_nanoerg / 1e9
         # The guards first: cooldown, daily count and pause must hold even if the bookkeeping below fails
-        self._last_trade_time = time.time()
+        self._last_trade_time = time.monotonic()
         today = datetime.now().strftime("%Y-%m-%d")
         self._trades_today = (today, self._trades_today_count() + 1)
         pause = {"leg2_failed": f"leg 2 failed ({result.message})",

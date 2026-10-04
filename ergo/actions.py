@@ -269,7 +269,15 @@ async def redeem(ns, sigusd, mode: str, log: Log):
     await _finish(ns, tx, redeem_policy(info, cents, UI_FEE_TREE), mode, log)
 
 
-async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log):
+async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log, confirm=None):
+    """`confirm(address)` must say yes before --execute (the CLI asks for the address's last 4 characters)."""
+    if config.SEND_ALLOWED_ADDRESSES and address not in config.SEND_ALLOWED_ADDRESSES:
+        log("  ABORTED: this address is not in SEND_ALLOWED_ADDRESSES (.env).")
+        return
+    if sigusd and sigusd > config.SEND_MAX_SIGUSD:
+        log(f"  ABORTED: {sigusd:g} SigUSD is above SEND_MAX_SIGUSD ({config.SEND_MAX_SIGUSD:g}); raise it in .env "
+            f"if you mean it.")
+        return
     log(f"Step 1: checking the destination address {address}...")
     valid = await _get(ns, f"/utils/address/{address}")
     if not valid or not valid.get("isValid"):
@@ -284,6 +292,9 @@ async def send(ns, address: str, erg: float, sigusd: float, mode: str, log: Log)
     erg_nano = req["requests"][0]["value"]
     log(f"  SENDING to {address}: {erg_nano / 1e9:,.4f} ERG"
         f"{f' and {cents / 100:,.2f} SigUSD' if cents else ''} (+{MINER_FEE / 1e9} miner fee)")
+    if mode == "execute" and (confirm is None or not confirm(address)):
+        log("  ABORTED: the destination was not confirmed.")
+        return
     log("Step 2: asking your node to build the payment...")
     async with ns.post(f"{config.ERGO_NODE_URL}/wallet/transaction/generateUnsigned", json=req,
                        timeout=NODE_TIMEOUT) as r:

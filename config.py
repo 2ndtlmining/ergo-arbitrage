@@ -233,6 +233,31 @@ LEG2_WATCH_TIMEOUT_SECONDS = int(setting("LEG2_WATCH_TIMEOUT_SECONDS", "1200"))
 LEG2_WATCH_INTERVAL_SECONDS = int(setting("LEG2_WATCH_INTERVAL_SECONDS", "20"))
 LEG2_MAX_REBUILDS = int(setting("LEG2_MAX_REBUILDS", "5"))
 
+# arb.py send: optional allow-list of destination addresses (comma separated; empty = any) and a SigUSD cap
+SEND_ALLOWED_ADDRESSES = {a.strip() for a in setting("SEND_ALLOWED_ADDRESSES", "").split(",") if a.strip()}
+SEND_MAX_SIGUSD = float(setting("SEND_MAX_SIGUSD", "100"))
+
+
+def node_url_warning(url: str):
+    """A warning when the node API key would cross a network in plain HTTP (not loopback, not a LAN)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    if u.scheme != "http":
+        return None
+    host = (u.hostname or "").lower()
+    if host == "localhost":
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return (f"ERGO_NODE_URL is plain http:// to {host}: the API key (which can unlock the wallet) is sent "
+                f"unencrypted. Fine only if {host} is on your LAN")
+    if ip.is_loopback or ip.is_private or ip.is_link_local:
+        return None
+    return f"ERGO_NODE_URL is plain http:// to the public address {host}: the API key is sent unencrypted"
+
+
 # Tracker: non-profitable scan rows older than this are deleted at startup
 SCAN_RESULTS_RETENTION_DAYS = int(setting("SCAN_RESULTS_RETENTION_DAYS", "14"))
 

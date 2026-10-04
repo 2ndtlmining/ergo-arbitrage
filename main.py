@@ -129,6 +129,8 @@ def main(argv=None):
 
 def _start(args, view: str, mode: str):
     logger = setup_logging(args.log_level, console_handler=view == "plain")
+    if warning := config.node_url_warning(config.ERGO_NODE_URL):
+        logger.warning(warning)
     logger.info(f"Files: database {args.db}, log {config.repo_path('arbitrage.log')}, "
                 f"kill switch {config.repo_path(config.LIVE_STOP_FILE)}")
     if view == "plain":
