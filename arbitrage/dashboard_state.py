@@ -99,6 +99,8 @@ class DashboardState:
         self.exchanges: list[ExchangeRow] = []
         self.spread_text: Optional[str] = None      # best cross-exchange spread after fees
         self.discord_on = False
+        self.view_mode = "erg"                      # "erg": the ERG paths (default) | "usd": SigUSD routes
+        self.usd_routes = None                      # arbitrage.usd_routes.SigusdRoutes for the wallet's SigUSD
         # silent failures, turned into health alerts (notifications/health.py)
         self.wallet_locked: Optional[bool] = None   # node reachable but its wallet locked
         self.scan_error: Optional[str] = None       # the last poll failed with this
@@ -185,3 +187,9 @@ class DashboardState:
             "health": self.health,
             "history": {"episodes": self.recent_episodes, "trades": self.recent_trades},
         }
+
+    def on_key(self, key: str):
+        """Dashboard keys: u = SigUSD routes (USD view), e = ERG paths (default view)."""
+        mode = {"u": "usd", "e": "erg"}.get((key or "").lower())
+        if mode:
+            self.view_mode = mode

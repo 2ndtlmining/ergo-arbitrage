@@ -21,12 +21,13 @@ class Digest:
     outage_since: str = ""
     wallet: Optional[dict] = None
     mint: Optional[str] = None                      # bank mint gate status text
+    sigusd: Optional[str] = None                    # best exit for the wallet's SigUSD (usd_routes summary)
 
 
 def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: int = 24,
-                 bank: Optional[dict] = None) -> Digest:
+                 bank: Optional[dict] = None, sigusd: Optional[str] = None) -> Digest:
     since = now - timedelta(hours=hours)
-    d = Digest(hours=hours, wallet=wallet)
+    d = Digest(hours=hours, wallet=wallet, sigusd=sigusd)
     for row in tracker.chain_episodes_since(since.isoformat()):
         opened = datetime.fromisoformat(row["opened_at"])
         closed = datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else now

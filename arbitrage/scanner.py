@@ -29,6 +29,7 @@ from ergo.arb_runner import ArbResult, run_arb
 from ergo.chain_state import ChainSnapshot, prices_from_snapshot, read_snapshot
 from arbitrage.optimizer import maximize
 from arbitrage.sizing import Market, SizeChoice, best_size, profit_nanoerg
+from arbitrage.usd_routes import sigusd_routes
 from arbitrage.dashboard_state import PATH_LABELS, DashboardState, ExchangeRow
 from arbitrage.venues import VenueContext, describe_all
 from arbitrage.calculator import (
@@ -1158,8 +1159,10 @@ class ArbitrageScanner:
         if slot is None:
             return
         hours = digest_period_hours(slot, config.DISCORD_DIGEST_HOURS)
+        routes = self.state.usd_routes
+        sigusd_line = routes.summary() if routes is not None and not routes.example else None
         digest = build_digest(self.tracker, self.health, self._last_wallet, now, hours=hours,
-                              bank=self._bank_for_alerts())
+                              bank=self._bank_for_alerts(), sigusd=sigusd_line)
         self._digest_queued_at = time.time()
         self.discord.post(embeds.digest_embed(digest), on_id=lambda mid, slot=slot: self._digest_delivered(slot))
 
@@ -2009,6 +2012,10 @@ class ArbitrageScanner:
             s.wallet = dict(wallet, value_erg=value, value_usd=value * oracle if value and oracle else None)
         s.trades_today = self._trades_today_count()
         s.discord_on = self.discord_enabled
+        try:
+            s.usd_routes = self._sigusd_routes()
+        except Exception as e:  # an extra view: never break the refresh
+            logger.debug(f"SigUSD routes failed: {e}")
         nh = self.node_health or {}
         s.wallet_locked = (not nh.get("unlocked")) if nh.get("reachable") else None
         s.scan_error, s.db_error = self._poll_error, self._db_error
@@ -2071,6 +2078,17 @@ class ArbitrageScanner:
             self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
             self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
             self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
+
+    def _sigusd_routes(self):
+        """The exits for the wallet's SigUSD (an example amount when it holds none), from the last chain read
+        and exchange books; None until the pool and bank have been read."""
+        market = self._market(self._chain_prices or {})
+        if market is None:
+            return None
+        sigusd = (self._last_wallet or {}).get("sigusd") or 0
+        books = {name: q for name, q in ((self._last_prices or {}).get("cex") or {}).items()
+                 if getattr(q, "book", None) is not None} if (self.cex_watch or self.enable_cex) else {}
+        return sigusd_routes(sigusd, market, books, self.cex_fees)
 
     async def _wallet_and_health(self) -> tuple[dict, dict]:
         """The live gate's wallet balances and node health, read in parallel."""
