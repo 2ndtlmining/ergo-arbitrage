@@ -1,6 +1,5 @@
 """Unit tests for SigmaUSD bank rules and contract-exact quote math (issue #1)."""
 from exchanges.sigmausd import (
-    SigmaUSDBank,
     BankState,
     quote_redeem_sigusd,
     quote_mint_sigusd,
@@ -14,17 +13,6 @@ HIGH_RR = BankState(bank_erg_nano=2_000_000 * 10**9, sigusd_circ_cents=3_000_000
 
 
 class TestReserveRatioRules:
-    def test_redeem_allowed_when_rr_above_800(self):
-        b = SigmaUSDBank()
-        b._oracle_price = 1
-        b._bank_erg_reserve = 900
-        b._sigusd_circulating = 100
-        assert b.reserve_ratio == 900
-        assert b.can_redeem_sigusd() is True
-
-    def test_redeem_needs_known_state(self):
-        assert SigmaUSDBank().can_redeem_sigusd() is False
-
     def test_mint_checks_rr_after_the_mint(self):
         # RR = 405% before the mint: 405 ERG reserve per 100 USD circ, at 1 ERG = 1 USD
         rate_r4 = 10**9  # 1 ERG per USD

@@ -1,31 +1,9 @@
-import asyncio
-import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 
 
 @dataclass
-class PriceQuote:
-    exchange: str
-    pair: str
-    bid: float  # best buy price (what you get when selling)
-    ask: float  # best sell price (what you pay when buying)
-    bid_volume: float = 0.0  # volume available at bid
-    ask_volume: float = 0.0  # volume available at ask
-    timestamp: datetime = field(default_factory=datetime.now)
-
-    @property
-    def mid_price(self) -> float:
-        return (self.bid + self.ask) / 2
-
-    @property
-    def spread_percent(self) -> float:
-        if self.bid == 0:
-            return 0
-        return ((self.ask - self.bid) / self.bid) * 100
-
 
 @dataclass
 class OrderBookLevel:
@@ -125,62 +103,3 @@ class PoolState:
         output = self.swap_output(input_amount, input_is_x)
         effective_price = output / input_amount if input_amount > 0 else 0
         return abs(1 - (effective_price / spot_price)) * 100
-
-
-class RateLimiter:
-    """Simple async rate limiter using a sliding window."""
-
-    def __init__(self, max_calls: int, period_seconds: float):
-        self.max_calls = max_calls
-        self.period = period_seconds
-        self._timestamps: list[float] = []
-        self._lock = asyncio.Lock()   # one caller at a time, so waiters can't all pass at once after waking
-
-    async def acquire(self):
-        """Wait if necessary to stay within rate limits."""
-        async with self._lock:
-            while True:
-                now = time.monotonic()
-                self._timestamps = [t for t in self._timestamps if now - t < self.period]
-                if len(self._timestamps) < self.max_calls:
-                    break
-                await asyncio.sleep(self._timestamps[0] + self.period - now)
-            self._timestamps.append(time.monotonic())
-
-
-class ExchangeBase(ABC):
-    @abstractmethod
-    async def get_price(self, pair: str) -> Optional[PriceQuote]:
-        pass
-
-    @abstractmethod
-    async def connect(self):
-        pass
-
-    @abstractmethod
-    async def disconnect(self):
-        pass
-
-
-class CEXBase(ExchangeBase):
-    @abstractmethod
-    async def get_orderbook(self, pair: str, depth: int = 20) -> Optional[OrderBook]:
-        pass
-
-    @abstractmethod
-    async def get_balance(self, asset: str) -> float:
-        pass
-
-    @abstractmethod
-    async def get_withdraw_fee(self, asset: str) -> float:
-        pass
-
-    @abstractmethod
-    async def get_trading_fee(self, pair: str) -> float:
-        pass
-
-
-class DEXBase(ExchangeBase):
-    @abstractmethod
-    async def get_pool_state(self, pair: str) -> Optional[PoolState]:
-        pass

@@ -61,9 +61,9 @@ def test_report_flags_unknown_keys_with_a_suggestion():
 
 
 def test_report_flags_placeholders_and_deprecated_names():
-    env = {"KUCOIN_API_KEY": "your_kucoin_api_key_here", "LIVE_CONFIRM_SCANS": "3"}
+    env = {"ERGO_NODE_API_KEY": "your_ergo_node_api_key_here", "LIVE_CONFIRM_SCANS": "3"}
     text = "\n".join(config_check.report(file_values=env, environ=env))
-    assert re.search(r"KUCOIN_API_KEY.*placeholder", text)
+    assert re.search(r"ERGO_NODE_API_KEY.*placeholder", text)
     assert re.search(r"LIVE_CONFIRM_SCANS.*LIVE_CONFIRM_POLLS", text)
 
 

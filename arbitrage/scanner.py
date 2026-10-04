@@ -17,11 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 import config
-from exchanges.nonkyc import NonKYCExchange
-from exchanges.kucoin import KucoinExchange
-from exchanges.spectrum import SpectrumDEX
 from exchanges.sigmausd import (
-    SigmaUSDBank,
     BankState,
     affordable_mint_cents,
     can_mint_sigusd,
@@ -109,10 +105,6 @@ class ArbitrageScanner:
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
         # Watch-only CEX prices; redundant when CEX trading paths are enabled
         self.cex_watch = (config.CEX_WATCH if cex_watch is None else cex_watch) and not self.enable_cex
-        self.nonkyc = NonKYCExchange()
-        self.kucoin = KucoinExchange()
-        self.spectrum = SpectrumDEX()
-        self.sigmausd = SigmaUSDBank()
         self.ergo_node = ErgoNodeClient()
         self.calculator = ArbitrageCalculator()
         self.db_path = db_path
@@ -141,7 +133,6 @@ class ArbitrageScanner:
         self._last_wallet_analysis_time: float = 0.0
         self._last_summary_time: float = 0.0
         self._price_timestamps: dict[str, float] = {}
-        self._nonkyc_usdt_fee: float = 0.0
         self._stop = asyncio.Event()
         self.node_health: dict = {}
         self.last_optima: dict[str, ArbitrageOpportunity] = {}
@@ -153,7 +144,6 @@ class ArbitrageScanner:
         self._trades_today: tuple[str, int] = ("", 0)
         self._live_start_value: Optional[float] = None      # today's drawdown baseline (wallet value, ERG)
         self._live_baseline_day: str = ""
-        self._kucoin_usdt_fee: float = 1.0
         if self.mode == "live":
             self._restore_live_state()
 
@@ -166,10 +156,7 @@ class ArbitrageScanner:
         return self.mode == "live"
 
     async def connect_all(self):
-        venues = [self.ergo_node.connect()]  # pool/bank/oracle come from the node (ergo/chain_state.py)
-        if self.enable_cex or self.cex_watch:
-            venues += [self.nonkyc.connect(), self.kucoin.connect()]
-        await asyncio.gather(*venues)
+        await self.ergo_node.connect()  # pool/bank/oracle come from the node (ergo/chain_state.py)
         self._http = aiohttp.ClientSession()
         if self.enable_cex or self.cex_watch:
             self._start_cex_feed()
@@ -186,31 +173,13 @@ class ArbitrageScanner:
 
         if not self.enable_cex:
             logger.info("CEX venues disabled (on-chain only). Set ENABLE_CEX=true to enable.")
-            return
-
-        nonkyc_fee, kucoin_fee, nonkyc_usdt_fee, kucoin_usdt_fee = await asyncio.gather(
-            self.nonkyc.get_withdraw_fee("ERG"),
-            self.kucoin.get_withdraw_fee("ERG"),
-            self.nonkyc.get_withdraw_fee("USDT"),
-            self.kucoin.get_withdraw_fee("USDT"),
-        )
-        self._nonkyc_usdt_fee = nonkyc_usdt_fee
-        self._kucoin_usdt_fee = kucoin_usdt_fee
-        logger.info(f"NonKYC ERG withdrawal fee: {nonkyc_fee} ERG")
-        logger.info(f"Kucoin ERG withdrawal fee: {kucoin_fee} ERG")
-        logger.info(f"NonKYC USDT withdrawal fee: {nonkyc_usdt_fee} USDT")
-        logger.info(f"Kucoin USDT withdrawal fee: {kucoin_usdt_fee} USDT")
 
     async def disconnect_all(self):
         await self._stop_cex_feed()
         if self._http:
             await self._http.close()
             self._http = None
-        venues = []
-        if self.enable_cex or self.cex_watch:
-            venues += [self.nonkyc.disconnect(), self.kucoin.disconnect()]
         await asyncio.gather(
-            *venues,
             self.ergo_node.disconnect(),
             self.discord.disconnect(),
         )
@@ -1667,8 +1636,7 @@ class ArbitrageScanner:
         fee_factor = (1 - config.SIGMAUSD_PROTOCOL_FEE) * (1 - config.SIGMAUSD_FRONTEND_FEE)
         bank_fee_pct = (1 - fee_factor) * 100  # ~2.225%
 
-        nonkyc_usdt_fee = self._nonkyc_usdt_fee
-        kucoin_usdt_fee = self._kucoin_usdt_fee
+        nonkyc_usdt_fee = kucoin_usdt_fee = config.CEX_USDT_TRANSFER_FEE   # moving USDT off an exchange
 
         erg_options = self._erg_wallet_options(erg, prices)
         sigusd_options = self._sigusd_wallet_options(sigusd, prices) if oracle_price and oracle_price > 0 else []

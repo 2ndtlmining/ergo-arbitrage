@@ -9,7 +9,6 @@ import arbitrage.scanner as scanner_module
 from arbitrage.scanner import ArbitrageScanner
 from arbitrage.venues import VenueContext, describe_all
 from exchanges import cex_public as cp
-from exchanges.base import RateLimiter
 from tests.test_cex_public import FakeResp, FakeSession, GATE_BOOK
 from tests.test_cex_sources import QUOTES
 from tests.test_chain_scanner import HEALTHY, Reader, snap
@@ -93,20 +92,3 @@ def test_the_venue_row_shows_the_response_time():
                        read_ms=None, enable_cex=False, enable_use=False, cex_watch=True)
     (gate,) = [r for r in describe_all(ctx) if r.name == "Gate"]
     assert gate.latency_ms == 123.0
-
-
-def test_rate_limiter_never_lets_a_burst_through():
-    """#8: concurrent callers that slept all passed at once after waking."""
-    limiter = RateLimiter(max_calls=2, period_seconds=0.2)
-    stamps = []
-
-    async def call():
-        await limiter.acquire()
-        stamps.append(time.monotonic())
-
-    async def go():
-        await asyncio.gather(*(call() for _ in range(6)))
-
-    run(go())
-    stamps.sort()
-    assert all(stamps[i + 2] - stamps[i] >= 0.18 for i in range(len(stamps) - 2)), stamps

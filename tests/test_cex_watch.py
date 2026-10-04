@@ -3,11 +3,18 @@ import asyncio
 
 import pytest
 
+from datetime import datetime
+from types import SimpleNamespace
+
 import config
 from arbitrage.scanner import ArbitrageScanner
-from exchanges.base import PriceQuote
 from logging_config import console
 from notifications.discord import DiscordNotifier
+
+
+def PriceQuote(exchange, pair, bid, ask, timestamp=None):
+    """Stand-in for a CEX quote (the scanner only reads bid, ask and timestamp)."""
+    return SimpleNamespace(exchange=exchange, pair=pair, bid=bid, ask=ask, timestamp=timestamp or datetime.now())
 
 
 @pytest.fixture
