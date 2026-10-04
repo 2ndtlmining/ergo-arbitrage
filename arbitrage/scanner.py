@@ -2175,17 +2175,17 @@ class ArbitrageScanner:
         for warning in config.deprecated_settings():
             logger.warning(warning)
         restore = self._install_signal_handlers()
-        await self.connect_all()
-        self._log_startup()
+        try:  # from here on the connections are closed however the run ends (also a failed startup)
+            await self.connect_all()
+            self._log_startup()
 
-        self._maybe_prune(datetime.now())
+            self._maybe_prune(datetime.now())
 
-        if self.discord_enabled:
-            await self.discord.send_startup_message(mode=self.mode)
-            if not once:  # a one-off run must leave a running bot's open messages alone
-                self._close_stale_discord_messages()
+            if self.discord_enabled:
+                await self.discord.send_startup_message(mode=self.mode)
+                if not once:  # a one-off run must leave a running bot's open messages alone
+                    self._close_stale_discord_messages()
 
-        try:
             loop = asyncio.get_running_loop()
             next_tick = loop.time()
             while not self._stop.is_set():

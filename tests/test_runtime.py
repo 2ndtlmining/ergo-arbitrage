@@ -84,3 +84,26 @@ class TestNodeHealth:
         h = asyncio.run(c.get_health())
         assert not h["reachable"] and not h["ok_to_trade"]
         assert asyncio.run(c.check_connection()) is False
+
+
+def test_a_failure_during_startup_still_closes_the_connections(tmp_path, monkeypatch):
+    """The sessions opened by connect_all are closed even when startup fails or is interrupted."""
+    s = ArbitrageScanner(db_path=str(tmp_path / "t.db"))
+    calls = []
+
+    async def connect_all():
+        calls.append("connect")
+
+    def broken_startup():
+        raise RuntimeError("startup broke")
+
+    async def disconnect_all():
+        calls.append("disconnect")
+        s.tracker.close()
+
+    monkeypatch.setattr(s, "connect_all", connect_all)
+    monkeypatch.setattr(s, "_log_startup", broken_startup)
+    monkeypatch.setattr(s, "disconnect_all", disconnect_all)
+    with pytest.raises(RuntimeError):
+        asyncio.run(asyncio.wait_for(s.run(), timeout=5))
+    assert calls == ["connect", "disconnect"]
