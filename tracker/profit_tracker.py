@@ -29,8 +29,8 @@ class ProfitTracker:
         self._migrate()
         self._session_start = datetime.now()
         # Episodes: one row per continuous run of a profitable path
-        self._open_episodes: dict[str, int] = {}  # path_key -> episode id
-        self._session_episode_best: dict[int, float] = {}  # episode id -> best profit
+        self._open_episodes: dict[str, int] = {}     # path_key -> index into _session_episode_best
+        self._session_episode_best: list[float] = []  # best profit of each run of a profitable path
         self._close_stale_episodes()
 
     def _create_tables(self):
@@ -190,12 +190,9 @@ class ProfitTracker:
         self._commit()
 
     def record_scan(self, opportunities: list, scan_number: int, snapshot_id: int = None):
-        """Open, extend or close opportunity episodes for this scan.
-
-        A path that stays profitable for many scans is one episode; its potential
-        profit is counted once, at the best size seen during the episode.
-        """
-        now = datetime.now().isoformat()
+        """One `opportunities` row (full fee breakdown) when a path turns profitable. The session counts
+        each run of a profitable path once, at its best size. The on-chain episodes Discord reports are
+        kept in chain_episodes; opportunity_episodes is no longer written (old rows stay)."""
         best: dict = {}
         for opp in opportunities:
             if not opp.is_profitable or opp.blocked:
@@ -203,40 +200,16 @@ class ProfitTracker:
             key = opp.path_key
             if key not in best or opp.profit_erg > best[key].profit_erg:
                 best[key] = opp
-
         for key, opp in best.items():
-            episode_id = self._open_episodes.get(key)
-            if episode_id is None:
-                opp_id = self.log_opportunity(opp, scan_number=scan_number, snapshot_id=snapshot_id)
-                cursor = self.conn.execute(
-                    """INSERT INTO opportunity_episodes
-                       (path, first_seen, last_seen, scans, first_scan_number,
-                        best_profit_erg, best_profit_percent, best_size_erg, opportunity_id)
-                       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)""",
-                    (key, now, now, scan_number, opp.profit_erg, opp.profit_percent, opp.input_erg, opp_id),
-                )
-                self._open_episodes[key] = cursor.lastrowid
-                self._session_episode_best[cursor.lastrowid] = opp.profit_erg
-                continue
-            self.conn.execute(
-                "UPDATE opportunity_episodes SET last_seen = ?, scans = scans + 1 WHERE id = ?",
-                (now, episode_id),
-            )
-            if opp.profit_erg > self._session_episode_best[episode_id]:
-                self.conn.execute(
-                    """UPDATE opportunity_episodes
-                       SET best_profit_erg = ?, best_profit_percent = ?, best_size_erg = ?
-                       WHERE id = ?""",
-                    (opp.profit_erg, opp.profit_percent, opp.input_erg, episode_id),
-                )
-                self._session_episode_best[episode_id] = opp.profit_erg
-
+            index = self._open_episodes.get(key)
+            if index is None:
+                self.log_opportunity(opp, scan_number=scan_number, snapshot_id=snapshot_id)
+                self._open_episodes[key] = len(self._session_episode_best)
+                self._session_episode_best.append(opp.profit_erg)
+            elif opp.profit_erg > self._session_episode_best[index]:
+                self._session_episode_best[index] = opp.profit_erg
         for key in [k for k in self._open_episodes if k not in best]:
-            episode_id = self._open_episodes.pop(key)
-            self.conn.execute(
-                "UPDATE opportunity_episodes SET closed_at = ? WHERE id = ?", (now, episode_id)
-            )
-            logger.info(f"Episode #{episode_id} closed: {key}")
+            del self._open_episodes[key]
         self._commit()
 
     def _commit(self):
@@ -508,7 +481,7 @@ class ProfitTracker:
     def get_session_stats(self) -> dict:
         return {
             "opportunities_seen": len(self._session_episode_best),
-            "total_potential_profit_erg": sum(self._session_episode_best.values()),
+            "total_potential_profit_erg": sum(self._session_episode_best),
             "session_duration": str(datetime.now() - self._session_start).split(".")[0],
         }
 

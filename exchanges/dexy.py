@@ -1,4 +1,5 @@
 """Dexy USE: bank mint math (FreeMint/ArbMint) and the USE/ERG LP read on-chain."""
+import asyncio
 import logging
 from typing import Optional
 
@@ -77,3 +78,19 @@ async def fetch_use_lp(session: aiohttp.ClientSession) -> Optional[PoolState]:
     except Exception as e:
         logger.error(f"USE LP box fetch error: {e}")
         return None
+
+
+async def fetch_use_mint_status(session) -> Optional[dict]:
+    """Crux's USE free_mint / arb_mint status ({mint_type: status}), or None when neither answers."""
+    async def one(mint_type: str):
+        try:
+            async with session.get(f"{config.CRUX_API_URL}/dexy/mint_status/use?mint_type={mint_type}",
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return mint_type, await r.json()
+        except Exception as e:
+            logger.error(f"Crux {mint_type} status error: {e}")
+        return mint_type, None
+
+    pairs = await asyncio.gather(one("free_mint"), one("arb_mint"))
+    return {k: v for k, v in pairs if v is not None} or None

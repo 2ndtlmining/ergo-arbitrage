@@ -35,11 +35,8 @@ class TestEpisodes:
     def test_long_opportunity_is_one_episode(self, tracker):
         for _ in range(40):
             tracker.record_scan([opp("A", 25, 1.0), opp("A", 50, 1.5)], scan_number=1)
-        rows = tracker.conn.execute("SELECT * FROM opportunity_episodes").fetchall()
-        assert len(rows) == 1
-        assert rows[0]["scans"] == 40
-        assert rows[0]["best_profit_erg"] == pytest.approx(1.5)
-        assert rows[0]["best_size_erg"] == 50
+        rows = tracker.conn.execute("SELECT * FROM opportunities").fetchall()
+        assert len(rows) == 1                                   # one row when the path opened
         stats = tracker.get_session_stats()
         assert stats["opportunities_seen"] == 1
         assert stats["total_potential_profit_erg"] == pytest.approx(1.5)
@@ -48,10 +45,7 @@ class TestEpisodes:
         tracker.record_scan([opp("A", 10, 0.5)], 1)
         tracker.record_scan([], 2)
         tracker.record_scan([opp("A", 10, 0.7)], 3)
-        rows = tracker.conn.execute("SELECT closed_at FROM opportunity_episodes ORDER BY id").fetchall()
-        assert len(rows) == 2
-        assert rows[0]["closed_at"] is not None
-        assert rows[1]["closed_at"] is None
+        assert tracker.conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0] == 2
         assert tracker.get_session_stats()["total_potential_profit_erg"] == pytest.approx(1.2)
 
     def test_unprofitable_and_blocked_are_ignored(self, tracker):
@@ -60,7 +54,7 @@ class TestEpisodes:
         p = opp("B", 10, -0.5)
         p.is_profitable = False
         tracker.record_scan([o, p], 1)
-        assert tracker.conn.execute("SELECT COUNT(*) FROM opportunity_episodes").fetchone()[0] == 0
+        assert tracker.conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0] == 0
 
 
 class TestDailySummary:

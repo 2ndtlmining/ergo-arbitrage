@@ -24,11 +24,11 @@ from exchanges.sigmausd import (
     quote_redeem_sigusd,
 )
 from exchanges.ergo_node import ErgoNodeClient
-from exchanges.dexy import fetch_use_lp, mint_available, mint_box_state, quote_dexy_mint
+from exchanges.dexy import fetch_use_lp, fetch_use_mint_status, mint_available, mint_box_state, quote_dexy_mint
 from ergo.arb_runner import ArbResult, run_arb
 from ergo.chain_state import ChainSnapshot, prices_from_snapshot, read_snapshot
 from arbitrage.optimizer import maximize
-from arbitrage.sizing import Market, SizeChoice, best_size
+from arbitrage.sizing import Market, SizeChoice, best_size, profit_nanoerg
 from arbitrage.dashboard_state import PATH_LABELS, DashboardState, ExchangeRow
 from arbitrage.venues import VenueContext, describe_all
 from arbitrage.calculator import (
@@ -187,24 +187,7 @@ class ArbitrageScanner:
         self.tracker.close()
 
     async def _fetch_use_mint_status(self) -> Optional[dict]:
-        """Check if USE free_mint or arb_mint is available."""
-        if not self._http:
-            return None
-        async def one(mint_type: str):
-            try:
-                async with self._http.get(
-                    f"{config.CRUX_API_URL}/dexy/mint_status/use?mint_type={mint_type}",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status == 200:
-                        return mint_type, await r.json()
-            except Exception as e:
-                logger.error(f"Crux {mint_type} status error: {e}")
-            return mint_type, None
-
-        pairs = await asyncio.gather(one("free_mint"), one("arb_mint"))
-        results = {k: v for k, v in pairs if v is not None}
-        return results if results else None
+        return await fetch_use_mint_status(self._http) if self._http else None
 
     async def _fetch_use_lp(self):
         return await fetch_use_lp(self._http) if self._http else None
@@ -490,6 +473,28 @@ class ArbitrageScanner:
     def _amm_buffer(self, prices: dict, trade_size: float) -> float:
         return config.EXECUTION_BUFFER if prices.get("spectrum_pool") else config.get_recommended_slippage(trade_size)
 
+    @staticmethod
+    def _market(prices: dict) -> Optional[Market]:
+        pool = prices.get("spectrum_pool")
+        bank_state = (prices.get("bank") or {}).get("state")
+        return Market.from_pool_state(pool, bank_state) if pool is not None and bank_state else None
+
+    def _exact(self, opp: ArbitrageOpportunity, path: str, prices: dict, trade_size: float) -> ArbitrageOpportunity:
+        """With the pool's real reserves a grid cell carries the contract-exact numbers of arbitrage/sizing.py,
+        the same ones the live gate, the dashboard, Discord and the transactions use (no second model)."""
+        market = self._market(prices)
+        result = profit_nanoerg(path, market, int(round(trade_size * 1e9))) if market else None
+        if result is None:
+            return opp
+        profit, spent = result
+        opp.input_erg = spent / 1e9
+        opp.profit_erg = profit / 1e9
+        opp.output_erg = opp.input_erg + opp.profit_erg
+        opp.profit_percent = profit / spent * 100
+        opp.fees.slippage_cost = 0.0           # exact: the size search keeps its own margin (EXECUTION_BUFFER)
+        opp.is_profitable = opp.profit_percent >= config.MIN_PROFIT_PERCENT
+        return opp
+
     def _path_bank_mint(self, prices: dict, trade_size: float) -> Optional[ArbitrageOpportunity]:
         """Path 1: ERG -> SigUSD (bank mint) -> ERG (pool sell). Always computed, marked blocked."""
         bank = prices.get("bank", {})
@@ -513,6 +518,7 @@ class ArbitrageScanner:
             dex_execution_fee=config.pool_service_fee(),
             slippage=self._amm_buffer(prices, trade_size),
         )
+        opp = self._exact(opp, "mint", prices, trade_size)
         opp.path = f"Bank mint->Spectrum sell [{trade_size:g} ERG]"
         fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
         opp.steps = [
@@ -550,6 +556,7 @@ class ArbitrageScanner:
             dex_execution_fee=config.pool_service_fee(),
             slippage=self._amm_buffer(prices, trade_size),
         )
+        opp = self._exact(opp, "redeem", prices, trade_size)
         opp.path = f"Spectrum buy->Bank redeem [{trade_size:g} ERG]"
         fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
         opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
@@ -571,9 +578,7 @@ class ArbitrageScanner:
         gates --live. Without them only an estimate is shown and nothing is tradable.
         """
         lo, hi = config.MIN_TRADE_SIZE_ERG, max(config.MAX_TRADE_SIZE_ERG, config.MIN_TRADE_SIZE_ERG)
-        pool = prices.get("spectrum_pool")
-        bank_state = (prices.get("bank") or {}).get("state")
-        market = Market.from_pool_state(pool, bank_state) if pool is not None and bank_state else None
+        market = self._market(prices)
         self.last_sizing = {}
         optima = {}
         for path_fn, path in ((self._path_bank_mint, "mint"), (self._path_pool_buy_redeem, "redeem")):
@@ -1677,7 +1682,7 @@ class ArbitrageScanner:
                             "name": "Crux -> Kucoin",
                             "steps": [
                                 crux_step,
-                                f"Deposit {erg_from_crux:.2f} ERG to Kucoin (free)",
+                                f"Deposit {erg_from_crux:.2f} ERG to Kucoin",
                                 f"Sell on Kucoin: {erg_from_crux:.2f} ERG -> ${usdt_out:.2f} USDT (${kucoin_price:.4f}/ERG, -{config.KUCOIN_TRADING_FEE*100:.1f}% fee)",
                             ],
                             "profit_pct": pct_usdt,
@@ -1694,7 +1699,7 @@ class ArbitrageScanner:
                             "name": "Crux -> NonKYC",
                             "steps": [
                                 crux_step,
-                                f"Deposit {erg_from_crux:.2f} ERG to NonKYC (free)",
+                                f"Deposit {erg_from_crux:.2f} ERG to NonKYC",
                                 f"Sell on NonKYC: {erg_from_crux:.2f} ERG -> ${usdt_out:.2f} USDT (${nonkyc_price:.4f}/ERG, -{config.NONKYC_TRADING_FEE*100:.1f}% fee)",
                             ],
                             "profit_pct": pct_usdt,
@@ -1715,7 +1720,7 @@ class ArbitrageScanner:
                             "name": "Crux -> Spectrum -> Bank redeem",
                             "steps": [
                                 crux_step,
-                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-0.5% pool fee, {config.pool_fee_text()})",
+                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
                                 f"Redeem at Bank: {sigusd_from_spectrum:.2f} SigUSD -> {erg_hop2:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
                                 f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
                             ],
@@ -1739,7 +1744,7 @@ class ArbitrageScanner:
                             "steps": [
                                 crux_step,
                                 f"Mint SigUSD at Bank: {erg_from_crux:.2f} ERG -> {sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
-                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-0.5% pool fee, {config.pool_fee_text()})",
+                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
                                 f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
                             ],
                             "profit_pct": pct_arb,
@@ -1757,7 +1762,7 @@ class ArbitrageScanner:
                         "name": "Crux LP swap",
                         "steps": [f"Not worth it: {config.SPECTRUM_EXECUTION_FEE} ERG service fee > {erg_before_fees:.2f} ERG value"],
                         "profit_pct": -100,
-                        "profit_desc": f"Balance too small (0.785 ERG fee > {erg_before_fees:.2f} ERG value)",
+                        "profit_desc": f"Balance too small ({config.SPECTRUM_EXECUTION_FEE} ERG fee > {erg_before_fees:.2f} ERG value)",
                         "result": "",
                         "blocked": False, "blocked_reason": "too small",
                     })
