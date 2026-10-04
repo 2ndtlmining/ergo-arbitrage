@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from rich.table import Table
@@ -17,6 +18,11 @@ class ProfitTracker:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, timeout=10)  # another process (backup, arb.py) may hold a write briefly
         self.conn.row_factory = sqlite3.Row
+        self._batch_depth = 0
+        # new databases give freed pages back to the file system (incremental_vacuum after a prune);
+        # must be set before the first table exists, existing databases keep reusing freed pages
+        if not self.conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone():
+            self.conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
         # WAL lets a dashboard read while the scanner writes
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
@@ -138,7 +144,7 @@ class ProfitTracker:
                 FOREIGN KEY (opportunity_id) REFERENCES opportunities(id)
             );
         """)
-        self.conn.commit()
+        self._commit()
 
     def _migrate(self):
         """Schema versioning via PRAGMA user_version; each step is idempotent."""
@@ -174,14 +180,14 @@ class ProfitTracker:
                 self.conn.execute("ALTER TABLE chain_episodes ADD COLUMN last_seen_at TEXT")
         if version < SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self.conn.commit()
+            self._commit()
 
     def _close_stale_episodes(self):
         """Close episodes left open by a previous process (crash or kill)."""
         self.conn.execute(
             "UPDATE opportunity_episodes SET closed_at = last_seen WHERE closed_at IS NULL"
         )
-        self.conn.commit()
+        self._commit()
 
     def record_scan(self, opportunities: list, scan_number: int, snapshot_id: int = None):
         """Open, extend or close opportunity episodes for this scan.
@@ -231,16 +237,46 @@ class ProfitTracker:
                 "UPDATE opportunity_episodes SET closed_at = ? WHERE id = ?", (now, episode_id)
             )
             logger.info(f"Episode #{episode_id} closed: {key}")
-        self.conn.commit()
+        self._commit()
 
-    def prune_scan_results(self, days: int) -> int:
-        """Delete non-profitable scan_results older than `days`. Returns rows deleted."""
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        cursor = self.conn.execute(
+    def _commit(self):
+        if self._batch_depth == 0:
+            self.conn.commit()
+
+    @contextmanager
+    def batch(self):
+        """One commit for several writes (a scan's snapshot, results and episodes); rolled back on error."""
+        self._batch_depth += 1
+        try:
+            yield
+        except BaseException:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self.conn.rollback()
+            raise
+        self._batch_depth -= 1
+        if self._batch_depth == 0:
+            self.conn.commit()
+
+    def prune(self, days: int, now: datetime = None) -> tuple[int, int]:
+        """Delete non-profitable scan rows older than `days` and the old price snapshots nothing points to,
+        then checkpoint the WAL and return freed pages. Returns (scan rows, snapshots) deleted."""
+        cutoff = ((now or datetime.now()) - timedelta(days=days)).isoformat()
+        rows = self.conn.execute(
             "DELETE FROM scan_results WHERE is_profitable = 0 AND timestamp < ?", (cutoff,)
-        )
+        ).rowcount
+        snaps = self.conn.execute(
+            """DELETE FROM price_snapshots WHERE timestamp < ?
+               AND id NOT IN (SELECT snapshot_id FROM scan_results WHERE snapshot_id IS NOT NULL)
+               AND id NOT IN (SELECT snapshot_id FROM opportunities WHERE snapshot_id IS NOT NULL)""", (cutoff,)
+        ).rowcount
         self.conn.commit()
-        return cursor.rowcount
+        try:
+            self.conn.execute("PRAGMA incremental_vacuum")
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as e:  # another process reading: the next prune checkpoints instead
+            logger.debug(f"checkpoint skipped: {e}")
+        return rows, snaps
 
     def log_price_snapshot(self, prices: dict) -> int:
         """Log a price snapshot from all sources."""
@@ -269,7 +305,7 @@ class ProfitTracker:
                 1 if bank.get("can_redeem_sigusd") else 0,
             ),
         )
-        self.conn.commit()
+        self._commit()
         return cursor.lastrowid
 
     def log_scan_results(self, opportunities: list, scan_number: int, snapshot_id: int = None):
@@ -293,7 +329,7 @@ class ProfitTracker:
                     opp.fees.total_fee_erg, opp.fees.total_fee_usd,
                 ),
             )
-        self.conn.commit()
+        self._commit()
         logger.debug(f"Logged {len(opportunities)} scan results for scan #{scan_number}")
 
     def log_opportunity(self, opp, scan_number: int = 0, snapshot_id: int = None) -> int:
@@ -328,7 +364,7 @@ class ProfitTracker:
                 snapshot_id,
             ),
         )
-        self.conn.commit()
+        self._commit()
         opp_id = cursor.lastrowid
         logger.info(
             f"Opportunity #{opp_id} logged: {opp.path} | "
@@ -352,7 +388,7 @@ class ProfitTracker:
             "UPDATE opportunities SET executed = 1 WHERE id = ?",
             (opportunity_id,),
         )
-        self.conn.commit()
+        self._commit()
         trade_id = cursor.lastrowid
         logger.info(f"Trade #{trade_id} started for opportunity #{opportunity_id}")
         return trade_id
@@ -363,7 +399,7 @@ class ProfitTracker:
             "UPDATE trades SET input_erg = ?, expected_output_erg = ?, expected_profit_erg = ? WHERE id = ?",
             (input_erg, expected_output, expected_profit, trade_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def complete_trade(self, trade_id: int, actual_output: float,
                        fee_paid_erg: float = 0, fee_paid_usd: float = 0,
@@ -392,7 +428,7 @@ class ProfitTracker:
              fee_paid_erg, fee_paid_usd,
              json.dumps(tx_ids or []), notes, trade_id),
         )
-        self.conn.commit()
+        self._commit()
 
         if actual_profit is not None:
             status = "PROFIT" if actual_profit > 0 else "LOSS"
@@ -420,7 +456,7 @@ class ProfitTracker:
                WHERE id = ?""",
             (now, duration, error, notes, trade_id),
         )
-        self.conn.commit()
+        self._commit()
         logger.error(f"Trade #{trade_id} failed after {duration:.1f}s: {error}")
 
     def update_daily_summary(self, opportunities: int):
@@ -467,7 +503,7 @@ class ProfitTracker:
             trade_stats["profit"], trade_stats["fees"],
             trade_stats["best"], trade_stats["worst"],
         ))
-        self.conn.commit()
+        self._commit()
 
     def get_session_stats(self) -> dict:
         return {
@@ -501,14 +537,6 @@ class ProfitTracker:
             "avg_trade_duration_s": trade_row[3] or 0.0,
         }
 
-    def get_recent_opportunities(self, limit: int = 10) -> list[dict]:
-        """Get most recent opportunities for review."""
-        rows = self.conn.execute("""
-            SELECT * FROM opportunities
-            ORDER BY id DESC LIMIT ?
-        """, (limit,)).fetchall()
-        return [dict(r) for r in rows]
-
     def get_fee_analysis(self) -> dict:
         """Analyze fee impact across all opportunities."""
         row = self.conn.execute("""
@@ -526,78 +554,6 @@ class ProfitTracker:
         if row and row[0] is not None:
             return dict(row)
         return {}
-
-    def get_opportunity_frequency(self, hours: int = 24) -> dict:
-        """Get stats on opportunity frequency over the last N hours."""
-        row = self.conn.execute("""
-            SELECT
-                COUNT(*) as total,
-                AVG(profit_percent) as avg_profit_pct,
-                MAX(profit_percent) as best_profit_pct,
-                MAX(profit_erg) as best_profit_erg,
-                AVG(profit_erg) as avg_profit_erg
-            FROM opportunities
-            WHERE timestamp >= datetime('now', ?)
-        """, (f"-{hours} hours",)).fetchone()
-
-        # Most common profitable path
-        path_row = self.conn.execute("""
-            SELECT path, COUNT(*) as cnt
-            FROM opportunities
-            WHERE timestamp >= datetime('now', ?)
-            GROUP BY path
-            ORDER BY cnt DESC
-            LIMIT 1
-        """, (f"-{hours} hours",)).fetchone()
-
-        # Best single opportunity
-        best_row = self.conn.execute("""
-            SELECT path, profit_erg, profit_percent, input_erg
-            FROM opportunities
-            WHERE timestamp >= datetime('now', ?)
-            ORDER BY profit_percent DESC
-            LIMIT 1
-        """, (f"-{hours} hours",)).fetchone()
-
-        result = {
-            "hours": hours,
-            "total_opportunities": row[0] if row else 0,
-            "avg_profit_percent": row[1] if row and row[1] else 0.0,
-            "best_profit_percent": row[2] if row and row[2] else 0.0,
-            "best_profit_erg": row[3] if row and row[3] else 0.0,
-            "avg_profit_erg": row[4] if row and row[4] else 0.0,
-            "most_common_path": path_row[0] if path_row else "N/A",
-            "most_common_path_count": path_row[1] if path_row else 0,
-        }
-
-        if best_row:
-            result["best_opportunity"] = {
-                "path": best_row[0],
-                "profit_erg": best_row[1],
-                "profit_percent": best_row[2],
-                "input_erg": best_row[3],
-            }
-        else:
-            result["best_opportunity"] = None
-
-        return result
-
-    def get_opportunity_history(
-        self, path_filter: str = None, limit: int = 50
-    ) -> list[dict]:
-        """Get historical opportunities, optionally filtered by path."""
-        if path_filter:
-            rows = self.conn.execute("""
-                SELECT * FROM opportunities
-                WHERE path LIKE ?
-                ORDER BY id DESC LIMIT ?
-            """, (f"%{path_filter}%", limit)).fetchall()
-        else:
-            rows = self.conn.execute("""
-                SELECT * FROM opportunities
-                ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-        return [dict(r) for r in rows]
 
     def print_summary(self):
         """Print comprehensive session summary."""
@@ -653,7 +609,7 @@ class ProfitTracker:
             """INSERT INTO chain_episodes (path, opened_at, peak_profit_erg, peak_profit_percent, peak_size_erg,
                last_profit_percent) VALUES (?, ?, ?, ?, ?, ?)""",
             (ep.label, datetime.now().isoformat(), ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent))
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def update_chain_episode(self, episode_id: int, ep):
@@ -662,11 +618,11 @@ class ProfitTracker:
                last_profit_percent = ?, last_seen_at = ? WHERE id = ?""",
             (ep.peak_erg, ep.peak_percent, ep.peak_size_erg, ep.profit_percent, datetime.now().isoformat(),
              episode_id))
-        self.conn.commit()
+        self._commit()
 
     def set_chain_episode_message(self, episode_id: int, message_id: str):
         self.conn.execute("UPDATE chain_episodes SET message_id = ? WHERE id = ?", (message_id, episode_id))
-        self.conn.commit()
+        self._commit()
 
     def claim_stale_chain_episodes(self) -> list[dict]:
         """Close the episodes a stopped process left open and return them (for their Discord message).
@@ -677,7 +633,7 @@ class ProfitTracker:
         rows = [dict(r) for r in self.conn.execute("SELECT * FROM chain_episodes WHERE closed_at IS NULL")]
         self.conn.execute("UPDATE chain_episodes SET closed_at = COALESCE(last_seen_at, opened_at) "
                           "WHERE closed_at IS NULL")
-        self.conn.commit()
+        self._commit()
         for row in rows:
             row["closed_at"] = row.get("last_seen_at") or row["opened_at"]
         return rows
@@ -686,13 +642,13 @@ class ProfitTracker:
         """Heartbeat for an open episode, so a crash still records roughly how long it lasted."""
         self.conn.execute("UPDATE chain_episodes SET last_seen_at = ? WHERE id = ?",
                           (datetime.now().isoformat(), episode_id))
-        self.conn.commit()
+        self._commit()
 
     def close_chain_episode(self, episode_id: int, ep):
         self.update_chain_episode(episode_id, ep)
         self.conn.execute("UPDATE chain_episodes SET closed_at = ?, trade = ? WHERE id = ?",
                           (datetime.now().isoformat(), ep.trade, episode_id))
-        self.conn.commit()
+        self._commit()
 
     def chain_episodes_since(self, since_iso: str) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM chain_episodes WHERE opened_at >= ? ORDER BY opened_at",
@@ -719,7 +675,7 @@ class ProfitTracker:
     def set_meta(self, key: str, value: str):
         self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
                           "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
-        self.conn.commit()
+        self._commit()
 
     # --- live-mode state that must survive a restart (#59) ---
 
@@ -741,7 +697,7 @@ class ProfitTracker:
 
     def delete_meta(self, key: str):
         self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
-        self.conn.commit()
+        self._commit()
 
     def close(self):
         self.conn.close()

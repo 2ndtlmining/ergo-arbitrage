@@ -103,6 +103,7 @@ class ArbitrageScanner:
         self._logged_error: tuple = ("", -1e18)         # (error key, time) of the last logged poll error
         self._logged_since = 0.0
         self._db_error: Optional[str] = None            # tracker writes failing
+        self._pruned_day = ""
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
@@ -1894,15 +1895,12 @@ class ArbitrageScanner:
         if outage:  # prices below are the last good state: show them, but do not log or alert on them
             self.out.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
                           f"state; nothing is logged, alerted or traded until the node can be read[/bold yellow]")
-        else:
-            self._last_snapshot_id = self._db_write(self.tracker.log_price_snapshot, prices)
         self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
         self._update_live_streak()
         if not outage:
-            self._db_write(self.tracker.log_scan_results, opportunities, self.scan_count, self._last_snapshot_id)
-            self._db_write(self.tracker.record_scan, opportunities, self.scan_count, self._last_snapshot_id)
+            self._db_write(self._log_scan, prices, opportunities)
         self._display_opportunities(opportunities, prices)
         if self.cex_watch:
             self._display_cex_watch(prices)
@@ -1932,6 +1930,7 @@ class ArbitrageScanner:
                 await self.discord.send_scan_summary(opportunities, scan_number=self.scan_count)
                 self._last_summary_time = now
                 logger.info("Periodic summary sent to Discord")
+        self._maybe_prune(datetime.now())
         try:
             self._maybe_send_digest()
         except Exception as e:  # the digest must never block a scan or a trade
@@ -2114,6 +2113,24 @@ class ArbitrageScanner:
             return
         self._logged_error = (key, now)
 
+    def _log_scan(self, prices: dict, opportunities: list):
+        """The scan's price snapshot, results and episodes: one commit instead of one per write."""
+        with self.tracker.batch():
+            self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
+            self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
+            self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
+
+    def _maybe_prune(self, now: datetime):
+        """Once a day (and at start): old scan rows and snapshots go, so a bot running for months stays small."""
+        day = now.strftime("%Y-%m-%d")
+        if self._pruned_day == day:
+            return
+        self._pruned_day = day
+        result = self._db_write(self.tracker.prune, config.SCAN_RESULTS_RETENTION_DAYS)
+        if result and any(result):
+            logger.info(f"Pruned {result[0]} scan rows and {result[1]} price snapshots older than "
+                        f"{config.SCAN_RESULTS_RETENTION_DAYS} days")
+
     def _db_write(self, fn, *args):
         """A tracker write that may fail (locked, full or corrupt database) without stopping the scan."""
         try:
@@ -2204,9 +2221,7 @@ class ArbitrageScanner:
         await self.connect_all()
         self._log_startup()
 
-        pruned = self.tracker.prune_scan_results(config.SCAN_RESULTS_RETENTION_DAYS)
-        if pruned:
-            logger.info(f"Pruned {pruned} non-profitable scan rows older than {config.SCAN_RESULTS_RETENTION_DAYS} days")
+        self._maybe_prune(datetime.now())
 
         if self.discord_enabled:
             await self.discord.send_startup_message(mode=self.mode)
