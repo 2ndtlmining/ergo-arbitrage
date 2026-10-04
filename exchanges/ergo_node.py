@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Optional
 
@@ -115,14 +116,13 @@ class ErgoNodeClient:
 
     async def get_health(self) -> dict:
         """Reachability, sync and wallet-lock state. `ok_to_trade` requires all three."""
-        info = await self.get_node_info()
+        info, status = await asyncio.gather(self.get_node_info(), self.get_wallet_status())
         if not info:
             return {"reachable": False, "synced": False, "unlocked": False,
                     "height": 0, "headers": 0, "ok_to_trade": False}
         height = info.get("fullHeight") or 0
         headers = info.get("headersHeight") or 0
         synced = height > 0 and abs(headers - height) < MAX_HEADER_LAG
-        status = await self.get_wallet_status()
         unlocked = bool(status and status.get("isUnlocked"))
         return {"reachable": True, "synced": synced, "unlocked": unlocked,
                 "height": height, "headers": headers, "ok_to_trade": synced and unlocked}

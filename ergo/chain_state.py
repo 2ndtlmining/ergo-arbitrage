@@ -12,6 +12,7 @@ a pending oracle update is only reported (pending=True): the live gate waits for
 to confirm, since a bank TX on the old oracle box would be dropped once it does.
 """
 import asyncio
+from typing import Optional
 import json
 import logging
 import time
@@ -74,12 +75,14 @@ async def _mempool_outputs_by_token(ns, nft: str) -> list[dict]:
 
 async def _pending_outputs(ns, nft: str) -> list[dict]:
     """Mempool outputs holding `nft` that no other mempool TX has spent yet."""
-    live = []
-    for out in await _mempool_outputs_by_token(ns, nft):
-        st, b = await _get(ns, f"/utxo/withPool/byId/{out['boxId']}")
-        if st == 200 and b:
-            live.append(b)
-    return live
+    return (await _pending(ns, nft))[0]
+
+
+async def _pending(ns, nft: str) -> tuple[list[dict], bool]:
+    """(unspent mempool outputs holding `nft`, whether the mempool had any output with it at all)."""
+    outs = await _mempool_outputs_by_token(ns, nft)
+    reads = await asyncio.gather(*(_get(ns, f"/utxo/withPool/byId/{o['boxId']}") for o in outs))
+    return [b for st, b in reads if st == 200 and b], bool(outs)
 
 
 async def _confirmed_box(ns, box_id: str) -> dict:
@@ -90,7 +93,8 @@ async def _confirmed_box(ns, box_id: str) -> dict:
     return b
 
 
-async def latest_box(ns, nft: str, explorer=None) -> tuple[dict, bool]:
+async def latest_box(ns, nft: str, explorer=None, pending: Optional[list] = None,
+                     confirmed: Optional[dict] = None) -> tuple[dict, bool]:
     """(box, pending) for `nft`'s contract box.
 
     Pool/bank (PENDING_OK): the newest mempool output still unspent in the pool, with
@@ -98,11 +102,15 @@ async def latest_box(ns, nft: str, explorer=None) -> tuple[dict, bool]:
     pending=True means an update is waiting in the mempool.
     The confirmed box id comes from the node index, then the explorer.
     Raises RuntimeError if the box cannot be found.
+    `pending` (already read) and `confirmed` (a confirmed box known to be current) save node calls.
     """
-    pending = await _pending_outputs(ns, nft)
+    if pending is None:
+        pending = await _pending_outputs(ns, nft)
     if nft in PENDING_OK:
         if pending:
             return pending[-1], True
+        if confirmed is not None:
+            return confirmed, False
         try:
             return await _confirmed(ns, nft, explorer, node_box), False
         except RuntimeError:
@@ -113,7 +121,7 @@ async def latest_box(ns, nft: str, explorer=None) -> tuple[dict, bool]:
             raise
     # An update arriving between the two calls is reported as not pending; the runner
     # re-reads (and re-checks) right before it signs anything.
-    return await _confirmed(ns, nft, explorer, _confirmed_box), bool(pending)
+    return confirmed if confirmed is not None else await _confirmed(ns, nft, explorer, _confirmed_box), bool(pending)
 
 
 async def _confirmed(ns, nft: str, explorer, read) -> dict:
@@ -147,11 +155,16 @@ class ChainSnapshot:
 
 MAX_HEADER_LAG = 3                       # blocks between headersHeight and fullHeight still counted as synced
 _TIP = {"height": None, "since": None}   # last block height seen and when it first appeared (monotonic)
+_REUSE: dict = {"tip": None, "boxes": {}}  # confirmed boxes of the last snapshot and the tip they belong to
 
 
 async def _height(ns) -> int:
-    """The node's block height, refusing (RuntimeError) a node that is syncing, stalled or on another
-    network: its boxes would be old, and the bot must not price, alert or trade on them."""
+    return (await _tip(ns))[0]
+
+
+async def _tip(ns) -> tuple[int, Optional[str]]:
+    """(height, best block id) of the node, refusing (RuntimeError) a node that is syncing, stalled or on
+    another network: its boxes would be old, and the bot must not price, alert or trade on them."""
     status, info = await _get(ns, "/info")
     if status != 200 or not info:
         raise RuntimeError(f"node /info returned HTTP {status}")
@@ -168,15 +181,25 @@ async def _height(ns) -> int:
     elif now - _TIP["since"] > config.CHAIN_STALL_SECONDS:
         raise RuntimeError(f"no new block for {(now - _TIP['since']) / 60:.0f} min at height {height} "
                            f"(node stalled or without peers?)")
-    return height
+    return height, info.get("bestFullHeaderId")
 
 
 async def read_snapshot(ns, explorer=None) -> ChainSnapshot:
     """Pool, bank and oracle boxes plus height, read in parallel."""
     start = time.perf_counter()
-    *found, height = await asyncio.gather(*(latest_box(ns, nft, explorer) for _, nft in CONTRACTS), _height(ns))
+    *mempool, tip = await asyncio.gather(*(_pending(ns, nft) for _, nft in CONTRACTS), _tip(ns))
+    # Confirmed boxes only change with a block: same tip and nothing of a contract in the mempool means
+    # its confirmed box from the last read is still the one (an idle poll: 4 node calls instead of 7).
+    same_tip = _REUSE["tip"] == tip
+    found = await asyncio.gather(*(
+        latest_box(ns, nft, explorer, pending=live,
+                   confirmed=_REUSE["boxes"].get(name) if same_tip and (not seen or name == "oracle") else None)
+        for (name, nft), (live, seen) in zip(CONTRACTS, mempool)))
     boxes = {name: b for (name, _), (b, _) in zip(CONTRACTS, found)}
     pending = frozenset(name for (name, _), (_, p) in zip(CONTRACTS, found) if p)
+    _REUSE["tip"] = tip
+    _REUSE["boxes"] = {name: b for name, b in boxes.items() if name == "oracle" or name not in pending}
+    height = tip[0]
     return ChainSnapshot(height, boxes["pool"], boxes["bank"], boxes["oracle"], pending,
                          (time.perf_counter() - start) * 1000)
 

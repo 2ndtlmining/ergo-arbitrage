@@ -94,7 +94,7 @@ async def run(scanner: ArbitrageScanner, view: str, once: bool):
         await scanner.run(once=once)
         return
     with Live(get_renderable=lambda: render_safe(scanner.state, console.size.width, console.size.height),
-              console=console, refresh_per_second=2,
+              console=console, refresh_per_second=1,
               screen=not once, redirect_stdout=False, redirect_stderr=False):
         await scanner.run(once=once)
 
