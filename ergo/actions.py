@@ -207,8 +207,8 @@ async def quote(ns, sell: Optional[str], amount: Optional[float], log: Log):
         best = "pool" if pool_erg > bank_erg else "bank"
         log(f"  Pool (direct, no service fee): {amount:g} SigUSD -> {pool_erg:.6f} ERG (after miner fee)")
         log(f"  Bank redeem:                   {amount:g} SigUSD -> {bank_erg:.6f} ERG (after 2% + UI + miner fee)")
-        log(f"  Better: {best}. Use `arb.py {'swap --sell sigusd' if best == 'pool' else 'redeem --sigusd'} "
-            f"{amount:g}`")
+        command = f"swap --sell sigusd --amount {amount:g}" if best == "pool" else f"redeem --sigusd {amount:g}"
+        log(f"  Better: {best}. Check it with `python arb.py {command} --check`, then run it with --execute")
 
 
 async def swap(ns, sell: str, amount, mode: str, log: Log):

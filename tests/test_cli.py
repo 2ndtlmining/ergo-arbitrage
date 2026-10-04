@@ -125,3 +125,16 @@ def test_unreachable_node_is_one_line(monkeypatch, capsys):
     assert e.value.code == 1
     out = capsys.readouterr().out
     assert "Cannot reach your Ergo node" in out and "ERGO_NODE_URL" in out and "Traceback" not in out
+
+
+def test_quote_hint_is_a_command_that_parses():
+    """The `Better: ...` hint of `arb.py quote --sell sigusd` must be a valid arb.py command line."""
+    import re
+    import inspect
+    import shlex
+    from ergo import actions
+    src = inspect.getsource(actions.quote)
+    for command in re.findall(r'f"((?:swap|redeem) [^"]+)"', src):
+        argv = shlex.split(command.replace("{amount:g}", "200")) + ["--check"]
+        args = build_parser().parse_args(argv)
+        assert args.check and args.command in ("swap", "redeem")
