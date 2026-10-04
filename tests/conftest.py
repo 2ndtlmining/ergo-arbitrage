@@ -57,6 +57,7 @@ def fresh_node_api_detection():
     def reset():
         chain_state._MEMPOOL_BY_TOKEN_POST = None
         chain_state._TIP.update(height=None, since=None)
+        chain_state._REUSE.update(tip=None, boxes={})
         chain._EXPLORER_BACKOFF.clear()
 
     reset()

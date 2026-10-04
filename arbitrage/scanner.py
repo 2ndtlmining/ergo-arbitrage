@@ -100,6 +100,7 @@ class ArbitrageScanner:
         self._logged_since = 0.0
         self._db_error: Optional[str] = None            # tracker writes failing
         self._pruned_day = ""
+        self._health_prefetch: Optional[dict] = None    # node health read together with the wallet this poll
         # On-chain only by default: CEX paths are parked until issues #2/#3 are fixed
         self.enable_cex = config.ENABLE_CEX if enable_cex is None else enable_cex
         self.enable_use = config.ENABLE_USE if enable_use is None else enable_use
@@ -1381,7 +1382,7 @@ class ArbitrageScanner:
         if self._drawdown_baseline(wallet, prices) is None:
             blockers.append("no drawdown baseline yet (wallet or oracle price unreadable)")
         blockers += self._sync_global_blockers(wallet, prices)
-        health = await self.ergo_node.get_health()
+        health, self._health_prefetch = self._health_prefetch or await self.ergo_node.get_health(), None
         self._health_blocker = None
         if not health.get("ok_to_trade"):
             self._health_blocker = (f"node not ready (synced={health.get('synced')}, "
@@ -1767,7 +1768,7 @@ class ArbitrageScanner:
             "use": {"balance": use, "options": use_options},
         }
 
-    def _display_wallet_opportunities(self, wallet: dict, opportunities: list, prices: dict):
+    def _display_wallet_opportunities(self, wallet: dict, opportunities: list, prices: dict, analysis=None):
         """Show what's possible with current wallet holdings."""
         erg = wallet.get("erg", 0)
         sigusd = wallet.get("sigusd", 0)
@@ -1780,7 +1781,7 @@ class ArbitrageScanner:
             border_style="cyan",
         ))
 
-        analysis = self._build_wallet_analysis(wallet, prices)
+        analysis = analysis or self._build_wallet_analysis(wallet, prices)
 
         for asset_key, label in [("erg", "ERG"), ("sigusd", "SigUSD"), ("use", "USE")]:
             info = analysis[asset_key]
@@ -1871,21 +1872,31 @@ class ArbitrageScanner:
         if outage:  # prices below are the last good state: show them, but do not log or alert on them
             self.out.print(f"[bold yellow]Chain state unavailable ({self._chain_error}): showing the last good "
                           f"state; nothing is logged, alerted or traded until the node can be read[/bold yellow]")
-        self._display_prices(prices)
+        plain = self.view == "plain"     # the other views never show these tables: do not build them
+        if plain:
+            self._display_prices(prices)
 
         opportunities = self._find_opportunities(prices)
         self._update_live_streak()
         if not outage:
             self._db_write(self._log_scan, prices, opportunities)
-        self._display_opportunities(opportunities, prices)
-        if self.cex_watch:
-            self._display_cex_watch(prices)
+        if plain:
+            self._display_opportunities(opportunities, prices)
+            if self.cex_watch:
+                self._display_cex_watch(prices)
 
-        # Wallet-based analysis
+        # Wallet-based analysis, built at most once per scan
         wallet = await self._fetch_wallet_balances()
         self._last_wallet = wallet
-        if self.show_wallet:
-            self._display_wallet_opportunities(wallet, opportunities, prices)
+        built = []
+
+        def wallet_analysis():
+            if not built:
+                built.append(self._build_wallet_analysis(wallet, prices))
+            return built[0]
+
+        if plain and self.show_wallet:
+            self._display_wallet_opportunities(wallet, opportunities, prices, wallet_analysis())
 
         if not outage:
             await self._notify_discord(opportunities)
@@ -1894,8 +1905,7 @@ class ArbitrageScanner:
 
         # Send wallet analysis to Discord (rate limited)
         if self.discord_enabled and self._should_send_wallet_analysis(opportunities):
-            analysis = self._build_wallet_analysis(wallet, prices)
-            await self.discord.send_wallet_analysis(wallet, analysis)
+            await self.discord.send_wallet_analysis(wallet, wallet_analysis())
             self._last_wallet_analysis_time = time.time()
             logger.info("Wallet analysis sent to Discord")
 
@@ -2071,7 +2081,7 @@ class ArbitrageScanner:
         self._note_change()
         if self.trading_enabled and any(self._live_streak.get(k, 0) >= config.LIVE_CONFIRM_POLLS
                                         for k in LIVE_PATHS):
-            wallet = await self._fetch_wallet_balances()
+            wallet, self._health_prefetch = await self._wallet_and_health()
             self._last_wallet = wallet
             await self._execute_trades(wallet, prices, quiet=True)
 
@@ -2095,6 +2105,11 @@ class ArbitrageScanner:
             self._last_snapshot_id = self.tracker.log_price_snapshot(prices)
             self.tracker.log_scan_results(opportunities, self.scan_count, self._last_snapshot_id)
             self.tracker.record_scan(opportunities, self.scan_count, self._last_snapshot_id)
+
+    async def _wallet_and_health(self) -> tuple[dict, dict]:
+        """The live gate's wallet balances and node health, read in parallel."""
+        wallet, health = await asyncio.gather(self._fetch_wallet_balances(), self.ergo_node.get_health())
+        return wallet, health
 
     def _maybe_prune(self, now: datetime):
         """Once a day (and at start): old scan rows and snapshots go, so a bot running for months stays small."""
