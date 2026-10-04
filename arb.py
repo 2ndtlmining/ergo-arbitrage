@@ -12,6 +12,7 @@ without broadcasting; --execute sends and follows the transaction until it confi
     python arb.py config                                    (effective settings, mistakes in .env)
     python arb.py backup [--to backups] [--keep 14]         (consistent copy of the tracker database)
     python arb.py resume                                    (clear a live-mode pause, then restart the bot)
+    python arb.py status                                    (is the bot running and is everything OK? no node needed)
 
 --execute (and main.py --live) refuse to run with dangerous settings, e.g. SLIPPAGE_TOLERANCE above 0.05.
 """
@@ -23,6 +24,7 @@ from pathlib import Path
 import aiohttp
 
 import config
+import bot_status
 import config_check
 from instance_lock import InstanceLock, LockHeld
 from tracker.backup import backup_database
@@ -146,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--to", default=str(config.repo_path("backups")), help="folder for the copies")
     b.add_argument("--keep", type=int, default=14, help="newest copies to keep")
 
+    st = _sub(sub, "status", "is the bot running and is everything OK? (reads the database; no node needed)",
+              "Whether the bot is running (and in which mode), its last full scan and prices, open opportunities, "
+              "today's trades, a live pause or STOP file, and the next Discord digest. Reads the bot's database "
+              "and lock file only; `arb.py doctor` checks the node.", ["status"])
+    st.add_argument("--db", default=DEFAULT_DB, help="the bot's database")
+
     rs = _sub(sub, "resume", "clear the live-mode pause left by a failed or interrupted trade",
               "Clears the stored live-mode pause. Check `arb.py balance` first; the running bot keeps its pause "
               "until it is restarted.", ["resume"])
@@ -256,6 +264,9 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if args.command == "config":
         print("\n".join(config_check.report()), flush=True)
+        return
+    if args.command == "status":
+        print("\n".join(bot_status.status_lines(args.db)), flush=True)
         return
     if args.command == "resume":
         resume(args.db)
