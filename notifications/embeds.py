@@ -135,6 +135,8 @@ def digest_embed(d) -> dict:
         fields.append(field("Wallet", f"{d.wallet.get('erg', 0):.4f} ERG · {d.wallet.get('sigusd', 0):.2f} SigUSD"))
     if getattr(d, "mint", None):
         fields.append(field("Bank mint", d.mint))
+    if getattr(d, "sigusd", None):
+        fields.append(field("SigUSD", d.sigusd, inline=False))
     return embed(f"Digest · last {d.hours}h", BLUE, fields)
 
 

@@ -5,6 +5,7 @@ import sys
 from rich.live import Live
 
 import config
+from arbitrage import dashboard_keys
 from arbitrage.dashboard_view import render_safe
 from arbitrage.scanner import ArbitrageScanner
 from instance_lock import InstanceLock, LockHeld
@@ -61,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="log file level (arbitrage.log, rotated daily, 14 days kept)")
     p.add_argument("--db", default=str(config.repo_path("arbitrage_tracker.db")), help="tracker database")
     p.add_argument("--no-wallet", action="store_true", help="hide the wallet panel and wallet analysis")
+    p.add_argument("--usd", action="store_true",
+                   help="start the dashboard in the SigUSD view (what your SigUSD is worth where); "
+                        "press u / e to switch while it runs")
     p.add_argument("--yes", action="store_true",
                    help="arm --live without the typed confirmation (for systemd and other unattended runs)")
     return p
@@ -93,10 +97,14 @@ async def run(scanner: ArbitrageScanner, view: str, once: bool):
     if view != "dashboard":
         await scanner.run(once=once)
         return
-    with Live(get_renderable=lambda: render_safe(scanner.state, console.size.width, console.size.height),
-              console=console, refresh_per_second=1,
-              screen=not once, redirect_stdout=False, redirect_stderr=False):
-        await scanner.run(once=once)
+    stop_keys = dashboard_keys.start(scanner.state.on_key, asyncio.get_running_loop())   # u / e switch views
+    try:
+        with Live(get_renderable=lambda: render_safe(scanner.state, console.size.width, console.size.height),
+                  console=console, refresh_per_second=1,
+                  screen=not once, redirect_stdout=False, redirect_stderr=False):
+            await scanner.run(once=once)
+    finally:
+        stop_keys()
 
 
 def arm_live() -> bool:
@@ -162,6 +170,8 @@ def _start(args, view: str, mode: str):
     if view == "plain":
         print_banner(mode)
     scanner = ArbitrageScanner(mode=mode, db_path=args.db, view=view, show_wallet=not args.no_wallet)
+    if args.usd:
+        scanner.state.view_mode = "usd"
     if view == "dashboard":
         logger.addHandler(EventLogHandler(scanner.state))
     try:

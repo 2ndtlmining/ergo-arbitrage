@@ -55,6 +55,16 @@ for about 120x40; narrower than 100 columns it drops a few columns and puts venu
 one table, and shorter than 32 rows it hides Events/History, so every path and venue still shows at
 80x24. For anything smaller use `--plain`.
 
+**Two views.** Press **`u`** for the **SigUSD view** and **`e`** for the ERG view (the default). The SigUSD
+view replaces the Paths panel with what the SigUSD in your wallet is worth where, best first: redeemed
+at the bank, swapped on the ErgoDEX pool, or swapped and then sold on each exchange for USDT (into its
+order book, after the taker fee). It shows the ERG or USDT you would end up with, its dollar value, the
+gain against $1 per SigUSD and against the bank, and the **pool premium**: how much more ERG the pool
+pays for SigUSD than the bank. A high premium means selling SigUSD through the pool is the better exit;
+a negative one means SigUSD is cheap there. With no SigUSD in the wallet it quotes 100 SigUSD as an
+example. Information only: the bot never sends anything to an exchange. `arb.py quote --sell sigusd
+--amount 200` prints the same routes, and the digest adds the best one when the wallet holds SigUSD.
+
 - **Header + health strip:** node, wallet, poll timing; then each source's response time (chain read,
   every exchange), the full-scan time, the Discord send queue and the age of the chain data. Slow,
   stale or backed-up items turn yellow, then red.
@@ -101,6 +111,7 @@ one table, and shorter than 32 rows it hides Events/History, so every path and v
 | `--db PATH` | tracker database |
 | `--no-wallet` | hide the wallet panel and wallet analysis |
 | `--yes` | arm `--live` without typing `LIVE` (systemd and other unattended runs) |
+| `--usd` | start the dashboard in the SigUSD view (press `u` / `e` to switch while it runs) |
 
 ## Arbitrage Strategies
 

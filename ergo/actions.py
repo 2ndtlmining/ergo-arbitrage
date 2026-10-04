@@ -21,6 +21,8 @@ from ergo.progress import wait_confirmed
 from ergo.sigmausd_tx import build_redeem_tx, register_int
 from ergo.signing import DryRun, check_on_node, guarded_sign
 from ergo.tx_guard import SignPolicy, TxGuardError
+from arbitrage.usd_routes import sigusd_routes
+from exchanges.cex_public import FeeBook, fetch_all_quotes
 from exchanges.sigmausd import BankState, affordable_mint_cents, can_mint_sigusd, quote_redeem_sigusd
 
 Log = Callable[[str], None]
@@ -209,6 +211,35 @@ async def quote(ns, sell: Optional[str], amount: Optional[float], log: Log):
         log(f"  Bank redeem:                   {amount:g} SigUSD -> {bank_erg:.6f} ERG (after 2% + UI + miner fee)")
         command = f"swap --sell sigusd --amount {amount:g}" if best == "pool" else f"redeem --sigusd {amount:g}"
         log(f"  Better: {best}. Check it with `python arb.py {command} --check`, then run it with --execute")
+        for line in await sigusd_route_lines(amount, Market.from_boxes(pool, bank, oracle_box)):
+            log(line)
+
+
+async def sigusd_route_lines(amount: float, market: Market) -> list[str]:
+    """Every exit for `amount` SigUSD incl. selling the ERG on an exchange (public order books; no keys)."""
+    books, fees = {}, FeeBook()
+    try:
+        async with aiohttp.ClientSession() as cex:            # its own session: the node API key stays home
+            quotes = await fetch_all_quotes(cex)
+            await fees.refresh(cex)
+        books = {name: q for name, q in quotes.items() if q.book is not None}
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        pass
+    r = sigusd_routes(amount, market, books, fees)
+    lines = ["", f"  Where {amount:g} SigUSD is worth the most (best first; information only, nothing goes to an exchange):"]
+    for route in r.routes:
+        if route.amount is None:
+            lines.append(f"    {route.name:<28} {'—':>16}   {route.note}")
+            continue
+        face, bank = r.vs_face(route), r.vs_bank(route)
+        vs_bank = f"  {bank:+.1f}% vs bank" if bank is not None else ""
+        lines.append(f"    {route.name:<28} {route.amount:>12,.2f} {route.unit:<4} {route.usd_text:>10}"
+                     f"{'*' if route.unit == 'ERG' else ' '} {face:+6.1f}% vs ${amount:,.0f}{vs_bank}")
+    if not books:
+        lines.append("    (no exchange order book answered: only the on-chain routes)")
+    lines.append("    * ERG valued at the oracle price; exchange routes: order-book depth and taker fee, deposits "
+                 "assumed free. Then sell by hand on the exchange.")
+    return lines
 
 
 async def swap(ns, sell: str, amount, mode: str, log: Log):

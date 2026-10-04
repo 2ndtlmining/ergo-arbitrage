@@ -111,6 +111,7 @@ def header(s: DashboardState) -> Text:
     if s.next_full_scan_in is not None:
         t.append(f"  full scan in {s.next_full_scan_in:.0f}s")
     t.append(f"  confirm {config.LIVE_CONFIRM_POLLS}  {datetime.now():%H:%M:%S}")
+    t.append("  [u] SigUSD view" if s.view_mode == "erg" else "  [e] ERG view", style="dim")
     return t
 
 
@@ -316,6 +317,42 @@ def exchanges_line(s: DashboardState) -> Text:
     return Text("CEX (watch-only): " + " · ".join(parts), style="cyan")
 
 
+def usd_routes_panel(s: DashboardState, compact: bool = False) -> Panel:
+    """The USD view: every exit for the wallet's SigUSD, best dollar value first (information only)."""
+    r = s.usd_routes
+    if r is None:
+        return Panel(Text("waiting for the pool, bank and exchange prices…", style="dim"), title="SigUSD routes")
+    held = f"example {r.sigusd:g} SigUSD (wallet holds none)" if r.example else f"wallet {r.sigusd:,.2f} SigUSD"
+    premium = f" · pool premium {r.premium_percent:+.1f}% vs bank" if r.premium_percent is not None else ""
+    t = Table(expand=True, box=None, pad_edge=False)
+    columns = [("route", "left"), ("you get", "right"), ("$ value", "right"), (f"vs ${r.sigusd:,.0f}", "right")]
+    if not compact:
+        columns.append(("vs bank", "right"))
+    for col, justify in columns:
+        t.add_column(col, justify=justify, no_wrap=True, overflow="ellipsis", ratio=1 if col == "route" else None)
+    for route in r.routes:
+        if route.amount is None:
+            cells = [route.name, "—", "—", Text(route.note or "—", style="dim")]
+            if not compact:
+                cells.append("")
+            t.add_row(*cells, style="dim")
+            continue
+        face, bank = r.vs_face(route), r.vs_bank(route)
+        star = "*" if route.unit == "ERG" else ""
+        cells = [route.name, f"{route.amount:,.2f} {route.unit}", f"{route.usd_text}{star}",
+                 Text(f"{face:+.1f}%", style="green" if face > 0 else "red")]
+        if not compact:
+            cells.append(f"{bank:+.1f}%" if bank is not None else "—")
+        t.add_row(*cells, style="bold" if route is r.best else None)
+    foot = Text("* ERG valued at the oracle price; exchange routes sell into the order book after the taker "
+                "fee (deposits assumed free). Information only: nothing is sent to an exchange.", style="dim")
+    return Panel(Group(t, foot), title=f"SigUSD routes · {held}{premium}")
+
+
+def _usd_rows(s: DashboardState) -> int:
+    return (len(s.usd_routes.routes) if s.usd_routes else 1) + 5
+
+
 def venues_compact_panel(s: DashboardState, short: bool = False) -> Panel:
     """Narrow terminals: on-chain venues and exchanges in one three-column table (short: exchanges in one line)."""
     if not s.venues:
@@ -374,8 +411,9 @@ def _render_compact(s: DashboardState, width: int, short: bool) -> Layout:
     top, _ = _top(s)
     venue_rows = (len([v for v in s.venues if v.kind != "CEX"] if s.exchanges else s.venues)
                   + len(s.exchanges) + 3) if s.venues else 3
-    parts = [Layout(header(s), size=1)] + ([] if short else [Layout(health_strip(s), size=1)]) + [
-        top, Layout(paths_panel(s, compact=True, steps=not short), size=_paths_rows(s, width, True, not short))]
+    middle_panel = (Layout(usd_routes_panel(s, compact=True), size=_usd_rows(s) + 1) if s.view_mode == "usd" else
+                    Layout(paths_panel(s, compact=True, steps=not short), size=_paths_rows(s, width, True, not short)))
+    parts = [Layout(header(s), size=1)] + ([] if short else [Layout(health_strip(s), size=1)]) + [top, middle_panel]
     if short:
         parts.append(Layout(venues_compact_panel(s, short=True)))     # takes what is left
     else:
@@ -396,6 +434,7 @@ def _render_full(s: DashboardState, width: int) -> Layout:
         Layout(header(s), size=1),
         Layout(health_strip(s), size=1),
         top,
+        Layout(usd_routes_panel(s), size=_usd_rows(s)) if s.view_mode == "usd" else
         Layout(paths_panel(s), size=paths_rows),
         Layout(name="middle", minimum_size=4),
         Layout(name="bottom", size=bottom_rows),
