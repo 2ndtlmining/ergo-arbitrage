@@ -6,7 +6,6 @@ import pytest
 import config
 import ergo.arb_runner as runner
 from instance_lock import InstanceLock, LockHeld, holder
-from tests.test_runner_sizing import offline  # noqa: F401  (fixture)
 
 
 @pytest.fixture
@@ -171,26 +170,26 @@ def run_forced(confirm):
     return r, "\n".join(logs)
 
 
-def test_forced_loss_needs_confirmation(offline, monkeypatch):  # noqa: F811
+def test_forced_loss_needs_confirmation(offline, monkeypatch):
     monkeypatch.setattr(config, "MIN_PROFIT_PERCENT", 50.0)
     asked = []
     r, out = run_forced(lambda msg, erg: asked.append(msg) or False)
     assert r.status == "not_confirmed" and asked and "ERG" in asked[0]
 
 
-def test_confirmed_forced_trade_goes_on_to_signing(offline, monkeypatch):  # noqa: F811
+def test_confirmed_forced_trade_goes_on_to_signing(offline, monkeypatch):
     monkeypatch.setattr(config, "MIN_PROFIT_PERCENT", 50.0)
     r, _ = run_forced(lambda msg, erg: True)
     assert r.status == "dry_run"                              # reached guarded_sign
 
 
-def test_forced_loss_without_a_prompt_is_refused(offline, monkeypatch):  # noqa: F811
+def test_forced_loss_without_a_prompt_is_refused(offline, monkeypatch):
     monkeypatch.setattr(config, "MIN_PROFIT_PERCENT", 50.0)
     r, _ = run_forced(None)
     assert r.status == "not_confirmed"
 
 
-def test_profitable_trades_are_not_asked(offline):  # noqa: F811
+def test_profitable_trades_are_not_asked(offline):
     r, _ = run_forced(lambda msg, erg: pytest.fail("asked"))
     assert r.status == "dry_run"
 

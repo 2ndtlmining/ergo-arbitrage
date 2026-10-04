@@ -9,13 +9,12 @@ from arbitrage.scanner import ArbitrageScanner
 from ergo.arb_runner import ArbResult
 from tests.test_optimizer import discount_prices
 
-KEY = "Spectrum buy->Bank redeem"
+KEY = "ErgoDEX buy->Bank redeem"
 HEALTHY = {"reachable": True, "synced": True, "unlocked": True, "height": 1, "headers": 1, "ok_to_trade": True}
 WALLET = {"erg": 50.0, "sigusd": 0.0, "use": 0.0}
 
 
-@pytest.fixture
-def live(tmp_path, monkeypatch):
+def live_bot(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
     monkeypatch.setattr(config, "LIVE_STOP_FILE", str(tmp_path / "STOP"))
     s = ArbitrageScanner(mode="live", db_path=str(tmp_path / "t.db"))

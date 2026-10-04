@@ -4,8 +4,8 @@ import json
 from arbitrage.dashboard_state import MAX_EVENTS, MAX_VENUES, DashboardState, VenueStatus, path_status
 from arbitrage.sizing import SizeChoice
 
-POOL = "Spectrum buy->Bank redeem"
-MINT = "Bank mint->Spectrum sell"
+POOL = "ErgoDEX buy->Bank redeem"
+MINT = "Bank mint->ErgoDEX sell"
 
 
 def go(pct=3.0):

@@ -29,7 +29,7 @@ class FeeBreakdown:
 
 @dataclass
 class ArbitrageOpportunity:
-    path: str  # e.g. "ERG -> SigUSD (Bank) -> ERG (Spectrum)"
+    path: str  # e.g. "Bank mint->ErgoDEX sell [10 ERG]"
     input_erg: float
     output_erg: float
     profit_erg: float
@@ -54,7 +54,7 @@ class ArbitrageOpportunity:
 
     @property
     def path_key(self) -> str:
-        """Path name without the trade size suffix, e.g. "Bank mint->Spectrum sell"."""
+        """Path name without the trade size suffix, e.g. "Bank mint->ErgoDEX sell"."""
         return self.path.rsplit(" [", 1)[0] if " [" in self.path else self.path
 
     @property
@@ -108,7 +108,7 @@ class ArbitrageCalculator:
         """
         Path: ERG -> SigUSD (Bank mint) -> ERG (DEX swap)
         1. Send ERG to SigmaUSD bank, receive SigUSD (minus 2.1% fee)
-        2. Swap SigUSD -> ERG on Spectrum/Mew
+        2. Swap SigUSD -> ERG on the ErgoDEX pool/Mew
         """
         fees = FeeBreakdown()
 
@@ -143,7 +143,7 @@ class ArbitrageCalculator:
             source_price=bank_erg_to_sigusd_rate,
             target_price=sigusd_received / erg_from_dex if erg_from_dex > 0 else 0,
             source_exchange="SigmaUSD Bank",
-            target_exchange="Spectrum DEX",
+            target_exchange="ErgoDEX pool",
             is_profitable=profit_percent > config.MIN_PROFIT_PERCENT,
             requires_transfer=False,  # all on-chain
             estimated_execution_minutes=exec_time,
@@ -161,7 +161,7 @@ class ArbitrageCalculator:
     ) -> ArbitrageOpportunity:
         """
         Path: ERG -> SigUSD (DEX swap) -> ERG (Bank redeem)
-        1. Swap ERG -> SigUSD on Spectrum/Mew
+        1. Swap ERG -> SigUSD on the ErgoDEX pool/Mew
         2. Redeem SigUSD at SigmaUSD bank for ERG
         """
         fees = FeeBreakdown()
@@ -195,7 +195,7 @@ class ArbitrageCalculator:
             fees=fees,
             source_price=sigusd_received / input_erg if input_erg > 0 else 0,
             target_price=1.0 / bank_sigusd_to_erg_rate if bank_sigusd_to_erg_rate > 0 else 0,
-            source_exchange="Spectrum DEX",
+            source_exchange="ErgoDEX pool",
             target_exchange="SigmaUSD Bank",
             is_profitable=profit_percent > config.MIN_PROFIT_PERCENT,
             estimated_execution_minutes=exec_time,
@@ -328,8 +328,8 @@ class ArbitrageCalculator:
             fees=fees,
             source_price=cex_buy_price if direction == "buy_cex_sell_dex" else dex_erg_sigusd_price,
             target_price=dex_erg_sigusd_price if direction == "buy_cex_sell_dex" else cex_sell_price,
-            source_exchange="CEX" if direction == "buy_cex_sell_dex" else "Spectrum DEX",
-            target_exchange="Spectrum DEX" if direction == "buy_cex_sell_dex" else "CEX",
+            source_exchange="CEX" if direction == "buy_cex_sell_dex" else "ErgoDEX pool",
+            target_exchange="ErgoDEX pool" if direction == "buy_cex_sell_dex" else "CEX",
             is_profitable=profit_percent > config.MIN_PROFIT_PERCENT,
             blocked=True,
             blocked_reason=WATCH_ONLY_REASON,

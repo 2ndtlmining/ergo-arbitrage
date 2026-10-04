@@ -10,8 +10,7 @@ from arbitrage.scanner import ArbitrageScanner
 from tests.test_chain_scanner import HEALTHY, KEY, WALLET, Reader, snap
 
 
-@pytest.fixture
-def make(tmp_path, monkeypatch):
+def view_factory(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
     monkeypatch.setattr(config, "LIVE_STOP_FILE", str(tmp_path / "STOP"))
     monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))

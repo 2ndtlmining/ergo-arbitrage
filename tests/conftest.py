@@ -78,3 +78,29 @@ def fresh_box_id_cache():
     chain_state._BOX_IDS.clear()
     yield
     chain_state._BOX_IDS.clear()
+
+
+# Fixtures shared across test modules (defined next to the tests they came from).
+
+@pytest.fixture
+def live(tmp_path, monkeypatch):
+    from tests.test_live import live_bot
+    yield from live_bot(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def offline(monkeypatch):
+    from tests.test_runner_sizing import offline_runner
+    yield offline_runner(monkeypatch)
+
+
+@pytest.fixture
+def scanner(tmp_path, monkeypatch):
+    from tests.test_chain_scanner import chain_scanner
+    yield from chain_scanner(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def make(tmp_path, monkeypatch):
+    from tests.test_scanner_views import view_factory
+    yield from view_factory(tmp_path, monkeypatch)

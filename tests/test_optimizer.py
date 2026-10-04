@@ -50,7 +50,7 @@ def discount_prices(pool_erg=20_000):
 
 
 class TestScannerOptimum:
-    KEY = "Spectrum buy->Bank redeem"
+    KEY = "ErgoDEX buy->Bank redeem"
 
     def test_optimum_beats_every_grid_point(self, scanner, monkeypatch):
         monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
@@ -100,4 +100,4 @@ def test_unprofitable_path_says_no_profitable_size(scanner):
     opps = scanner._find_opportunities(prices)
     with console.capture() as cap:
         scanner._display_opportunities(opps, prices)
-    assert "BEST SIZE Spectrum buy->Bank redeem: no profitable size" in cap.get()
+    assert "BEST SIZE ErgoDEX buy->Bank redeem: no profitable size" in cap.get()

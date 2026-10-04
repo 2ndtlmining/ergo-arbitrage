@@ -15,11 +15,14 @@ The app continuously scans prices from multiple sources and calculates whether a
 
 | Source | Type | Pair | Notes |
 |--------|------|------|-------|
-| **ErgoDEX (Spectrum) pool** | AMM pool | ERG/SigUSD | Pool box read from your node every 2 s; 0.5% pool fee; traded with direct pool swaps |
+| **ErgoDEX pool** | AMM pool | ERG/SigUSD | Pool box read from your node every 2 s; 0.5% pool fee; traded with direct pool swaps |
 | **SigmaUSD bank** | Protocol | ERG/SigUSD | Oracle-priced, ~2.23% fee; minting closes when the reserve ratio would fall below 400% |
 | **Oracle** | Price feed | ERG/USD | The SigmaUSD oracle pool box, read from your node |
 | **Crux Finance / Dexy** | LP + mint | ERG/USE | Off (`ENABLE_USE=false`): the USE LP was drained, a token migration is expected |
 | **Kucoin, NonKYC, Gate, MEXC** (SafeTrade opt-in) | CEX | ERG/USDT | Public order books, watch-only, no API keys |
+
+**Names:** the ERG/SigUSD AMM pool was built by Spectrum Finance, which has been sunset; it is the
+ErgoDEX pool now. In the code, `spectrum_*` names and `SPECTRUM_*` constants still mean that pool.
 
 ### Ergo Node
 
@@ -107,11 +110,11 @@ When the bank's oracle price values ERG higher than the DEX pool price:
 
 ```
   Oracle:   1 ERG = $0.32 (SigUSD via bank)
-  Spectrum: 1 ERG = $0.29 (SigUSD via pool)
+  ErgoDEX:  1 ERG = $0.29 (SigUSD via pool)
 
   Step 1: Send 10 ERG to SigmaUSD Bank, mint SigUSD
           Receive: 10 * $0.32 * (1 - 2.2% fee) = 3.13 SigUSD
-  Step 2: Swap 3.13 SigUSD -> ERG on Spectrum
+  Step 2: Swap 3.13 SigUSD -> ERG on the ErgoDEX pool
           Receive: 3.13 / $0.29 * (1 - 0.5% pool) - miner fee = ~10.7 ERG (direct pool swap)
   Result:  10 ERG -> ~10.7 ERG before price impact (a 10% price gap; fees take ~2.7% of it)
 
@@ -123,10 +126,10 @@ When the bank's oracle price values ERG higher than the DEX pool price:
 When the DEX pool prices ERG higher than the bank's oracle rate:
 
 ```
-  Spectrum: 1 ERG = $0.35 (SigUSD)
+  ErgoDEX:  1 ERG = $0.35 (SigUSD)
   Oracle:   1 ERG = $0.32
 
-  Step 1: Swap 10 ERG -> SigUSD on Spectrum (-0.5% pool, direct swap: miner fee only)
+  Step 1: Swap 10 ERG -> SigUSD on the ErgoDEX pool (-0.5% pool, direct swap: miner fee only)
           Receive: 10 * 0.35 * (1 - 0.5%) = 3.48 SigUSD
   Step 2: Redeem 3.48 SigUSD at the bank (-2.23% bank fee, -0.0021 ERG receipt box + miner fee)
           Receive: 3.48 / $0.32 * (1 - 2.23%) = ~10.6 ERG
@@ -521,6 +524,7 @@ python main.py --live       # + auto-execute
 python main.py --once --plain   # one scan, classic output
 
 # Run tests (unit only; add -m live for the tests that call your node and public APIs)
+pip install -r requirements-dev.txt     # once: pytest and pyflakes
 python -m pytest -q
 ```
 
@@ -791,7 +795,7 @@ under [Modes](#modes).
 ## Project Structure
 
 ```
-ergo_arbitrage/
+ergo-arbitrage/
 ├── .env / .env.example     # settings and secrets (.env is gitignored)
 ├── config.py               # settings, fee constants, token IDs
 ├── main.py                 # bot entry point (monitor / --notify / --live)

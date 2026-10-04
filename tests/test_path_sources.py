@@ -25,14 +25,14 @@ def test_every_opportunity_declares_its_sources(scanner):
     opps = scanner._find_opportunities(_CexPaths().prices(state))
     assert opps and all(o.sources and set(o.sources) <= KNOWN for o in opps)
     by = {o.path_key: set(o.sources) for o in opps}
-    assert by["Spectrum buy->Bank redeem"] == {"spectrum", "bank"}
-    assert by["Kucoin<>Bank"] == {"kucoin", "bank"} and by["NonKYC<>Spectrum"] == {"nonkyc", "spectrum"}
+    assert by["ErgoDEX buy->Bank redeem"] == {"spectrum", "bank"}
+    assert by["Kucoin<>Bank"] == {"kucoin", "bank"} and by["NonKYC<>ErgoDEX"] == {"nonkyc", "spectrum"}
 
 
 def test_staleness_follows_the_declared_sources_not_the_name(scanner):
     state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
     opp = next(o for o in scanner._find_opportunities(_CexPaths().prices(state))
-               if o.path_key == "Spectrum buy->Bank redeem")
+               if o.path_key == "ErgoDEX buy->Bank redeem")
     opp.path = "Pool buy->SigmaUSD redeem [10 ERG]"            # a rename must not switch the check off
     now = time.time()
     scanner._price_timestamps.update(spectrum=now, bank=now - config.PRICE_STALE_SECONDS - 5)

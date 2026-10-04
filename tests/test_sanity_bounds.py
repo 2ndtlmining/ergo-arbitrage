@@ -7,8 +7,7 @@ import pytest
 import config
 import ergo.arb_runner as runner
 from notifications.health import HealthMonitor
-from tests.test_live import KEY, WALLET, live  # noqa: F401  (fixture)
-from tests.test_runner_sizing import offline  # noqa: F401  (fixture)
+from tests.test_live import KEY, WALLET
 
 
 def run(coro):
@@ -28,7 +27,7 @@ def oracle(bot):
     return bot._prices["bank"]["oracle_erg_usd"]
 
 
-def test_an_implausible_profit_blocks_live_trading(live, monkeypatch):  # noqa: F811
+def test_an_implausible_profit_blocks_live_trading(live, monkeypatch):
     profit = live.last_sizing[KEY].profit_percent
     monkeypatch.setattr(config, "LIVE_MAX_PROFIT_PERCENT", profit / 2)
     blockers = run(live._live_blockers(WALLET, live._prices))
@@ -37,12 +36,12 @@ def test_an_implausible_profit_blocks_live_trading(live, monkeypatch):  # noqa: 
     assert live.calls == []
 
 
-def test_a_plausible_profit_trades(live):  # noqa: F811
+def test_a_plausible_profit_trades(live):
     run(live._execute_trades(WALLET, live._prices))
     assert len(live.calls) == 1
 
 
-def test_oracle_far_from_the_exchanges_blocks_live_trading(live):  # noqa: F811
+def test_oracle_far_from_the_exchanges_blocks_live_trading(live):
     o = oracle(live)
     with_cex(live, o * 1.10, o * 1.12, o * 1.11)
     blockers = run(live._live_blockers(WALLET, live._prices))
@@ -51,13 +50,13 @@ def test_oracle_far_from_the_exchanges_blocks_live_trading(live):  # noqa: F811
     assert live.calls == []
 
 
-def test_oracle_close_to_the_exchanges_is_fine(live):  # noqa: F811
+def test_oracle_close_to_the_exchanges_is_fine(live):
     o = oracle(live)
     with_cex(live, o * 1.01, o * 0.99)
     assert not any("oracle" in b for b in run(live._live_blockers(WALLET, live._prices)))
 
 
-def test_one_exchange_is_not_enough_to_judge_the_oracle(live):  # noqa: F811
+def test_one_exchange_is_not_enough_to_judge_the_oracle(live):
     with_cex(live, oracle(live) * 2)
     assert not any("LIVE_MAX_ORACLE_DEVIATION_PERCENT" in b for b in run(live._live_blockers(WALLET, live._prices)))
 
@@ -78,19 +77,19 @@ def test_bounds_are_validated(monkeypatch, name, value):
     assert any(name in e for e in config.live_config_errors())
 
 
-def test_manual_execute_refuses_an_implausible_profit(offline, monkeypatch):  # noqa: F811
+def test_manual_execute_refuses_an_implausible_profit(offline, monkeypatch):
     monkeypatch.setattr(config, "LIVE_MAX_PROFIT_PERCENT", 0.5)
     r = run(runner.run_arb(None, "redeem", 3 * 10**9, execute=True, log=lambda m: None))
     assert r.status == "implausible" and "LIVE_MAX_PROFIT_PERCENT" in r.message
 
 
-def test_manual_check_still_runs_on_an_implausible_profit(offline, monkeypatch):  # noqa: F811
+def test_manual_check_still_runs_on_an_implausible_profit(offline, monkeypatch):
     monkeypatch.setattr(config, "LIVE_MAX_PROFIT_PERCENT", 0.5)
     r = run(runner.run_arb(None, "redeem", 3 * 10**9, check=True, log=lambda m: None))
     assert r.status == "dry_run"
 
 
-def test_force_overrides_the_bound_for_a_manual_trade(offline, monkeypatch):  # noqa: F811
+def test_force_overrides_the_bound_for_a_manual_trade(offline, monkeypatch):
     monkeypatch.setattr(config, "LIVE_MAX_PROFIT_PERCENT", 0.5)
     r = run(runner.run_arb(None, "redeem", 3 * 10**9, execute=True, force=True, log=lambda m: None))
     assert r.status == "dry_run"

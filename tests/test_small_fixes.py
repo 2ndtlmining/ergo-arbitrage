@@ -7,7 +7,7 @@ import pytest
 
 import config
 from exchanges.ergo_node import ErgoNodeClient, parse_wallet_balances
-from tests.test_live import WALLET, live  # noqa: F401  (fixture)
+from tests.test_live import WALLET
 
 SIGUSD = config.SIGUSD_TOKEN_ID
 
@@ -42,7 +42,7 @@ def test_doctor_checks_the_balance_shape():
 
 # ---------- cooldown on a monotonic clock ----------
 
-def test_cooldown_ignores_a_wall_clock_jump(live, monkeypatch):  # noqa: F811
+def test_cooldown_ignores_a_wall_clock_jump(live, monkeypatch):
     run(live._execute_trades(WALLET, live._prices))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 3600)          # NTP step forward by an hour

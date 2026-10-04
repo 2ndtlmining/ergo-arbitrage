@@ -9,7 +9,7 @@ import config
 from ergo.arb_runner import ArbResult, LegNotReady, leg1_landed, watch_leg2
 from ergo.chain_state import latest_box
 from tests.fake_node import FakeSession, Seq
-from tests.test_chain_scanner import Reader, scanner, snap  # noqa: F401  (fixture)
+from tests.test_chain_scanner import Reader, snap
 
 
 def run(coro):

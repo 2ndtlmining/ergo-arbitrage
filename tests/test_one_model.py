@@ -6,7 +6,7 @@ from arbitrage.scanner import ArbitrageScanner
 from arbitrage.sizing import Market, profit_nanoerg
 from tests.test_optimizer import discount_prices
 
-REDEEM = "Spectrum buy->Bank redeem"
+REDEEM = "ErgoDEX buy->Bank redeem"
 
 
 @pytest.fixture

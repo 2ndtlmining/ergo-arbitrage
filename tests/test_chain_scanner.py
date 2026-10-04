@@ -1,7 +1,6 @@
 """Scanner on node snapshots: prices, chain-unavailable gate (spec: chain watcher)."""
 import asyncio
 
-import pytest
 
 import arbitrage.scanner as scanner_module
 import config
@@ -10,7 +9,7 @@ from ergo.chain_state import ChainSnapshot
 from tests.test_bank_redeem_tx import BANK_BOX, ORACLE_BOX
 from tests.test_chain_arb import pool_box
 
-KEY = "Spectrum buy->Bank redeem"
+KEY = "ErgoDEX buy->Bank redeem"
 HEALTHY = {"reachable": True, "synced": True, "unlocked": True, "height": 1, "headers": 1, "ok_to_trade": True}
 WALLET = {"erg": 50.0, "sigusd": 0.0, "use": 0.0}
 
@@ -34,8 +33,7 @@ class Reader:
         return item
 
 
-@pytest.fixture
-def scanner(tmp_path, monkeypatch):
+def chain_scanner(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MAX_TRADE_SIZE_ERG", 1000.0)
     monkeypatch.setattr(config, "LIVE_STOP_FILE", str(tmp_path / "STOP"))
     s = ArbitrageScanner(mode="live", db_path=str(tmp_path / "t.db"))

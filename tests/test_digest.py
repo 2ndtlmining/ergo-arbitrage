@@ -18,7 +18,7 @@ def tracker(tmp_path):
 
 
 def ep(label="pool→redeem", peak_erg=1.5, peak_pct=3.5, last=0.3, trade=None):
-    return SimpleNamespace(key="Spectrum buy->Bank redeem", label=label, peak_erg=peak_erg, peak_percent=peak_pct,
+    return SimpleNamespace(key="ErgoDEX buy->Bank redeem", label=label, peak_erg=peak_erg, peak_percent=peak_pct,
                            peak_size_erg=45.0, profit_percent=last, trade=trade)
 
 

@@ -30,7 +30,7 @@ def test_erg_options_are_the_live_gates_best_size_at_the_wallet_cap(scanner):
     market = Market.from_pool_state(prices["spectrum_pool"], prices["bank"]["state"])
     cap = WALLET["erg"] - config.LIVE_ERG_RESERVE
     expected = best_size("redeem", market, cap)
-    redeem = options(analysis, "erg")["Spectrum buy -> Bank redeem"]
+    redeem = options(analysis, "erg")["ErgoDEX buy -> Bank redeem"]
     assert expected.ok and redeem["profit_pct"] == pytest.approx(expected.profit_percent)
     assert f"{expected.size_erg:.2f} ERG" in redeem["profit_desc"] and not redeem["blocked"]
     assert redeem["steps"]                                   # the same steps the Paths panel shows
@@ -41,7 +41,7 @@ def test_a_blocked_mint_is_reported_as_blocked(scanner):
     prices = discount_prices(pool_erg=2_000)
     low = BankState(1_006_250 * 10**9, 10_000_000, 3_125_000_000)          # RR 322%: mint not allowed
     prices["bank"] = dict(prices["bank"], state=low, reserve_ratio=low.reserve_ratio, can_mint_sigusd=False)
-    mint = options(scanner._build_wallet_analysis(WALLET, prices), "erg")["Bank mint -> Spectrum sell"]
+    mint = options(scanner._build_wallet_analysis(WALLET, prices), "erg")["Bank mint -> ErgoDEX sell"]
     assert mint["blocked"] and "blocked" in mint["blocked_reason"].lower()
 
 
@@ -62,14 +62,14 @@ def test_sigusd_options_are_contract_exact(scanner):
     redeem_erg = scanner._bank_redeem_erg(prices["bank"]["state"], 10.0)[1] - config.SIGMAUSD_REDEEM_EXTRA_ERG
     pool_erg = scanner._dex_sigusd_to_erg(prices, 10.0) - config.pool_service_fee() - config.ERGO_TX_FEE
     assert sig["Bank redeem"]["result"] == f"{redeem_erg:.2f} ERG in wallet"
-    assert sig["Spectrum swap"]["result"] == f"{pool_erg:.2f} ERG in wallet"
+    assert sig["ErgoDEX pool swap"]["result"] == f"{pool_erg:.2f} ERG in wallet"
 
 
 def test_the_discord_wallet_embed_still_reads_it(scanner):
     prices = dict(discount_prices(pool_erg=2_000), cex=dict(QUOTES))
     e = embeds.wallet_embed(WALLET, scanner._build_wallet_analysis(dict(WALLET, sigusd=10.0), prices))
     text = " ".join(f["value"] for f in e.get("fields", []))
-    assert e["title"] == "Wallet" and "Spectrum buy -> Bank redeem" in text
+    assert e["title"] == "Wallet" and "ErgoDEX buy -> Bank redeem" in text
 
 
 def test_a_small_wallet_has_no_erg_arbitrage_options(scanner):

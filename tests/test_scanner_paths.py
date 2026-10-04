@@ -48,13 +48,13 @@ class TestBankPaths:
         state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
         assert state.reserve_ratio > 800
         opps = scanner._find_opportunities(make_prices(state, 0.31))
-        redeem = by_path(opps, "Spectrum buy->Bank redeem")
+        redeem = by_path(opps, "ErgoDEX buy->Bank redeem")
         assert redeem and not any(o.blocked for o in redeem)
 
     def test_redeem_leg_uses_contract_quote(self, scanner):
         state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
         opps = scanner._find_opportunities(make_prices(state, 0.31))
-        opp = next(o for o in by_path(opps, "Spectrum buy->Bank redeem") if o.input_erg == 10)
+        opp = next(o for o in by_path(opps, "ErgoDEX buy->Bank redeem") if o.input_erg == 10)
         cents = opp.details["sigusd_cents"]
         assert cents > 0
         assert opp.details["bank_erg"] == pytest.approx(quote_redeem_sigusd(state, cents) / 1e9)
@@ -65,7 +65,7 @@ class TestBankPaths:
         prices = make_prices(state, 0.95)
         prices["bank"]["can_mint_sigusd"] = True
         opps = scanner._find_opportunities(prices)
-        mint_100 = next(o for o in by_path(opps, "Bank mint->Spectrum sell") if o.input_erg == 100)
+        mint_100 = next(o for o in by_path(opps, "Bank mint->ErgoDEX sell") if o.input_erg == 100)
         assert mint_100.blocked
         assert "400%" in mint_100.blocked_reason
 
@@ -84,8 +84,8 @@ class TestWalletAnalysis:
         from tests.test_optimizer import discount_prices
         analysis = scanner._build_wallet_analysis({"erg": 50, "sigusd": 0, "use": 0}, discount_prices(pool_erg=2_000))
         names = {o["name"]: o for o in analysis["erg"]["options"]}
-        assert not names["Bank mint -> Spectrum sell"]["blocked"]
-        assert not names["Spectrum buy -> Bank redeem"]["blocked"]
+        assert not names["Bank mint -> ErgoDEX sell"]["blocked"]
+        assert not names["ErgoDEX buy -> Bank redeem"]["blocked"]
 
 
 class TestPoolLegs:
@@ -100,7 +100,7 @@ class TestPoolLegs:
         prices = make_prices(state, pool.price_x_in_y)
         prices["spectrum_pool"] = pool
         opps = scanner._find_opportunities(prices)
-        opp = next(o for o in by_path(opps, "Spectrum buy->Bank redeem") if o.input_erg == 100)
+        opp = next(o for o in by_path(opps, "ErgoDEX buy->Bank redeem") if o.input_erg == 100)
         assert opp.details["sigusd_cents"] == int(pool.swap_output(100, input_is_x=True) * 100)
 
     def test_thin_pool_makes_large_size_worse(self, scanner):
@@ -108,7 +108,7 @@ class TestPoolLegs:
         pool = self._pool(1_000, 330)
         prices = make_prices(state, pool.price_x_in_y)
         prices["spectrum_pool"] = pool
-        opps = {o.input_erg: o for o in by_path(scanner._find_opportunities(prices), "Spectrum buy->Bank redeem")}
+        opps = {o.input_erg: o for o in by_path(scanner._find_opportunities(prices), "ErgoDEX buy->Bank redeem")}
         assert opps[100].profit_percent < opps[25].profit_percent
 
 
@@ -211,14 +211,14 @@ class TestPoolRouteCosts:
         return next(o for o in by_path(opps, path) if o.input_erg == size)
 
     def test_direct_route_has_no_service_fee(self, scanner):
-        opp = self._opp(scanner, "Spectrum buy->Bank redeem")
+        opp = self._opp(scanner, "ErgoDEX buy->Bank redeem")
         assert opp.fees.execution_fee_erg == 0
         assert not any("service fee" in s and "no service fee" not in s for s in opp.steps)
 
     def test_crux_route_charges_service_fee(self, scanner, monkeypatch):
-        direct = self._opp(scanner, "Spectrum buy->Bank redeem")
+        direct = self._opp(scanner, "ErgoDEX buy->Bank redeem")
         monkeypatch.setattr(config, "POOL_SWAP_ROUTE", "crux")
-        crux = self._opp(scanner, "Spectrum buy->Bank redeem")
+        crux = self._opp(scanner, "ErgoDEX buy->Bank redeem")
         assert crux.fees.execution_fee_erg == pytest.approx(config.SPECTRUM_EXECUTION_FEE)
         assert direct.output_erg - crux.output_erg == pytest.approx(config.SPECTRUM_EXECUTION_FEE, rel=0.01)
 
@@ -227,7 +227,7 @@ class TestPoolRouteCosts:
 
         def swap_result():
             a = scanner._build_wallet_analysis({"erg": 0, "sigusd": 10, "use": 0}, make_prices(state, 0.31))
-            return float(next(o for o in a["sigusd"]["options"] if o["name"] == "Spectrum swap")["result"].split()[0])
+            return float(next(o for o in a["sigusd"]["options"] if o["name"] == "ErgoDEX pool swap")["result"].split()[0])
 
         direct = swap_result()
         monkeypatch.setattr(config, "POOL_SWAP_ROUTE", "crux")
@@ -261,18 +261,18 @@ class TestExplanations:
 
     def test_mint_path_explains_shortfall(self, scanner):
         prices, opps = self._setup(scanner, premium=0.02)
-        text = scanner._explain(self._best(opps, "Bank mint->Spectrum sell"), prices)
+        text = scanner._explain(self._best(opps, "Bank mint->ErgoDEX sell"), prices)
         assert "+2.00%" in text          # SigUSD premium on the pool
         assert "short by" in text
 
     def test_redeem_path_needs_discount(self, scanner):
         prices, opps = self._setup(scanner, premium=0.02)
-        text = scanner._explain(self._best(opps, "Spectrum buy->Bank redeem"), prices)
+        text = scanner._explain(self._best(opps, "ErgoDEX buy->Bank redeem"), prices)
         assert "discount" in text and "short by" in text
 
     def test_profitable_path_says_so(self, scanner):
         prices, opps = self._setup(scanner, premium=0.06)
-        best = self._best(opps, "Bank mint->Spectrum sell")
+        best = self._best(opps, "Bank mint->ErgoDEX sell")
         assert best.profit_percent > config.MIN_PROFIT_PERCENT
         assert "clears" in scanner._explain(best, prices)
 
@@ -281,7 +281,7 @@ class TestExplanations:
         prices, opps = self._setup(scanner, premium=0.02)
         with console.capture() as cap:
             scanner._display_opportunities(opps, prices)
-        assert "WHY Bank mint->Spectrum sell" in cap.get()
+        assert "WHY Bank mint->ErgoDEX sell" in cap.get()
 
 
 class TestCexPaths:
@@ -309,7 +309,7 @@ class TestCexPaths:
         from arbitrage.calculator import WATCH_ONLY_REASON
         state = BankState(bank_erg_nano=3_000_000 * 10**9, sigusd_circ_cents=10_000_000, oracle_r4=ORACLE_R4)
         opps = cex_scanner._find_opportunities(self.prices(state))
-        cex = [o for o in opps if any(n in o.path for n in ("<>Spectrum", "<>Bank"))]
+        cex = [o for o in opps if any(n in o.path for n in ("<>ErgoDEX", "<>Bank"))]
         assert len(cex) == 4 * len(cex_scanner._trade_sizes)
         assert all(o.blocked and WATCH_ONLY_REASON in o.blocked_reason for o in cex)
         assert not any("SigUSD=USDT" in o.assumption for o in opps)
