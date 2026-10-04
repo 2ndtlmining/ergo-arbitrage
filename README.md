@@ -576,6 +576,7 @@ sudo systemctl enable --now ergo-arb
 kills the bot while it follows leg 2 of a live trade.
 
 ```bash
+.venv/bin/python arb.py status        # the bot's view: running, last scan, open opportunities, trades, pause
 systemctl status ergo-arb             # running? since when?
 tail -f ~/ergo-arbitrage/arbitrage.log
 journalctl -u ergo-arb -n 50          # start-up errors and crashes
@@ -846,6 +847,7 @@ python arb.py doctor                                    # is the node ready for 
 python arb.py config                                    # settings in use and mistakes in .env
 python arb.py backup                                    # consistent copy of the database (see Backups)
 python arb.py resume                                    # clear a live-mode pause (then restart the bot)
+python arb.py status                                    # is the bot running and is everything OK? (no node needed)
 ```
 
 **`arb.py doctor`** first warns about `.env` mistakes and checks the Discord webhook (a GET that shows
