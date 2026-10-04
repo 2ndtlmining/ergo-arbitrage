@@ -7,10 +7,8 @@ box itself, so quotes match what the contract will accept.
 import logging
 from typing import Optional
 
-import aiohttp
-
 import config
-from exchanges.base import DEXBase, PriceQuote, PoolState
+from exchanges.base import PoolState
 
 logger = logging.getLogger("ergo_arb.spectrum")
 
@@ -48,59 +46,3 @@ def parse_n2t_pool_box(box: dict, token_id: str, decimals_y: int, symbol_y: str 
         fee_num=fee_num,
         fee_denom=FEE_DENOM,
     )
-
-
-class SpectrumDEX(DEXBase):
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.pool: Optional[PoolState] = None
-
-    async def connect(self):
-        self.session = aiohttp.ClientSession()
-        logger.info("[exchange]ErgoDEX pool[/exchange] connected")
-
-    async def disconnect(self):
-        if self.session:
-            await self.session.close()
-            self.session = None
-        logger.info("ErgoDEX pool disconnected")
-
-    async def get_pool_state(self, pair: str = "ERG/SigUSD") -> Optional[PoolState]:
-        """Read the ERG/SigUSD pool box from the explorer."""
-        if not self.session:
-            return None
-        url = f"{config.ERGO_EXPLORER_API_URL}/boxes/unspent/byTokenId/{config.SPECTRUM_SIGUSD_POOL_NFT}?limit=1"
-        try:
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Pool box query returned {resp.status}")
-                    return None
-                data = await resp.json()
-            items = data.get("items", []) if isinstance(data, dict) else data
-            if not items:
-                logger.warning("ERG/SigUSD pool box not found")
-                return None
-            self.pool = parse_n2t_pool_box(items[0], config.SIGUSD_TOKEN_ID, config.SIGUSD_DECIMALS)
-            return self.pool
-        except Exception as e:
-            logger.error(f"Pool box fetch error: {e}")
-            return None
-
-    async def get_price(self, pair: str = "ERG/SigUSD") -> Optional[PriceQuote]:
-        pool = await self.get_pool_state(pair)
-        if not pool:
-            return None
-        price = pool.price_x_in_y
-        return PriceQuote(
-            exchange=f"ErgoDEX ({pool.pool_id[:8]}...)",
-            pair=pair,
-            bid=price,
-            ask=price,
-            bid_volume=pool.reserve_x,
-            ask_volume=pool.reserve_y,
-        )
-
-    async def get_erg_sigusd_price(self) -> Optional[float]:
-        """Spot SigUSD per ERG from the pool reserves."""
-        pool = await self.get_pool_state()
-        return pool.price_x_in_y if pool else None

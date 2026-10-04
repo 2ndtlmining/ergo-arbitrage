@@ -40,16 +40,6 @@ def setting(name: str, default=""):
 ERGO_NODE_URL = setting("ERGO_NODE_URL", "http://127.0.0.1:9053")
 ERGO_NODE_API_KEY = setting("ERGO_NODE_API_KEY", "")
 
-# NonKYC Exchange
-NONKYC_API_KEY = setting("NONKYC_API_KEY", "")
-NONKYC_API_SECRET = setting("NONKYC_API_SECRET", "")
-NONKYC_BASE_URL = "https://api.nonkyc.io/api/v2"
-
-# Kucoin Exchange (future)
-KUCOIN_API_KEY = setting("KUCOIN_API_KEY", "")
-KUCOIN_API_SECRET = setting("KUCOIN_API_SECRET", "")
-KUCOIN_API_PASSPHRASE = setting("KUCOIN_API_PASSPHRASE", "")
-
 # Ergo explorer (public API)
 ERGO_EXPLORER_API_URL = setting("ERGO_EXPLORER_API_URL", "https://api.ergoplatform.com/api/v1")
 

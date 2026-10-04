@@ -3,7 +3,15 @@ import time
 from datetime import datetime, timedelta
 
 from arbitrage.venues import VENUES, VenueContext, describe_all
-from exchanges.base import PoolState, PriceQuote
+from types import SimpleNamespace
+
+from exchanges.base import PoolState
+
+
+def PriceQuote(exchange, pair, bid, ask, timestamp=None):
+    """Stand-in for a CEX quote (the scanner only reads bid, ask and timestamp)."""
+    return SimpleNamespace(exchange=exchange, pair=pair, bid=bid, ask=ask, timestamp=timestamp or datetime.now())
+
 
 POOL = PoolState(exchange="t", pool_id="p", token_x="ERG", token_y="SigUSD", reserve_x=20_114, reserve_y=6_290,
                  fee_num=995, fee_denom=1000)

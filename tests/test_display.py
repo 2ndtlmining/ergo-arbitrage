@@ -64,14 +64,8 @@ class TestWalletMessage:
 
 
 class TestShutdown:
-    def test_cex_not_disconnected_when_disabled(self, tmp_path, monkeypatch):
-        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_cex=False)
-        called = []
-
-        async def fake_disconnect():
-            called.append("cex")
-
-        monkeypatch.setattr(s.nonkyc, "disconnect", fake_disconnect)
-        monkeypatch.setattr(s.kucoin, "disconnect", fake_disconnect)
+    def test_no_exchange_adapter_sessions(self, tmp_path):
+        """#77: CEX books come from exchanges/cex_public.py on one shared session; no idle per-exchange sessions."""
+        s = ArbitrageScanner(db_path=str(tmp_path / "t.db"), enable_cex=True)
+        assert not any(hasattr(s, name) for name in ("nonkyc", "kucoin", "spectrum", "sigmausd"))
         asyncio.run(s.disconnect_all())
-        assert called == []

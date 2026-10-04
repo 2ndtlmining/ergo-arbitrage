@@ -684,14 +684,12 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 
 | Setting | Default | Effect |
 |---|---|---|
-| `ENABLE_CEX` | `false` | Price the CEX paths with your exchange API keys (they never auto-trade). |
+| `ENABLE_CEX` | `false` | Price the CEX paths from the public order books (they never trade; no API keys are used). |
 | `ENABLE_USE` | `false` | Price the USE (Dexy) paths. Off: the USE LP was drained. |
 | `POOL_SWAP_ROUTE` | `direct` | SigUSD pool legs: `direct` (own pool swap, miner fee only) or `crux` (Crux API, ~0.785 ERG per leg). |
 | `USE_TOKEN_ID` | current USE token | Set after the expected USE token migration. |
 | `DEXY_USE_LP_NFT` | current USE LP | Set after the expected USE token migration. |
 | `EXTRA_SERVICE_FEE_ERGO_TREES` | (none) | Extra service-fee ErgoTrees (comma separated) the transaction guard lets a third-party-built TX pay. |
-| `NONKYC_API_KEY`, `NONKYC_API_SECRET` | (none) | NonKYC keys, only read with `ENABLE_CEX=true`. |
-| `KUCOIN_API_KEY`, `KUCOIN_API_SECRET`, `KUCOIN_API_PASSPHRASE` | (none) | Kucoin keys, only read with `ENABLE_CEX=true`. |
 
 **Sizing and profit**
 
@@ -816,7 +814,7 @@ ergo_arbitrage/
 │   ├── sigmausd_tx.py      # bank mint / redeem transactions
 │   ├── tx_guard.py         # refuses any transaction that pays someone unexpected
 │   └── signing.py, wallet.py, chain.py, codec.py, amounts.py, actions.py, progress.py
-├── exchanges/              # price sources: ergo_node, spectrum, sigmausd, dexy, crux, kucoin, nonkyc
+├── exchanges/              # node client, pool/bank math (spectrum, sigmausd), dexy, cex_public (exchange books)
 ├── notifications/
 │   ├── discord.py          # webhook client, background send queue
 │   ├── embeds.py           # Discord embed layouts
