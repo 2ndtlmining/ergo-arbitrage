@@ -42,7 +42,7 @@ python main.py --live     # + auto-execute (see "Live mode" below)
 | | monitor (default) | `--notify` | `--live` |
 |---|---|---|---|
 | Dashboard, chain watcher (pool, bank, oracle every 2 s), SQLite log | ✓ | ✓ | ✓ |
-| Discord: opportunities, health alerts, daily digest | | ✓ | ✓ |
+| Discord: opportunities, health alerts, digest 3 times a day | | ✓ | ✓ |
 | **Signs and sends transactions from your node wallet** | | | ✓ |
 
 `--notify` is the safe way to run the bot all the time: it watches and tells you, and never spends
@@ -243,10 +243,8 @@ webhook in the channel settings and create a new one.
 | **Bank mint OPEN · RR 412%** (green) | at most once per `MINT_GATE_PING_COOLDOWN_SECONDS` | The SigmaUSD bank lets you mint again, with the room in ERG. | A mint -> pool sell path may open; watch for an OPEN message. |
 | **Bank mint closed · open for 3h** (grey) | | The same message once minting has stayed shut for `MINT_GATE_CLOSE_SECONDS`. | Nothing. |
 | **Bank mint · bot stopped** (grey) | | The bot stopped while minting was open, so it no longer knows. | Nothing; the next start reports the gate again. |
-| **Daily digest · last 24h** (blue) | | Once a day at `DISCORD_DIGEST_HOUR`: episodes per path, potential ERG, trades, outages, wallet. | Read it; it is the quickest way to see if the bot is earning anything. |
-| **Wallet** (blue) | | Wallet balances and value, every `DISCORD_WALLET_COOLDOWN_SECONDS`. | Nothing. |
+| **Digest · last 6h** (blue) | | At `DISCORD_DIGEST_HOURS` (default 08:00, 14:00, 20:00): episodes per path, potential ERG, trades, outages and the wallet since the previous digest. The only scheduled message. | Read it; it is the quickest way to see if the bot is earning anything. |
 | **CEX watch-only: CEX** | | An exchange is far from the pool price, or the cross-exchange spread pays after every fee. At most once per `CEX_WATCH_COOLDOWN_SECONDS`. | Informational: no CEX is connected, nothing can trade it. |
-| **Scan #123 - 12:00:00 \| 0 profitable paths** | | The text summary of all paths, every `DISCORD_SUMMARY_INTERVAL_SECONDS`. | Nothing. |
 | **Arbitrage Opportunity Found** | at or above `DISCORD_TIER1_PROFIT_PERCENT` | Scan-based alert for the CEX/USE paths (both off by default). | See the path text; these paths are not traded automatically. |
 
 ### How the on-chain alerts work
@@ -263,8 +261,8 @@ The on-chain paths (pool ↔ bank) use the same exact sizing as the dashboard an
     day's trade cap reached, the STOP file holding trades for `DISCORD_HEALTH_LIVE_SECONDS`
   - the full scan failing, or database writes failing, for 2 min or more
   - a failure that continues is re-alerted every 30 min
-- **Daily digest** at `DISCORD_DIGEST_HOUR` (local time), once a day, also after a restart. It shows the past 24 h: episodes per path, potential ERG, trades, outages and the wallet.
-- **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting has stayed closed for `MINT_GATE_CLOSE_SECONDS`, so minting the room away and reopening a block later does not post a new pair of messages. If the bot stops while minting is open, the message is marked "bot stopped" (also after a crash, on the next start). The dashboard Bank line and the daily digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
+- **Digest** at `DISCORD_DIGEST_HOURS` (local time, default `8,14,20`), covering the time since the previous one: episodes per path, potential ERG, trades, outages and the wallet. A digest missed while the bot was down is sent when it comes back. Nothing else is posted on a schedule: about 3 messages a day when nothing happens, and an opportunity or a failure is posted at once.
+- **Bank mint gate.** When the SigmaUSD bank lets you mint again (reserve ratio above 400% with room for at least `MINT_GATE_MIN_ROOM_ERG`), one message is posted (ping at most once an hour) and edited when minting has stayed closed for `MINT_GATE_CLOSE_SECONDS`, so minting the room away and reopening a block later does not post a new pair of messages. If the bot stops while minting is open, the message is marked "bot stopped" (also after a crash, on the next start). The dashboard Bank line and the digest show the room, or the ERG price at which minting would open (e.g. `mint ✗ needs ERG $0.392 (+21.7%)`). A change needs `MINT_GATE_CONFIRM_POLLS` agreeing polls in a row; after a restart an open gate is reported again.
 - Discord is sent from a background queue (bounded, with HTTP 429 retry), so a slow or unreachable Discord never delays the 2 s chain poll.
 
 ```env
@@ -279,7 +277,7 @@ DISCORD_HEALTH_VENUE_SECONDS=300       # CEX venue down -> alert
 DISCORD_HEALTH_ORACLE_SECONDS=600      # Oracle update pending -> alert
 DISCORD_HEALTH_REPEAT_SECONDS=1800     # Re-alert interval while still failing
 DISCORD_HEALTH_LIVE_SECONDS=600        # STOP file holding --live this long -> alert
-DISCORD_DIGEST_HOUR=8                  # Local hour for the daily digest, -1 = off
+DISCORD_DIGEST_HOURS=8,14,20           # Local hours of the digest, off = none
 MINT_GATE_CONFIRM_POLLS=3              # Agreeing polls before a mint open/close alert
 MINT_GATE_MIN_ROOM_ERG=1               # Smaller mint room counts as closed (default MIN_TRADE_SIZE_ERG)
 MINT_GATE_PING_COOLDOWN_SECONDS=3600   # At most one mint-open ping per this
@@ -299,8 +297,6 @@ The CEX and USE paths (both off by default) still use the older scan flow:
 ```env
 DISCORD_CONFIRM_SCANS=3                # Scans in a row before posting (CEX/USE paths)
 DISCORD_COOLDOWN_SECONDS=300           # Per-path cooldown (CEX/USE paths)
-DISCORD_WALLET_COOLDOWN_SECONDS=600    # Wallet message interval
-DISCORD_SUMMARY_INTERVAL_SECONDS=1800  # Text summary interval
 PRICE_STALE_SECONDS=60                 # Max price age before skipping
 ```
 
@@ -744,11 +740,9 @@ lists every setting with its value and source. Times are in seconds, amounts in 
 | `DISCORD_HEALTH_ORACLE_SECONDS` | `600` | Oracle update pending this long: alert. |
 | `DISCORD_HEALTH_REPEAT_SECONDS` | `1800` | A failure that continues is re-alerted this often. |
 | `DISCORD_HEALTH_LIVE_SECONDS` | `600` | The STOP file holding `--live` this long: alert. |
-| `DISCORD_DIGEST_HOUR` | `8` | Local hour of the daily digest; `-1` = off. |
+| `DISCORD_DIGEST_HOURS` | `8,14,20` | Local hours of the digest (each covers the time since the previous one); `off` = none. |
 | `DISCORD_CONFIRM_SCANS` | `3` | Scan-based alerts (CEX/USE paths): scans in a row before posting. |
 | `DISCORD_COOLDOWN_SECONDS` | `300` | Scan-based alerts: per-path cooldown. |
-| `DISCORD_WALLET_COOLDOWN_SECONDS` | `600` | Wallet analysis at most this often. |
-| `DISCORD_SUMMARY_INTERVAL_SECONDS` | `1800` | The text summary of all paths. |
 
 **Bank mint gate**
 
@@ -766,7 +760,7 @@ the exchanges and are not settings.
 |---|---|---|
 | `CEX_WATCH` | `true` | Read public exchange prices (no keys); never trades. |
 | `CEX_WATCH_ALERT_PERCENT` | `3.0` | Gap to the pool that posts a watch message. |
-| `CEX_WATCH_COOLDOWN_SECONDS` | `3600` | At most one watch message per this. |
+| `CEX_WATCH_COOLDOWN_SECONDS` | `21600` | At most one watch message per this (6 h). |
 | `GATE_TRADING_FEE` | `0.002` | Fallback until Gate's taker fee is read. |
 | `GATE_ERG_WITHDRAW_FEE` | `0.403` | Gate's ERG withdrawal fee (not public; check on Gate). |
 | `MEXC_TRADING_FEE` | `0.0008` | Fallback until MEXC's taker fee is read. |
@@ -824,7 +818,7 @@ ergo-arbitrage/
 │   ├── embeds.py           # Discord embed layouts
 │   ├── episodes.py         # one message per on-chain opportunity
 │   ├── health.py           # health alerts and recoveries
-│   └── digest.py           # daily digest
+│   └── digest.py           # the digest (3 times a day by default)
 ├── tracker/
 │   └── profit_tracker.py   # SQLite: snapshots, opportunities, episodes, trades, stats
 ├── tests/                  # pytest (unit by default; -m live for node/API tests)
@@ -986,7 +980,7 @@ All data is stored in `arbitrage_tracker.db` (SQLite):
 - **daily_summary** - Aggregated daily stats
 - **opportunity_episodes** - Continuous runs of a profitable path, from the 15 s full scans
 - **chain_episodes** - The on-chain opportunities sent to Discord (opened, closed, peak, trade)
-- **meta** - Small key/value state, e.g. the date the last daily digest was sent, the live pause
+- **meta** - Small key/value state, e.g. the last digest sent, the live pause
 
 Once a day (and at start) rows older than `SCAN_RESULTS_RETENTION_DAYS` are pruned and the WAL file is
 checkpointed, so a bot that runs for months stays small; freed space is reused. Profitable rows,
@@ -1034,7 +1028,7 @@ tested on mainnet and its fees.
   (is the node ready?), `config` (settings in use, mistakes in `.env`) and `backup`
 - One-screen dashboard with health strip, Exchanges and History panels and the mint-gate / reserve-ratio
   trend, plus `--plain` and `--json` views
-- Discord: one message per opportunity, health alerts, bank mint gate alert, daily digest, wallet analysis
+- Discord: one message per opportunity, health alerts, bank mint gate alert, a digest 3 times a day
 - CEX prices (Kucoin, NonKYC, Gate, MEXC; SafeTrade opt-in), watch-only, with live fees and the
   cross-exchange spread after fees; fetched in the background so they never slow the chain poll
 - SQLite tracking of prices, opportunities, episodes and trades

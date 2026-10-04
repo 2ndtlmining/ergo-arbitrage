@@ -1,6 +1,6 @@
 """chain_episodes storage and the daily digest (spec: discord episodes)."""
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -77,20 +77,37 @@ def test_digest_with_episodes_trades_and_outages(tracker):
     assert ("chain", 250.0, False) in d.outages
 
 
-def test_digest_due_once_per_day_and_survives_restart(tmp_path):
+HOURS = [8, 14, 20]
+
+
+def test_digest_three_times_a_day_and_after_a_restart(tmp_path):
     t = ProfitTracker(str(tmp_path / "d.db"))
-    morning = datetime(2026, 10, 2, 7, 59)
-    nine = datetime(2026, 10, 2, 9, 0)
-    assert not digest_due(t, morning, 8) and digest_due(t, nine, 8)
-    mark_digest_sent(t, nine)
+    assert digest_due(t, datetime(2026, 10, 2, 9), HOURS) is None          # first run: the schedule starts
+    assert digest_due(t, datetime(2026, 10, 2, 13, 59), HOURS) is None
+    slot = digest_due(t, datetime(2026, 10, 2, 14, 1), HOURS)
+    assert slot == datetime(2026, 10, 2, 14)
+    mark_digest_sent(t, slot)
     t.close()
     t2 = ProfitTracker(str(tmp_path / "d.db"))
     try:
-        assert not digest_due(t2, nine + timedelta(hours=3), 8)
-        assert digest_due(t2, nine + timedelta(days=1), 8)
-        assert not digest_due(t2, nine + timedelta(days=1), -1)
+        assert digest_due(t2, datetime(2026, 10, 2, 19, 59), HOURS) is None
+        assert digest_due(t2, datetime(2026, 10, 3, 7), HOURS) == datetime(2026, 10, 2, 20)   # missed while down
+        assert digest_due(t2, datetime(2026, 10, 3, 7), []) is None                            # digest off
     finally:
         t2.close()
+
+
+def test_each_digest_covers_the_time_since_the_previous_one():
+    from notifications.digest import digest_period_hours
+    assert digest_period_hours(datetime(2026, 10, 2, 8), HOURS) == 12
+    assert digest_period_hours(datetime(2026, 10, 2, 14), HOURS) == 6
+    assert digest_period_hours(datetime(2026, 10, 2, 8), [8]) == 24
+
+
+def test_digest_hours_setting():
+    import config
+    assert config.parse_hours("20, 8,14") == [8, 14, 20]
+    assert config.parse_hours("off") == [] and config.parse_hours("-1") == [] and config.parse_hours("") == []
 
 
 def test_digest_without_a_health_monitor(tracker):

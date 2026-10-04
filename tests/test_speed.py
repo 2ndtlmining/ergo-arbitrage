@@ -52,11 +52,8 @@ def scan(tmp_path, monkeypatch):
         monkeypatch.setattr(s, "_build_wallet_analysis", analysis)
         monkeypatch.setattr(config, "DISCORD_ENABLED", discord)
         if discord:
-            monkeypatch.setattr(s.discord, "send_wallet_analysis", nothing)
-            monkeypatch.setattr(s.discord, "send_scan_summary", nothing)
             monkeypatch.setattr(s, "_notify_discord", nothing)
             monkeypatch.setattr(s, "_notify_cex_watch", nothing)
-            monkeypatch.setattr(s, "_should_send_wallet_analysis", lambda opps: True)
         return s, calls
 
     yield make
@@ -76,16 +73,12 @@ def test_plain_view_still_prints_them(scan):
     assert calls["display"] >= 2 and calls["analysis"] == 1
 
 
-def test_wallet_analysis_is_built_once_for_plain_and_discord(scan):
-    s, calls = scan("plain", discord=True)
-    run(s.scan_once())
-    assert calls["analysis"] == 1
 
-
-def test_dashboard_with_discord_builds_it_only_for_discord(scan):
+def test_discord_needs_no_wallet_analysis(scan):
+    """#72: the wallet goes to Discord in the digest, so the dashboard view never builds the analysis."""
     s, calls = scan("dashboard", discord=True)
     run(s.scan_once())
-    assert calls == {"display": 0, "analysis": 1}
+    assert calls == {"display": 0, "analysis": 0}
 
 
 def test_dashboard_refreshes_once_a_second():

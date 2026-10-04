@@ -58,16 +58,6 @@ def test_health_embed_colours():
     assert ok["title"].startswith("✅") and alert["title"].startswith("⚠️")
 
 
-def test_wallet_embed_survives_missing_keys():
-    wallet = {"erg": 20.7119, "sigusd": 0.0}
-    analysis = {"erg": {"balance": 20.7, "options": [{"name": "ErgoDEX buy -> Bank redeem", "profit_pct": 2.9,
-                                                      "blocked": False}]},
-                "sigusd": {"balance": 0.0}}
-    e = embeds.wallet_embed(wallet, analysis)
-    text = values(e)
-    assert "20.7119 ERG" in text and "ErgoDEX buy -> Bank redeem" in text and "+2.9%" in text
-    assert embeds.wallet_embed({}, {})["title"] == "Wallet"
-
 
 def test_digest_embed_with_nothing_happening():
     d = SimpleNamespace(hours=24, paths={}, potential_erg=0.0, trades={"count": 0, "net_erg": 0.0, "failed": 0},
@@ -91,11 +81,6 @@ def test_startup_and_shutdown():
     s = embeds.shutdown_embed({"session_duration": "1:02:03", "opportunities_seen": 4})
     assert "1:02:03" in values(s)
 
-
-def test_wallet_embed_survives_none_values():
-    analysis = {"erg": {"balance": None, "options": [{"name": "x", "profit_pct": None}]}}
-    e = embeds.wallet_embed({"erg": None, "sigusd": None, "use": None}, analysis)
-    assert e["title"] == "Wallet" and "0.0000 ERG" in values(e)
 
 
 def test_stale_episode_embed_after_a_restart():

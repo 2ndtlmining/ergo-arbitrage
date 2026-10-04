@@ -118,29 +118,31 @@ async def run_doctor(ns, sign: bool = True, log: Callable[[str], None] = print) 
     line("OK", "API key", "accepted")
     if not wallet.get("isInitialized"):
         line("FAIL", "wallet", "no wallet on this node", "restore your wallet on the node (mnemonic), then unlock it")
-        skip(*later[2:])
-        return 1
-    if not wallet.get("isUnlocked"):
+    elif not wallet.get("isUnlocked"):
         line("FAIL", "wallet", "locked", 'unlock it: POST /wallet/unlock with {"pass": "<wallet password>"}')
-        skip(*later[2:])
-        return 1
-    line("OK", "wallet", "initialised and unlocked")
+    else:
+        line("OK", "wallet", "initialised and unlocked")
 
-    # 5: wallet boxes
+    # 5: wallet boxes. The chain and mempool checks below run either way: they do not need the wallet.
     erg = 0.0
-    try:
-        boxes, _, _ = await wallet_context(ns)
-        erg = sum(int(b["value"]) for b in boxes) / 1e9
-        line("OK", "wallet boxes", f"{len(boxes)} boxes, {erg:.2f} ERG")
-        status, raw = await _get(ns, "/wallet/balances")
-        parsed = parse_wallet_balances(raw) if status == 200 else None
-        if parsed is None:
-            line("FAIL", "wallet balances", f"/wallet/balances answered HTTP {status} in a shape the bot does not "
-                                            f"know: {str(raw)[:60]}", "the dashboard, drawdown limit and live mode need it")
-        else:
-            line("OK", "wallet balances", f"{parsed['erg']:.2f} ERG, {len(parsed['tokens'])} token(s)")
-    except Exception as e:
-        line("FAIL", "wallet boxes", f"{e.__class__.__name__}: {e}"[:110], "the wallet may still be scanning after a restore")
+    if not (wallet.get("isInitialized") and wallet.get("isUnlocked")):
+        skip("wallet boxes")
+    else:
+        try:
+            boxes, _, _ = await wallet_context(ns)
+            erg = sum(int(b["value"]) for b in boxes) / 1e9
+            line("OK", "wallet boxes", f"{len(boxes)} boxes, {erg:.2f} ERG")
+            status, raw = await _get(ns, "/wallet/balances")
+            parsed = parse_wallet_balances(raw) if status == 200 else None
+            if parsed is None:
+                line("FAIL", "wallet balances", f"/wallet/balances answered HTTP {status} in a shape the bot does "
+                                                f"not know: {str(raw)[:60]}",
+                     "the dashboard, drawdown limit and live mode need it")
+            else:
+                line("OK", "wallet balances", f"{parsed['erg']:.2f} ERG, {len(parsed['tokens'])} token(s)")
+        except Exception as e:
+            line("FAIL", "wallet boxes", f"{e.__class__.__name__}: {e}"[:110],
+                 "the wallet may still be scanning after a restore")
 
     # 6: chain state through the extra index
     try:

@@ -1,5 +1,6 @@
 """Scanner -> Discord: one message per episode, health alerts, legacy flow only for CEX/USE (spec)."""
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -122,7 +123,6 @@ def test_poll_does_not_wait_for_a_hanging_discord(notify, monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(notify.discord, "_send", hanging_send)
-    notify._last_summary_time = 0.0  # the 30 min text summary is due on this full scan
     monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
     run(asyncio.wait_for(notify.poll_once(0), 5))
 
@@ -291,7 +291,7 @@ def test_open_episodes_get_a_heartbeat(notify, monkeypatch):
 
 def test_digest_during_a_chain_outage_has_no_stale_mint_line(notify, monkeypatch):
     got = []
-    monkeypatch.setattr(scanner_module, "digest_due", lambda *a: True)
+    monkeypatch.setattr(scanner_module, "digest_due", lambda *a: datetime(2026, 10, 2, 14))
     monkeypatch.setattr(scanner_module, "build_digest",
                         lambda *a, **k: got.append(k.get("bank")) or SimpleNamespace(
                             hours=24, paths={}, potential_erg=0.0, trades={"count": 0, "net_erg": 0.0, "failed": 0},
@@ -311,18 +311,19 @@ def test_digest_is_marked_sent_only_once_delivered(notify, monkeypatch):
     undelivered = []
     monkeypatch.setattr(notify.discord, "post", lambda embed, content="", on_id=None: undelivered.append(
         (embed, on_id)))
-    monkeypatch.setattr(scanner_module, "digest_due", lambda tracker, now, hour: tracker.get_meta("digest_date") is None)
+    monkeypatch.setattr(scanner_module, "digest_due", lambda tracker, now, hours: None if tracker.get_meta("digest_slot")
+                        else datetime(2026, 10, 2, 14))
     monkeypatch.setattr(scanner_module, "read_snapshot", Reader(snap()))
     run(notify.poll_once(0))
     run(notify.poll_once(20))                                  # still in flight: not queued twice
-    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Daily digest")]
-    assert len(digests) == 1 and notify.tracker.get_meta("digest_date") is None
+    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Digest")]
+    assert len(digests) == 1 and notify.tracker.get_meta("digest_slot") is None
     notify._digest_queued_at -= 601                            # the post never came back
     run(notify.poll_once(40))
-    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Daily digest")]
+    digests = [(e, cb) for e, cb in undelivered if e["title"].startswith("Digest")]
     assert len(digests) == 2
     digests[-1][1]("m9")                                       # Discord returned the message id
-    assert notify.tracker.get_meta("digest_date") is not None
+    assert notify.tracker.get_meta("digest_slot") is not None
 
 
 def test_once_runs_leave_other_processes_messages_alone(notify, monkeypatch):

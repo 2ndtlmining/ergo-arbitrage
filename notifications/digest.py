@@ -1,4 +1,5 @@
-"""Daily Discord digest: episodes, trades and outages over the last 24 h (once per day)."""
+"""Discord digest at DISCORD_DIGEST_HOURS (default 8, 14, 20): episodes, trades, outages and the wallet
+since the previous digest. The only scheduled message; opportunities and alerts are posted when they happen."""
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -7,7 +8,7 @@ from typing import Optional
 import config
 from notifications.mint_gate import mint_gate_text
 
-DIGEST_KEY = "digest_date"
+DIGEST_KEY = "digest_slot"   # the last slot sent, e.g. "2026-10-05T14"
 
 
 @dataclass
@@ -47,9 +48,42 @@ def build_digest(tracker, health, wallet: Optional[dict], now: datetime, hours: 
     return d
 
 
-def digest_due(tracker, now: datetime, hour: int) -> bool:
-    return hour >= 0 and now.hour >= hour and tracker.get_meta(DIGEST_KEY) != now.date().isoformat()
+def _hours(hours) -> list[int]:
+    if isinstance(hours, int):
+        return [hours] if 0 <= hours <= 23 else []
+    return sorted(set(hours))
 
 
-def mark_digest_sent(tracker, now: datetime):
-    tracker.set_meta(DIGEST_KEY, now.date().isoformat())
+def digest_slot(now: datetime, hours) -> Optional[datetime]:
+    """The latest scheduled digest time at or before `now` (today's, else yesterday's last), or None."""
+    hours = _hours(hours)
+    if not hours:
+        return None
+    today = [h for h in hours if h <= now.hour]
+    day = now.replace(minute=0, second=0, microsecond=0)
+    return day.replace(hour=today[-1]) if today else (day - timedelta(days=1)).replace(hour=hours[-1])
+
+
+def digest_period_hours(slot: datetime, hours) -> int:
+    """Hours since the previous scheduled digest (24 with one digest a day)."""
+    hours = _hours(hours)
+    earlier = [h for h in hours if h < slot.hour]
+    previous = earlier[-1] if earlier else hours[-1] - 24
+    return slot.hour - previous
+
+
+def digest_due(tracker, now: datetime, hours) -> Optional[datetime]:
+    """The slot to send now, or None (sent already, or no digest configured). The very first run only
+    starts the schedule (no digest at once); a slot missed while the bot was down is sent on its return."""
+    slot = digest_slot(now, hours)
+    if slot is None:
+        return None
+    last = tracker.get_meta(DIGEST_KEY)
+    if last is None:
+        mark_digest_sent(tracker, slot)
+        return None
+    return None if last == slot.strftime("%Y-%m-%dT%H") else slot
+
+
+def mark_digest_sent(tracker, slot: datetime):
+    tracker.set_meta(DIGEST_KEY, slot.strftime("%Y-%m-%dT%H"))

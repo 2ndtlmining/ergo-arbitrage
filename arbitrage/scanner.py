@@ -42,7 +42,7 @@ from tracker.profit_tracker import ProfitTracker
 from notifications.discord import DiscordNotifier
 from exchanges.cex_public import VENUES as CEX_VENUES, CexQuote, FeeBook, best_spread, fetch_all_quotes
 from notifications import embeds
-from notifications.digest import build_digest, digest_due, mark_digest_sent
+from notifications.digest import build_digest, digest_due, digest_period_hours, mark_digest_sent
 from notifications.episodes import EpisodeTracker
 from notifications.health import HealthMonitor
 from notifications.mint_gate import MintGateWatcher, mint_gate_text
@@ -131,8 +131,6 @@ class ArbitrageScanner:
 
         # Notification anti-spam state
         self._opportunity_streak: dict[str, int] = {}
-        self._last_wallet_analysis_time: float = 0.0
-        self._last_summary_time: float = 0.0
         self._price_timestamps: dict[str, float] = {}
         self._stop = asyncio.Event()
         self.node_health: dict = {}
@@ -1150,17 +1148,20 @@ class ArbitrageScanner:
             logger.error(f"Closing Discord episodes failed: {e}", exc_info=True)
 
     def _maybe_send_digest(self):
-        """Queue the daily digest when due; it counts as sent once Discord returns the message id.
-        One that never comes back (Discord down) is queued again after DIGEST_RETRY_S."""
+        """Queue the digest when a DISCORD_DIGEST_HOURS slot is due; it counts as sent once Discord returns
+        the message id. One that never comes back (Discord down) is queued again after DIGEST_RETRY_S."""
         if not self.discord_enabled:
             return
         in_flight = self._digest_queued_at is not None and time.time() - self._digest_queued_at < DIGEST_RETRY_S
         now = datetime.now()
-        if in_flight or not digest_due(self.tracker, now, config.DISCORD_DIGEST_HOUR):
+        slot = None if in_flight else digest_due(self.tracker, now, config.DISCORD_DIGEST_HOURS)
+        if slot is None:
             return
-        digest = build_digest(self.tracker, self.health, self._last_wallet, now, bank=self._bank_for_alerts())
+        hours = digest_period_hours(slot, config.DISCORD_DIGEST_HOURS)
+        digest = build_digest(self.tracker, self.health, self._last_wallet, now, hours=hours,
+                              bank=self._bank_for_alerts())
         self._digest_queued_at = time.time()
-        self.discord.post(embeds.digest_embed(digest), on_id=lambda mid, now=now: self._digest_delivered(now))
+        self.discord.post(embeds.digest_embed(digest), on_id=lambda mid, slot=slot: self._digest_delivered(slot))
 
     def _digest_delivered(self, queued_at: datetime):
         mark_digest_sent(self.tracker, queued_at)
@@ -1845,26 +1846,6 @@ class ArbitrageScanner:
             for o in blocked:
                 self.out.print(f"    [dim]-- {o['name']}: {o['blocked_reason']}[/dim]")
 
-    def _should_send_wallet_analysis(self, opportunities: list[ArbitrageOpportunity]) -> bool:
-        """Check if wallet analysis should be sent to Discord."""
-        now = time.time()
-        elapsed = now - self._last_wallet_analysis_time
-
-        # Periodic: every WALLET_COOLDOWN_SECONDS
-        if elapsed >= config.DISCORD_WALLET_COOLDOWN_SECONDS:
-            return True
-
-        # Triggered: when a NEW opportunity just hit confirmation threshold
-        for opp in opportunities:
-            if not opp.is_profitable or opp.blocked:
-                continue
-            path_key = opp.path_key
-            streak = self._opportunity_streak.get(path_key, 0)
-            if streak == config.DISCORD_CONFIRM_SCANS:
-                return True
-
-        return False
-
     async def scan_once(self):
         """Run a single scan cycle."""
         self.scan_count += 1
@@ -1890,37 +1871,17 @@ class ArbitrageScanner:
             if self.cex_watch:
                 self._display_cex_watch(prices)
 
-        # Wallet-based analysis, built at most once per scan
+        # Wallet-based analysis (plain view only; Discord shows the wallet in the digest)
         wallet = await self._fetch_wallet_balances()
         self._last_wallet = wallet
-        built = []
-
-        def wallet_analysis():
-            if not built:
-                built.append(self._build_wallet_analysis(wallet, prices))
-            return built[0]
-
         if plain and self.show_wallet:
-            self._display_wallet_opportunities(wallet, opportunities, prices, wallet_analysis())
+            self._display_wallet_opportunities(wallet, opportunities, prices, self._build_wallet_analysis(wallet, prices))
 
         if not outage:
             await self._notify_discord(opportunities)
         if self.discord_enabled and self.cex_watch:
             await self._notify_cex_watch(prices)
 
-        # Send wallet analysis to Discord (rate limited)
-        if self.discord_enabled and self._should_send_wallet_analysis(opportunities):
-            await self.discord.send_wallet_analysis(wallet, wallet_analysis())
-            self._last_wallet_analysis_time = time.time()
-            logger.info("Wallet analysis sent to Discord")
-
-        # Periodic summary heartbeat
-        if self.discord_enabled:
-            now = time.time()
-            if (now - self._last_summary_time) >= config.DISCORD_SUMMARY_INTERVAL_SECONDS:
-                await self.discord.send_scan_summary(opportunities, scan_number=self.scan_count)
-                self._last_summary_time = now
-                logger.info("Periodic summary sent to Discord")
         self._maybe_prune(datetime.now())
         try:
             self._maybe_send_digest()

@@ -6,9 +6,7 @@ import sqlite3
 import aiohttp
 
 import ergo.arb_runner as runner
-from arbitrage.calculator import ArbitrageOpportunity, FeeBreakdown
 from ergo.arb_runner import ArbResult, leg1_landed, watch_leg2
-from notifications.discord import DiscordNotifier
 from tests.fake_node import FakeSession
 from tests.test_live import WALLET
 
@@ -114,14 +112,3 @@ def test_unreadable_balances_are_marked(live, monkeypatch):
 
 
 # --- 30-minute summary: blocked rows are labelled ------------------------------------------------------
-
-def test_summary_labels_blocked_paths():
-    blocked = ArbitrageOpportunity(
-        path="Bank mint->ErgoDEX sell [100 ERG]", input_erg=100, output_erg=102.57, profit_erg=2.5681,
-        profit_percent=2.57, fees=FeeBreakdown(), source_price=0, target_price=0, source_exchange="Bank",
-        target_exchange="Pool", is_profitable=True, blocked=True,
-        blocked_reason="Bank mint blocked (RR=329%, post-mint RR would drop below 400%)", profit_usd=0.83)
-    text = DiscordNotifier()._format_scan_summary([blocked], scan_number=566)
-    row = next(line for line in text.splitlines() if "Bank mint->ErgoDEX sell" in line)
-    assert "BLOCKED" in row and "RR=329%" in text
-    assert "0 profitable paths" in text           # a blocked path is never counted as profitable

@@ -17,6 +17,7 @@ logger = logging.getLogger("ergo_arb.discord")
 QUEUE_MAX = 100
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 RETRY_CAP_S = 30.0
+RETRY_BACKOFF_S = (2.0, 5.0)   # network errors and Discord 5xx: retried twice, after these waits
 
 
 class DiscordNotifier:
@@ -88,33 +89,9 @@ class DiscordNotifier:
         self._last_notified[path_key] = time.time()
 
     async def _send(self, content: str) -> bool:
-        """Send a plain text message to the webhook."""
-        try:
-            if self._session is None:
-                await self.connect()
-
-            async with self._session.post(
-                self.webhook_url,
-                json={"content": content},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 204:
-                    return True
-                elif resp.status == 429:
-                    body = await resp.json()
-                    retry_after = body.get("retry_after", 5)
-                    logger.warning(f"Discord rate limited, retry after {retry_after}s")
-                    return False
-                else:
-                    text = await resp.text()
-                    logger.error(f"Discord webhook failed (HTTP {resp.status}): {text[:200]}")
-                    return False
-        except asyncio.TimeoutError:
-            logger.error("Discord webhook timed out")
-            return False
-        except Exception as e:
-            logger.error(f"Discord webhook error: {e}")
-            return False
+        """A plain text message through the same request path as the embeds (rate limits, retries)."""
+        status, _ = await self._request("POST", self._url(), {"content": content})
+        return status in (200, 204)
 
     # --- queued embeds: never awaited from the scan/poll path -------------------------------
 
@@ -185,37 +162,54 @@ class DiscordNotifier:
             await self._request("PATCH", self._url(f"/messages/{message_id}"), {"embeds": [embed]})
 
     async def _request(self, method: str, url: str, payload: dict) -> tuple[int, Optional[dict]]:
-        """One HTTP call to the webhook; on 429 waits retry_after (<= 30 s) and retries once."""
+        """One webhook call, made by the queue worker (never on the poll). A 429 is waited out (retry_after,
+        at most 30 s) and retried once; a network error or a Discord 5xx is retried after RETRY_BACKOFF_S."""
         if self._session is None:
             await self.connect()
         loop = asyncio.get_running_loop()
-        status, body = 0, None
-        for attempt in (0, 1):
+        rate_limited, failures = False, 0
+        while True:
             wait = self._bucket_until - loop.time()
             if wait > 0:
                 await self._sleep(wait)
-            async with self._session.request(method, url, json=payload, timeout=REQUEST_TIMEOUT) as r:
-                status = r.status
-                headers = r.headers or {}
-                if headers.get("X-RateLimit-Remaining") == "0":
-                    reset = min(float(headers.get("X-RateLimit-Reset-After") or 1), RETRY_CAP_S)
-                    self._bucket_until = loop.time() + reset
-                if status == 429 and attempt == 0:
-                    try:
-                        data = await r.json(content_type=None) or {}
-                    except Exception:  # e.g. a Cloudflare HTML page: fall back to the header
-                        data = {}
-                    retry = min(float(data.get("retry_after") or headers.get("Retry-After") or 5), RETRY_CAP_S)
-                    if self._drain_until is not None and loop.time() + retry >= self._drain_until:
-                        logger.warning(f"Discord {method} dropped at shutdown: rate limited for {retry:g}s")
-                        return status, None
-                    await self._sleep(retry)
+            status, body, error = 0, None, None
+            try:
+                async with self._session.request(method, url, json=payload, timeout=REQUEST_TIMEOUT) as r:
+                    status = r.status
+                    headers = r.headers or {}
+                    if headers.get("X-RateLimit-Remaining") == "0":
+                        reset = min(float(headers.get("X-RateLimit-Reset-After") or 1), RETRY_CAP_S)
+                        self._bucket_until = loop.time() + reset
+                    if status == 429 and not rate_limited:
+                        try:
+                            data = await r.json(content_type=None) or {}
+                        except Exception:  # e.g. a Cloudflare HTML page: fall back to the header
+                            data = {}
+                        retry = min(float(data.get("retry_after") or headers.get("Retry-After") or 5), RETRY_CAP_S)
+                        if self._draining(loop, retry):
+                            logger.warning(f"Discord {method} dropped at shutdown: rate limited for {retry:g}s")
+                            return status, None
+                        rate_limited = True
+                        await self._sleep(retry)
+                        continue
+                    body = await r.json(content_type=None) if status == 200 else None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                error = f"{e.__class__.__name__}: {e}"
+            if (error or status >= 500) and failures < len(RETRY_BACKOFF_S):
+                delay = RETRY_BACKOFF_S[failures]
+                failures += 1
+                if not self._draining(loop, delay):
+                    await self._sleep(delay)
                     continue
-                body = await r.json(content_type=None) if status == 200 else None
-                if status not in (200, 204):
-                    logger.warning(f"Discord {method} returned HTTP {status}")
-                return status, body
-        return status, body
+            if error:
+                logger.warning(f"Discord {method} failed: {error}")
+            elif status not in (200, 204):
+                logger.warning(f"Discord {method} returned HTTP {status}")
+            return status, body
+
+    def _draining(self, loop, wait: float) -> bool:
+        """Shutting down and `wait` would run past the drain deadline."""
+        return self._drain_until is not None and loop.time() + wait >= self._drain_until
 
     async def stop(self, timeout: float = 10):
         """Deliver what is queued (up to `timeout` seconds), then stop the worker."""
@@ -321,50 +315,6 @@ class DiscordNotifier:
 
         return "\n".join(lines)
 
-    def _format_scan_summary(self, opportunities: list[ArbitrageOpportunity], scan_number: int = 0) -> str:
-        """Format all paths as a compact summary table (like the console grid)."""
-        now = datetime.now().strftime("%H:%M:%S")
-
-        # Group by path, pick best per path
-        best_per_path: dict[str, ArbitrageOpportunity] = {}
-        for opp in opportunities:
-            path_key = self._get_path_key(opp)
-            existing = best_per_path.get(path_key)
-            if existing is None or opp.profit_percent > existing.profit_percent:
-                best_per_path[path_key] = opp
-
-        sorted_paths = sorted(best_per_path.values(), key=lambda x: x.profit_percent, reverse=True)
-        profitable_count = sum(1 for o in sorted_paths if o.is_profitable and not o.blocked)
-
-        lines = []
-        lines.append(f"**Scan #{scan_number}** - {now}  |  {profitable_count} profitable paths")
-        lines.append("```")
-        lines.append(f"  {'Path':<28s} {'Size':>5s} {'Profit':>8s} {'ERG':>9s} {'USD':>7s} {'St':>7s}")
-        lines.append(f"  {'-'*28} {'-'*5} {'-'*8} {'-'*9} {'-'*7} {'-'*7}")
-
-        for opp in sorted_paths:
-            path_key = self._get_path_key(opp)
-            pname = path_key[:28]
-            size = f"{opp.input_erg:.0f}"
-            pct = f"{opp.profit_percent:+.2f}%"
-            erg = f"{opp.profit_erg:+.4f}"
-            usd = f"${opp.profit_usd:.2f}"
-            if opp.blocked:
-                st = "BLOCKED"            # the figure is what it would earn if the step were allowed
-            elif opp.is_profitable and opp.risk_adjusted_profitable:
-                st = "GO"
-            elif opp.is_profitable:
-                st = "RISKY"
-            else:
-                st = "-"
-            lines.append(f"  {pname:<28s} {size:>5s} {pct:>8s} {erg:>9s} {usd:>7s} {st:>7s}")
-
-        for opp in sorted_paths:
-            if opp.blocked and opp.blocked_reason:
-                lines.append(f"  BLOCKED {self._get_path_key(opp)}: {opp.blocked_reason}")
-        lines.append("```")
-        return "\n".join(lines)
-
     async def notify_opportunity(self, opp: ArbitrageOpportunity, scan_number: int = 0) -> bool:
         """Send a notification for a single profitable opportunity."""
         if not self.enabled:
@@ -380,12 +330,12 @@ class DiscordNotifier:
             return False
 
         msg = self._format_opportunity(opp, scan_number, tier=tier)
-        success = await self._send(msg)
-        if success:
-            self._record_notification(path_key)
-            tier_label = "Tier 1 (ping)" if tier == 1 else "Tier 2 (silent)"
-            logger.info(f"Discord notification sent [{tier_label}]: {path_key} +{opp.profit_percent:.2f}% ({opp.profit_erg:+.2f} ERG)")
-        return success
+        self._enqueue(("text", msg, tier == 1))       # queued: a slow Discord never holds the scan
+        self._record_notification(path_key)
+        tier_label = "Tier 1 (ping)" if tier == 1 else "Tier 2 (silent)"
+        logger.info(f"Discord notification queued [{tier_label}]: {path_key} +{opp.profit_percent:.2f}% "
+                    f"({opp.profit_erg:+.2f} ERG)")
+        return True
 
     async def notify_opportunities(
         self,
@@ -410,23 +360,7 @@ class DiscordNotifier:
             result = await self.notify_opportunity(opp, scan_number)
             if result:
                 sent += 1
-                await asyncio.sleep(0.5)
         return sent
-
-    async def send_scan_summary(
-        self,
-        opportunities: list[ArbitrageOpportunity],
-        scan_number: int = 0,
-    ):
-        """Send a compact scan summary table (all paths, one row each)."""
-        if not self.enabled or not opportunities:
-            return
-        msg = self._format_scan_summary(opportunities, scan_number)
-        self._enqueue(("text", msg, False))
-
-    async def send_wallet_analysis(self, wallet: dict, analysis: dict):
-        """Wallet balances and the best options per asset, as one embed."""
-        self.post(embeds.wallet_embed(wallet, analysis))
 
     async def send_startup_message(self, mode: str = "notify"):
         self.post(embeds.startup_embed(mode), content=self._ping())
