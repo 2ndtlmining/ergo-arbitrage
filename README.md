@@ -47,7 +47,10 @@ anything. `--live` does the same, and when a path passes every safety check (see
 executes the trade with your ERG. Start live mode with a small `--max-trade-erg` the first time
 (see **First live run**).
 
-The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+C quits):
+The default view is a one-screen live dashboard (refreshed twice a second, Ctrl+C quits). It is made
+for about 120x40; narrower than 100 columns it drops a few columns and puts venues and exchanges in
+one table, and shorter than 32 rows it hides Events/History, so every path and venue still shows at
+80x24. For anything smaller use `--plain`.
 
 - **Header + health strip:** node, wallet, poll timing; then each source's response time (chain read,
   every exchange), the full-scan time, the Discord send queue and the age of the chain data. Slow,

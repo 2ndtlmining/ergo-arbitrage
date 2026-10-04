@@ -1,4 +1,5 @@
 """Dashboard renderer: pure function of DashboardState (spec: dashboard)."""
+import pytest
 from rich.console import Console
 
 from arbitrage.dashboard_state import DashboardState, VenueStatus
@@ -69,3 +70,43 @@ def test_bank_line_uses_the_mint_gate_text():
     assert "mint ✗ needs ERG $0.398 (+24.2%)" in text(render(s))
     s.mint_text = None
     assert "mint ✗ (<400%)" in text(render(s))        # unchanged fallback before the first read
+
+
+# ---------- small terminals (#82) ----------
+
+def realistic_state():
+    from arbitrage.dashboard_state import ExchangeRow
+    s = full_state()
+    s.update_venues([VenueStatus("ErgoDEX pool", "on-chain", "live", "0.3127 SigUSD/ERG", 1.0, 6.0),
+                     VenueStatus("SigmaUSD bank", "on-chain", "live", "RR 330%, mint x", 1.0, 6.0),
+                     VenueStatus("Oracle", "on-chain", "live", "$0.3238/ERG", 1.0, 6.0),
+                     VenueStatus("Dexy USE", "on-chain", "disabled", "ENABLE_USE=false")])
+    s.exchanges = [ExchangeRow("Kucoin", "live", 0.3238, 0.3242, 0.06, "0.10% · 2.0 ERG*", 180),
+                   ExchangeRow("NonKYC", "live", 0.3261, 0.3267, 0.8, "0.20% · 3.1 ERG*", 240),
+                   ExchangeRow("Gate", "live", 0.3240, 0.3244, 0.1, "0.20% · 0.403 ERG", 200)]
+    s.spread_text = "buy on Kucoin, sell on NonKYC: -17.80% after fees"
+    return s
+
+
+@pytest.mark.parametrize("width,height", [(80, 24), (80, 40), (120, 40)])
+def test_every_path_status_and_venue_is_visible(width, height):
+    s = realistic_state()
+    out = text(render(s, width, height), width=width, height=height)
+    flat = " ".join(out.replace("│", " ").split())
+    for row in s.paths.values():
+        assert row.label in out
+        assert " ".join(row.status.split()) in flat
+    blocked = next(r for r in s.paths.values() if r.status == "BLOCKED")
+    assert " ".join(blocked.detail.split())[-12:] in flat                     # the reason is not cut off
+    for name in ("ErgoDEX pool", "SigmaUSD bank", "Oracle", "Dexy USE", "Kucoin", "NonKYC", "Gate"):
+        assert name in out, (name, width, height)
+
+
+def test_large_terminals_keep_the_full_layout():
+    out = text(render(realistic_state(), 140, 50))
+    assert "Exchanges (watch-only, * = fee published by the exchange)" in out and "Events" in out
+
+
+def test_render_safe_passes_the_terminal_size():
+    out = text(render_safe(realistic_state(), 80, 24), width=80, height=24)
+    assert "CEX (watch-only)" in out
