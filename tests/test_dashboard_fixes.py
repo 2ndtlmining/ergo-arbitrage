@@ -7,7 +7,6 @@ import pytest
 from rich.console import Console
 
 import config
-from tests.test_scanner_views import make  # noqa: F401  (fixture)
 from tests.test_chain_scanner import HEALTHY
 
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from notifications.episodes import EpisodeTracker
 
-KEY = "Spectrum buy->Bank redeem"
+KEY = "ErgoDEX buy->Bank redeem"
 
 
 def row(pct=3.0, erg=1.2, status="GO"):

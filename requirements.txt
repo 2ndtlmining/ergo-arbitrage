@@ -1,5 +1,5 @@
-aiohttp>=3.9.0
-python-dotenv>=1.0.0
-rich>=13.0.0
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# Runtime dependencies, pinned: the bot signs transactions, so upgrades are deliberate (bump, run the
+# tests, then commit). Development tools are in requirements-dev.txt.
+aiohttp==3.13.2
+python-dotenv==1.1.0
+rich==14.2.0

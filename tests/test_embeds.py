@@ -60,12 +60,12 @@ def test_health_embed_colours():
 
 def test_wallet_embed_survives_missing_keys():
     wallet = {"erg": 20.7119, "sigusd": 0.0}
-    analysis = {"erg": {"balance": 20.7, "options": [{"name": "Spectrum buy -> Bank redeem", "profit_pct": 2.9,
+    analysis = {"erg": {"balance": 20.7, "options": [{"name": "ErgoDEX buy -> Bank redeem", "profit_pct": 2.9,
                                                       "blocked": False}]},
                 "sigusd": {"balance": 0.0}}
     e = embeds.wallet_embed(wallet, analysis)
     text = values(e)
-    assert "20.7119 ERG" in text and "Spectrum buy -> Bank redeem" in text and "+2.9%" in text
+    assert "20.7119 ERG" in text and "ErgoDEX buy -> Bank redeem" in text and "+2.9%" in text
     assert embeds.wallet_embed({}, {})["title"] == "Wallet"
 
 

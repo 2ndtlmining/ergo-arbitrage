@@ -38,8 +38,7 @@ class TestChooseSize:
         assert c.cap_erg == pytest.approx(5)
 
 
-@pytest.fixture
-def offline(monkeypatch):
+def offline_runner(monkeypatch):
     """run_arb with node calls replaced; signing stops at the dry-run point."""
     boxes = {config.SPECTRUM_SIGUSD_POOL_NFT: POOL, config.SIGMAUSD_BANK_NFT: BANK_BOX,
              config.SIGMAUSD_ORACLE_NFT: ORACLE_BOX}

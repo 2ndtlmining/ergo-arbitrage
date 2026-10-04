@@ -59,9 +59,9 @@ DIGEST_RETRY_S = 600                     # a digest not confirmed by Discord is 
 
 logger = logging.getLogger("ergo_arb.scanner")
 
-LIVE_PATH = "Spectrum buy->Bank redeem"
+LIVE_PATH = "ErgoDEX buy->Bank redeem"
 # Paths --live can execute (ergo/arb_runner.py), scanner path key -> runner path
-LIVE_PATHS = {"Spectrum buy->Bank redeem": "redeem", "Bank mint->Spectrum sell": "mint"}
+LIVE_PATHS = {"ErgoDEX buy->Bank redeem": "redeem", "Bank mint->ErgoDEX sell": "mint"}
 POLL_ERROR_LOG_S = 300   # a repeating poll error is logged once per this (the first time with its traceback)
 LIVE_PAUSE_KEY = "live_paused"        # tracker meta: why live trading is paused (cleared by arb.py resume)
 LIVE_BASELINE_KEY = "live_baseline"   # tracker meta: {"day", "value"} today's drawdown baseline
@@ -519,13 +519,13 @@ class ArbitrageScanner:
             slippage=self._amm_buffer(prices, trade_size),
         )
         opp = self._exact(opp, "mint", prices, trade_size)
-        opp.path = f"Bank mint->Spectrum sell [{trade_size:g} ERG]"
+        opp.path = f"Bank mint->ErgoDEX sell [{trade_size:g} ERG]"
         fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
         opp.steps = [
             f"START: Have {trade_size:g} ERG in wallet",
             f"Send {trade_size:g} ERG to SigmaUSD Bank to mint SigUSD",
             f"Receive ~{sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
-            f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"Swap {sigusd_from_bank:.2f} SigUSD -> ERG on the ErgoDEX pool (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
             f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
         ]
         opp.details = {"sigusd_cents": mint_cents}
@@ -557,12 +557,12 @@ class ArbitrageScanner:
             slippage=self._amm_buffer(prices, trade_size),
         )
         opp = self._exact(opp, "redeem", prices, trade_size)
-        opp.path = f"Spectrum buy->Bank redeem [{trade_size:g} ERG]"
+        opp.path = f"ErgoDEX buy->Bank redeem [{trade_size:g} ERG]"
         fee_pct = (config.SIGMAUSD_PROTOCOL_FEE + config.SIGMAUSD_FRONTEND_FEE) * 100
         opp.details = {"sigusd_cents": redeem_cents, "bank_erg": erg_from_bank}
         opp.steps = [
             f"START: Have {trade_size:g} ERG in wallet",
-            f"Swap {trade_size:g} ERG -> SigUSD on Spectrum (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
+            f"Swap {trade_size:g} ERG -> SigUSD on the ErgoDEX pool (-{config.SPECTRUM_POOL_FEE*100:.1f}% pool fee, {config.pool_fee_text()})",
             f"Receive ~{sigusd_from_dex:.2f} SigUSD",
             f"Redeem {sigusd_from_dex:.2f} SigUSD at SigmaUSD Bank (oracle ${oracle_price:.4f}, -{fee_pct:.2f}% bank fees)",
             f"END RESULT: ~{opp.output_erg:.2f} ERG in wallet (net {opp.profit_erg:+.2f} ERG)",
@@ -655,7 +655,7 @@ class ArbitrageScanner:
                     erg_withdraw_fee=withdraw_fee, slippage=slippage, pool=pool)
                     for d in ("buy_cex_sell_dex", "buy_dex_sell_cex")), key=lambda o: o.profit_erg)
                 buy_on_cex = opp.source_exchange == "CEX"
-                opp.path = f"{cex}<>Spectrum [{trade_size} ERG]"
+                opp.path = f"{cex}<>ErgoDEX [{trade_size} ERG]"
                 if buy_on_cex:
                     opp.steps = [
                         f"START: Have USDT on {cex}",
@@ -839,7 +839,7 @@ class ArbitrageScanner:
         premium = self._sigusd_premium_percent(prices)
         key = opp.path_key
 
-        if premium is not None and key == "Bank mint->Spectrum sell":
+        if premium is not None and key == "Bank mint->ErgoDEX sell":
             cost = premium - profit  # profit ~ premium - costs
             if profit > min_pct:
                 text = f"clears: SigUSD at {premium:+.2f}% on the pool vs ~{cost:.2f}% costs -> {profit:+.2f}% at {size}"
@@ -847,7 +847,7 @@ class ArbitrageScanner:
                 text = (f"SigUSD at {premium:+.2f}% vs oracle on the pool; mint+sell costs ~{cost:.2f}% "
                         f"(bank fees, pool fee + impact, buffer, miner), so it needs > {cost + min_pct:+.2f}%: "
                         f"short by {short:.2f}% at {size}")
-        elif premium is not None and key == "Spectrum buy->Bank redeem":
+        elif premium is not None and key == "ErgoDEX buy->Bank redeem":
             cost = -premium - profit  # profit ~ discount - costs
             if profit > min_pct:
                 text = f"clears: SigUSD at {premium:+.2f}% on the pool vs ~{cost:.2f}% costs -> {profit:+.2f}% at {size}"
@@ -1527,8 +1527,8 @@ class ArbitrageScanner:
             "ok": True,
         }
 
-    WALLET_PATHS = (("redeem", "Spectrum buy -> Bank redeem", "_path_pool_buy_redeem"),
-                    ("mint", "Bank mint -> Spectrum sell", "_path_bank_mint"))
+    WALLET_PATHS = (("redeem", "ErgoDEX buy -> Bank redeem", "_path_pool_buy_redeem"),
+                    ("mint", "Bank mint -> ErgoDEX sell", "_path_bank_mint"))
 
     def _erg_wallet_options(self, erg: float, prices: dict) -> list[dict]:
         """What the wallet's ERG can do: both on-chain paths at the exact best size the live gate would
@@ -1603,9 +1603,9 @@ class ArbitrageScanner:
                             "result": f"{erg_out:.2f} ERG in wallet", "blocked": False, "blocked_reason": ""})
         if prices.get("spectrum_erg_sigusd"):
             erg_out = self._dex_sigusd_to_erg(prices, sigusd) - config.pool_service_fee() - config.ERGO_TX_FEE
-            outs["Spectrum swap"] = erg_out
+            outs["ErgoDEX pool swap"] = erg_out
             pct = (erg_out - baseline_erg) / baseline_erg * 100
-            options.append({"name": "Spectrum swap",
+            options.append({"name": "ErgoDEX pool swap",
                             "steps": [f"Sell on the pool: {sigusd:.2f} SigUSD -> {erg_out:.2f} ERG "
                                       f"(real reserves, {config.pool_fee_text()}, -{config.ERGO_TX_FEE} ERG network)"],
                             "profit_pct": pct,
@@ -1717,10 +1717,10 @@ class ArbitrageScanner:
                         net = erg_final - erg_from_crux
                         pct_arb = (net / erg_from_crux) * 100
                         use_options.append({
-                            "name": "Crux -> Spectrum -> Bank redeem",
+                            "name": "Crux -> ErgoDEX -> Bank redeem",
                             "steps": [
                                 crux_step,
-                                f"Swap ERG -> SigUSD on Spectrum: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
+                                f"Swap ERG -> SigUSD on the ErgoDEX pool: {erg_from_crux:.2f} ERG -> {sigusd_from_spectrum:.2f} SigUSD (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
                                 f"Redeem at Bank: {sigusd_from_spectrum:.2f} SigUSD -> {erg_hop2:.2f} ERG (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
                                 f"Extra fees: -{config.SIGMAUSD_REDEEM_EXTRA_ERG} ERG (receipt + miner), -{config.ERGO_TX_FEE} ERG network",
                             ],
@@ -1740,11 +1740,11 @@ class ArbitrageScanner:
                         net = erg_final - erg_from_crux
                         pct_arb = (net / erg_from_crux) * 100
                         use_options.append({
-                            "name": "Crux -> Bank mint -> Spectrum sell",
+                            "name": "Crux -> Bank mint -> ErgoDEX sell",
                             "steps": [
                                 crux_step,
                                 f"Mint SigUSD at Bank: {erg_from_crux:.2f} ERG -> {sigusd_from_bank:.2f} SigUSD (oracle ${oracle_price:.4f}, -{bank_fee_pct:.2f}% bank fee)",
-                                f"Swap SigUSD -> ERG on Spectrum: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
+                                f"Swap SigUSD -> ERG on the ErgoDEX pool: {sigusd_from_bank:.2f} SigUSD -> {erg_from_spectrum:.2f} ERG (-{config.SPECTRUM_POOL_FEE * 100:.1f}% pool fee, {config.pool_fee_text()})",
                                 f"Network fees: -{config.ERGO_TX_FEE * 2} ERG (2 txns)",
                             ],
                             "profit_pct": pct_arb,
@@ -1754,7 +1754,7 @@ class ArbitrageScanner:
                         })
                     elif spectrum_price and bank_state:
                         rr = prices.get('bank', {}).get('reserve_ratio', 0)
-                        use_options.append({"name": "Crux -> Bank mint -> Spectrum sell", "steps": [], "profit_pct": 0,
+                        use_options.append({"name": "Crux -> Bank mint -> ErgoDEX sell", "steps": [], "profit_pct": 0,
                             "profit_desc": "", "result": "", "blocked": True,
                             "blocked_reason": f"Bank mint BLOCKED (RR={rr:.0f}%)"})
                 else:

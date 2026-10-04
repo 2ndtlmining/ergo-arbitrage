@@ -80,7 +80,7 @@ SIGMAUSD_PROTOCOL_FEE = 0.02  # 2% (stays in bank reserve)
 SIGMAUSD_FRONTEND_FEE = 0.00229  # 0.229% UI fee on bc_delta (after protocol fee)
 SIGMAUSD_REDEEM_EXTRA_ERG = 0.0021  # receipt box (0.001) + miner fee (0.0011)
 
-# Spectrum DEX fees. The real fee is read from the pool box (R4 = 995 -> 0.5%);
+# ErgoDEX pool fees. The real fee is read from the pool box (R4 = 995 -> 0.5%);
 # this constant is only a display/fallback value.
 SPECTRUM_POOL_FEE = 0.005  # 0.5% (995/1000) for SigUSD/ERG pool
 SPECTRUM_EXECUTION_FEE = 0.785  # ERG service fee (via Crux Finance routing)

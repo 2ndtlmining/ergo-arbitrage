@@ -30,7 +30,7 @@ def tracker(db):
 
 class TestEpisodes:
     def test_path_key_strips_size(self):
-        assert opp("Bank mint->Spectrum sell", 25, 1).path_key == "Bank mint->Spectrum sell"
+        assert opp("Bank mint->ErgoDEX sell", 25, 1).path_key == "Bank mint->ErgoDEX sell"
 
     def test_long_opportunity_is_one_episode(self, tracker):
         for _ in range(40):
@@ -90,3 +90,23 @@ class TestSchema:
         deleted, _ = tracker.prune(days=7)
         assert deleted == 1
         assert tracker.conn.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0] == 2
+
+
+def test_old_spectrum_names_are_migrated_once(db):
+    """#81: stored path keys and venue names say ErgoDEX after the upgrade, so history and new rows match."""
+    import sqlite3
+    old = ProfitTracker(db)
+    old.conn.execute("INSERT INTO scan_results (timestamp, scan_number, path, input_erg, output_erg, profit_erg,"
+                     " profit_percent, source_exchange) VALUES ('t', 1, 'Spectrum buy->Bank redeem [10 ERG]', 1, 1,"
+                     " 0, 0, 'Spectrum DEX')")
+    old.conn.execute("INSERT INTO chain_episodes (path, opened_at, peak_profit_erg, peak_profit_percent, peak_size_erg)"
+                     " VALUES ('Bank mint->Spectrum sell', 't', 0, 0, 0)")
+    old.conn.execute("PRAGMA user_version = 3")
+    old.conn.commit()
+    old.close()
+    ProfitTracker(db).close()
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT path, source_exchange FROM scan_results").fetchone() == \
+        ("ErgoDEX buy->Bank redeem [10 ERG]", "ErgoDEX pool")
+    assert c.execute("SELECT path FROM chain_episodes").fetchone() == ("Bank mint->ErgoDEX sell",)
+    c.close()

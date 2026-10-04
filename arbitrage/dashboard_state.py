@@ -14,7 +14,7 @@ HISTORY = 30
 MAX_EVENTS = 200
 MAX_VENUES = 10
 RR_HISTORY = 1440           # reserve-ratio samples kept (6 h at one per 15 s full scan)
-PATH_LABELS = {"Spectrum buy->Bank redeem": "pool→redeem", "Bank mint->Spectrum sell": "mint→pool sell"}
+PATH_LABELS = {"ErgoDEX buy->Bank redeem": "pool→redeem", "Bank mint->ErgoDEX sell": "mint→pool sell"}
 
 
 @dataclass

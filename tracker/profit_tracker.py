@@ -10,7 +10,7 @@ from logging_config import console
 
 logger = logging.getLogger("ergo_arb.tracker")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ProfitTracker:
@@ -178,6 +178,14 @@ class ProfitTracker:
                 self.conn.execute("ALTER TABLE chain_episodes ADD COLUMN message_id TEXT")
             if "last_seen_at" not in cols:
                 self.conn.execute("ALTER TABLE chain_episodes ADD COLUMN last_seen_at TEXT")
+        if version < 4:
+            # "Spectrum" (sunset) is "ErgoDEX" in path keys and venue names: rename stored history once
+            for table, columns in (("scan_results", ("path", "source_exchange", "target_exchange")),
+                                   ("opportunities", ("path", "source_exchange", "target_exchange")),
+                                   ("opportunity_episodes", ("path",)), ("chain_episodes", ("path",))):
+                for col in columns:
+                    self.conn.execute(f"UPDATE {table} SET {col} = replace(replace({col}, 'Spectrum DEX', "
+                                      f"'ErgoDEX pool'), 'Spectrum', 'ErgoDEX') WHERE {col} LIKE '%Spectrum%'")
         if version < SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._commit()
