@@ -25,9 +25,8 @@ GROUPS = {
     "Discord": ["DISCORD_WEBHOOK_URL", "DISCORD_USER_ID", "DISCORD_MIN_PROFIT_PERCENT", "DISCORD_MIN_PROFIT_ERG",
                 "DISCORD_TIER1_PROFIT_PERCENT", "DISCORD_CONFIRM_SECONDS", "DISCORD_CLOSE_SECONDS",
                 "DISCORD_EDIT_SECONDS", "DISCORD_HEALTH_CHAIN_SECONDS", "DISCORD_HEALTH_VENUE_SECONDS",
-                "DISCORD_HEALTH_ORACLE_SECONDS", "DISCORD_HEALTH_REPEAT_SECONDS", "DISCORD_HEALTH_LIVE_SECONDS", "DISCORD_DIGEST_HOUR",
-                "DISCORD_CONFIRM_SCANS", "DISCORD_COOLDOWN_SECONDS", "DISCORD_WALLET_COOLDOWN_SECONDS",
-                "DISCORD_SUMMARY_INTERVAL_SECONDS"],
+                "DISCORD_HEALTH_ORACLE_SECONDS", "DISCORD_HEALTH_REPEAT_SECONDS", "DISCORD_HEALTH_LIVE_SECONDS", "DISCORD_DIGEST_HOURS",
+                "DISCORD_CONFIRM_SCANS", "DISCORD_COOLDOWN_SECONDS"],
     "Mint gate": ["MINT_GATE_CONFIRM_POLLS", "MINT_GATE_MIN_ROOM_ERG", "MINT_GATE_PING_COOLDOWN_SECONDS",
                   "MINT_GATE_CLOSE_SECONDS"],
     "CEX watch": ["CEX_WATCH", "CEX_WATCH_ALERT_PERCENT", "CEX_WATCH_COOLDOWN_SECONDS", "GATE_TRADING_FEE",
@@ -52,7 +51,7 @@ def env_file_values() -> dict:
 def unknown_settings(file_values: dict | None = None) -> list[tuple[str, str | None]]:
     """Keys in .env the bot does not read, each with the closest real setting name (or None)."""
     file_values = env_file_values() if file_values is None else file_values
-    known = set(config.SETTINGS) | set(config.RENAMED_SETTINGS)
+    known = set(config.SETTINGS) | set(config.RENAMED_SETTINGS) | set(config.RETIRED_SETTINGS)
     return [(key, (difflib.get_close_matches(key, config.SETTINGS, n=1, cutoff=0.75) or [None])[0])
             for key in file_values if key not in known]
 
@@ -84,6 +83,9 @@ def report(file_values: dict | None = None, environ=None) -> list[str]:
     for old, new in config.RENAMED_SETTINGS.items():
         if old in environ or old in file_values:
             problems.append(f"  renamed   {old} is no longer read; use {new}")
+    for name, why in config.RETIRED_SETTINGS.items():
+        if name in environ or name in file_values:
+            problems.append(f"  retired   {name} is no longer read: {why}")
     lines.append("")
     lines += ["Problems:"] + problems if problems else ["No unknown, placeholder or deprecated settings."]
     return lines

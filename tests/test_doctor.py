@@ -174,3 +174,10 @@ def test_placeholders_and_unknown_settings_are_warned(healthy, monkeypatch):
     monkeypatch.setattr(doctor, "unknown_settings", lambda: [("DISCORD_WEBHOOK", "DISCORD_WEBHOOK_URL")])
     code, out = run(Node())
     assert code == 0 and "DISCORD_USER_ID" in out and "DISCORD_WEBHOOK_URL?" in out and "arb.py config" in out
+
+
+def test_a_locked_wallet_still_checks_the_chain_and_mempool(healthy):
+    code, out = run(Node(wallet=(200, {"isInitialized": True, "isUnlocked": False})))
+    assert code == 1
+    assert "OK    chain state" in out and "OK    mempool lookup" in out
+    assert "SKIP  wallet boxes" in out and "SKIP  sign check" in out

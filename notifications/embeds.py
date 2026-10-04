@@ -116,24 +116,6 @@ def mint_gate_stopped_embed() -> dict:
                  description="The bot stopped while minting was open, so the current state is unknown.")
 
 
-def wallet_embed(wallet: dict, analysis: dict) -> dict:
-    wallet, analysis = wallet or {}, analysis or {}
-    description = (f"{wallet.get('erg') or 0:.4f} ERG · {wallet.get('sigusd') or 0:.2f} SigUSD · "
-                   f"{wallet.get('use') or 0:.3f} USE")
-    fields = []
-    for key, label in (("erg", "ERG"), ("sigusd", "SigUSD"), ("use", "USE")):
-        info = analysis.get(key) or {}
-        options = [o for o in (info.get("options") or []) if not o.get("blocked")]
-        if not options:
-            continue
-        lines = []
-        for o in sorted(options, key=lambda o: o.get("profit_pct") or 0, reverse=True)[:3]:
-            pct = o.get("profit_pct") or 0
-            lines.append(f"{'>>' if pct > 0.5 else '--'} {o.get('name', '?')} ({pct:+.1f}%)")
-        fields.append(field(f"{label} ({info.get('balance') or 0:g})", "\n".join(lines), inline=False))
-    return embed("Wallet", BLUE, fields, description=description)
-
-
 def digest_embed(d) -> dict:
     if d.paths:
         lines = [f"{label}: {p['count']} episode{'s' if p['count'] != 1 else ''}, longest "
@@ -153,7 +135,7 @@ def digest_embed(d) -> dict:
         fields.append(field("Wallet", f"{d.wallet.get('erg', 0):.4f} ERG · {d.wallet.get('sigusd', 0):.2f} SigUSD"))
     if getattr(d, "mint", None):
         fields.append(field("Bank mint", d.mint))
-    return embed(f"Daily digest · last {d.hours}h", BLUE, fields)
+    return embed(f"Digest · last {d.hours}h", BLUE, fields)
 
 
 def startup_embed(mode: str) -> dict:
@@ -162,7 +144,7 @@ def startup_embed(mode: str) -> dict:
                         f"held {config.DISCORD_CONFIRM_SECONDS:g}s"),
         field("Ping", f">= {config.DISCORD_TIER1_PROFIT_PERCENT}%, chain down, live paused"),
         field("Max trade", f"{config.MAX_TRADE_SIZE_ERG:g} ERG"),
-        field("Digest", f"{config.DISCORD_DIGEST_HOUR}:00" if config.DISCORD_DIGEST_HOUR >= 0 else "off"),
+        field("Digest", ", ".join(f"{h}:00" for h in config.DISCORD_DIGEST_HOURS) or "off"),
     ]
     if mode == "live":
         fields += [

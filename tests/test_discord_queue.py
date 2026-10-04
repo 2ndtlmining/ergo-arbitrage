@@ -85,7 +85,7 @@ def test_edit_without_message_id_is_dropped(notifier):
         await notifier.stop()
 
     run(go())
-    assert [c[0] for c in hook.calls] == ["POST"]
+    assert [c[0] for c in hook.calls] == ["POST"] * 3          # a 5xx is retried twice; the edit is dropped
 
 
 def test_429_waits_and_retries_once_then_gives_up(notifier):
@@ -143,20 +143,9 @@ def test_disabled_notifier_queues_nothing(monkeypatch):
     assert len(n._jobs) == 0
 
 
-def test_wallet_analysis_is_one_embed(notifier):
-    hook = FakeHook(Resp(200, {"id": "w"}))
-    notifier._session = hook
-
-    async def go():
-        await notifier.send_wallet_analysis({"erg": 20.7}, {"erg": {"balance": 20.7, "options": []}})
-        await notifier.stop()
-
-    run(go())
-    assert len(hook.calls) == 1 and hook.calls[0][2]["embeds"][0]["title"] == "Wallet"
-
 
 def test_text_alerts_are_queued_not_awaited(notifier, monkeypatch):
-    """Review: notify_live/notify_watch/send_scan_summary must not hold the poll while Discord hangs."""
+    """Review: notify_live/notify_watch must not hold the poll while Discord hangs."""
     sent = []
 
     async def hanging_send(content):
@@ -164,12 +153,10 @@ def test_text_alerts_are_queued_not_awaited(notifier, monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(notifier, "_send", hanging_send)
-    monkeypatch.setattr(notifier, "_format_scan_summary", lambda opps, n=0: "summary")
 
     async def go():
         await asyncio.wait_for(notifier.notify_live("executed"), 0.5)
         await asyncio.wait_for(notifier.notify_watch("Kucoin", "gap"), 0.5)
-        await asyncio.wait_for(notifier.send_scan_summary(["opp"], 1), 0.5)
         await notifier.stop(timeout=0.2)
 
     run(go())

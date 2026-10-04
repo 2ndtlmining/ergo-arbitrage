@@ -6,7 +6,6 @@ import config
 from arbitrage.scanner import ArbitrageScanner
 from arbitrage.sizing import Market, best_size
 from exchanges import cex_public as cp
-from notifications import embeds
 from tests.test_cex_sources import QUOTES
 from tests.test_optimizer import discount_prices
 
@@ -64,12 +63,6 @@ def test_sigusd_options_are_contract_exact(scanner):
     assert sig["Bank redeem"]["result"] == f"{redeem_erg:.2f} ERG in wallet"
     assert sig["ErgoDEX pool swap"]["result"] == f"{pool_erg:.2f} ERG in wallet"
 
-
-def test_the_discord_wallet_embed_still_reads_it(scanner):
-    prices = dict(discount_prices(pool_erg=2_000), cex=dict(QUOTES))
-    e = embeds.wallet_embed(WALLET, scanner._build_wallet_analysis(dict(WALLET, sigusd=10.0), prices))
-    text = " ".join(f["value"] for f in e.get("fields", []))
-    assert e["title"] == "Wallet" and "ErgoDEX buy -> Bank redeem" in text
 
 
 def test_a_small_wallet_has_no_erg_arbitrage_options(scanner):

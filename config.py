@@ -130,7 +130,7 @@ ENABLE_USE = setting("ENABLE_USE", "false").strip().lower() in ("1", "true", "ye
 # and alert when it is worth connecting an exchange. Never trades.
 CEX_WATCH = setting("CEX_WATCH", "true").strip().lower() in ("1", "true", "yes")
 CEX_WATCH_ALERT_PERCENT = float(setting("CEX_WATCH_ALERT_PERCENT", "3.0"))
-CEX_WATCH_COOLDOWN_SECONDS = int(setting("CEX_WATCH_COOLDOWN_SECONDS", "3600"))
+CEX_WATCH_COOLDOWN_SECONDS = int(setting("CEX_WATCH_COOLDOWN_SECONDS", "21600"))
 
 # Arbitrage settings
 MIN_PROFIT_PERCENT = float(setting("MIN_PROFIT_PERCENT", "0.5"))
@@ -181,8 +181,6 @@ DISCORD_COOLDOWN_SECONDS = int(setting("DISCORD_COOLDOWN_SECONDS", "300"))
 DISCORD_CONFIRM_SCANS = int(setting("DISCORD_CONFIRM_SCANS", "3"))
 DISCORD_MIN_PROFIT_ERG = float(setting("DISCORD_MIN_PROFIT_ERG", "0.5"))
 DISCORD_TIER1_PROFIT_PERCENT = float(setting("DISCORD_TIER1_PROFIT_PERCENT", "2.0"))
-DISCORD_WALLET_COOLDOWN_SECONDS = int(setting("DISCORD_WALLET_COOLDOWN_SECONDS", "600"))
-DISCORD_SUMMARY_INTERVAL_SECONDS = int(setting("DISCORD_SUMMARY_INTERVAL_SECONDS", "1800"))
 DISCORD_CONFIRM_SECONDS = float(setting("DISCORD_CONFIRM_SECONDS", "10"))   # held this long before a message opens
 DISCORD_CLOSE_SECONDS = float(setting("DISCORD_CLOSE_SECONDS", "10"))       # gone this long before it closes
 DISCORD_EDIT_SECONDS = float(setting("DISCORD_EDIT_SECONDS", "30"))         # at most one edit per this
@@ -191,7 +189,14 @@ DISCORD_HEALTH_VENUE_SECONDS = float(setting("DISCORD_HEALTH_VENUE_SECONDS", "30
 DISCORD_HEALTH_ORACLE_SECONDS = float(setting("DISCORD_HEALTH_ORACLE_SECONDS", "600"))
 DISCORD_HEALTH_REPEAT_SECONDS = float(setting("DISCORD_HEALTH_REPEAT_SECONDS", "1800"))
 DISCORD_HEALTH_LIVE_SECONDS = float(setting("DISCORD_HEALTH_LIVE_SECONDS", "600"))   # STOP file holding --live
-DISCORD_DIGEST_HOUR = int(setting("DISCORD_DIGEST_HOUR", "8"))              # local hour, -1 = off
+def parse_hours(text: str) -> list[int]:
+    """Comma-separated local hours (0-23) for the digest; empty, "off" or -1 = no digest."""
+    if text.strip().lower() in ("", "off", "-1", "none"):
+        return []
+    return sorted({int(h) for h in text.split(",") if h.strip() and 0 <= int(h) <= 23})
+
+
+DISCORD_DIGEST_HOURS = parse_hours(setting("DISCORD_DIGEST_HOURS", "8,14,20"))  # local hours of the digest
 MINT_GATE_CONFIRM_POLLS = int(setting("MINT_GATE_CONFIRM_POLLS", "3"))       # agreeing polls before an alert
 MINT_GATE_MIN_ROOM_ERG = float(setting("MINT_GATE_MIN_ROOM_ERG", str(MIN_TRADE_SIZE_ERG)))  # smaller = closed
 MINT_GATE_PING_COOLDOWN_SECONDS = float(setting("MINT_GATE_PING_COOLDOWN_SECONDS", "3600"))
@@ -199,13 +204,22 @@ MINT_GATE_CLOSE_SECONDS = float(setting("MINT_GATE_CLOSE_SECONDS", "600"))  # sh
 PRICE_STALE_SECONDS = int(setting("PRICE_STALE_SECONDS", "60"))
 
 # --live auto-execution (pool buy -> bank redeem). Trades only when every check passes.
-RENAMED_SETTINGS = {"LIVE_CONFIRM_SCANS": "LIVE_CONFIRM_POLLS"}
+RENAMED_SETTINGS = {"LIVE_CONFIRM_SCANS": "LIVE_CONFIRM_POLLS", "DISCORD_DIGEST_HOUR": "DISCORD_DIGEST_HOURS"}
+RENAME_HINTS = {"LIVE_CONFIRM_POLLS": "counts ~2 s chain polls", "DISCORD_DIGEST_HOURS": "a list of hours, e.g. 8,14,20"}
+# Settings whose feature is gone: reading them would only mislead
+RETIRED_SETTINGS = {
+    "DISCORD_WALLET_COOLDOWN_SECONDS": "the 10-minute wallet message is gone; the wallet is in the digest",
+    "DISCORD_SUMMARY_INTERVAL_SECONDS": "the 30-minute summary is gone; the digest comes at DISCORD_DIGEST_HOURS",
+}
 
 
 def deprecated_settings() -> list[str]:
     """Warnings for settings in the environment that are no longer read."""
-    return [f"{old} is no longer used; set {new} instead (counts ~{CHAIN_POLL_SECONDS:g} s chain polls)"
-            for old, new in RENAMED_SETTINGS.items() if os.getenv(old) is not None]
+    out = [f"{old} is no longer used; set {new} instead ({RENAME_HINTS[new]})"
+           for old, new in RENAMED_SETTINGS.items() if os.getenv(old) is not None]
+    out += [f"{name} is no longer used: {why}; delete it from .env"
+            for name, why in RETIRED_SETTINGS.items() if os.getenv(name) is not None]
+    return out
 
 
 LIVE_CONFIRM_POLLS = int(setting("LIVE_CONFIRM_POLLS", "2"))            # profitable on N chain polls in a row
